@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import random
+import secrets
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -182,7 +182,9 @@ class ResilientWebSocketSession:
             ) as exc:
                 self._set_state(ConnectionState.DEGRADED, str(exc))
                 attempt += 1
-                await asyncio.sleep(random.uniform(0, min(self.backoff_cap, 2 ** min(attempt, 10))))
+                await asyncio.sleep(
+                    secrets.SystemRandom().uniform(0, min(self.backoff_cap, 2 ** min(attempt, 10)))
+                )
         self._set_state(ConnectionState.CLOSED)
 
     async def _socket_messages(self, socket: Any) -> AsyncIterator[bytes | str]:
