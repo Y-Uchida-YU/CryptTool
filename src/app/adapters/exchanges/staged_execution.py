@@ -56,17 +56,45 @@ class StagedExecutionAdapter(ExecutionAdapter):
         self._blocked()
 
 
-class HyperliquidExecutionAdapter(StagedExecutionAdapter):
+class StagedHyperliquidExecutionAdapter(StagedExecutionAdapter):
     name = "hyperliquid"
 
 
-class AsterExecutionAdapter(StagedExecutionAdapter):
+class StagedAsterExecutionAdapter(StagedExecutionAdapter):
     name = "aster"
 
 
-class BitgetExecutionAdapter(StagedExecutionAdapter):
+class StagedBitgetExecutionAdapter(StagedExecutionAdapter):
     name = "bitget"
 
 
-class MexcExecutionAdapter(StagedExecutionAdapter):
+class StagedMexcExecutionAdapter(StagedExecutionAdapter):
     name = "mexc"
+
+
+# Module-level aliases cannot warn on import by themselves. Instantiation of a legacy
+# name does, while preserving import compatibility until downstream users migrate.
+def _deprecated_alias(
+    name: str, replacement: type[StagedExecutionAdapter]
+) -> type[StagedExecutionAdapter]:
+    class Deprecated(replacement):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            import warnings
+
+            warnings.warn(
+                f"{name} is staged; use {replacement.__name__}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            super().__init__(*args, **kwargs)
+
+    Deprecated.__name__ = name
+    return Deprecated
+
+
+HyperliquidExecutionAdapter = _deprecated_alias(
+    "HyperliquidExecutionAdapter", StagedHyperliquidExecutionAdapter
+)
+AsterExecutionAdapter = _deprecated_alias("AsterExecutionAdapter", StagedAsterExecutionAdapter)
+BitgetExecutionAdapter = _deprecated_alias("BitgetExecutionAdapter", StagedBitgetExecutionAdapter)
+MexcExecutionAdapter = _deprecated_alias("MexcExecutionAdapter", StagedMexcExecutionAdapter)

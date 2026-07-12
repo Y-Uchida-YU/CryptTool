@@ -1,5 +1,10 @@
 """Exchange data and execution ports."""
 
+from app.adapters.exchanges.dex import (
+    DydxMarketDataAdapter,
+    LighterMarketDataAdapter,
+    ParadexMarketDataAdapter,
+)
 from app.adapters.exchanges.domestic import (
     BitbankMarketDataAdapter,
     BitflyerMarketDataAdapter,
@@ -16,6 +21,10 @@ from app.adapters.exchanges.staged_execution import (
     BitgetExecutionAdapter,
     HyperliquidExecutionAdapter,
     MexcExecutionAdapter,
+    StagedAsterExecutionAdapter,
+    StagedBitgetExecutionAdapter,
+    StagedHyperliquidExecutionAdapter,
+    StagedMexcExecutionAdapter,
 )
 
 __all__ = [
@@ -25,9 +34,16 @@ __all__ = [
     "BitflyerMarketDataAdapter",
     "BitgetExecutionAdapter",
     "BitgetMarketDataAdapter",
+    "DydxMarketDataAdapter",
     "GmoCoinMarketDataAdapter",
     "HyperliquidExecutionAdapter",
     "HyperliquidMarketDataAdapter",
+    "LighterMarketDataAdapter",
     "MexcExecutionAdapter",
     "MexcMarketDataAdapter",
+    "ParadexMarketDataAdapter",
+    "StagedAsterExecutionAdapter",
+    "StagedBitgetExecutionAdapter",
+    "StagedHyperliquidExecutionAdapter",
+    "StagedMexcExecutionAdapter",
 ]
