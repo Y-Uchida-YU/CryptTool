@@ -27,7 +27,7 @@ class TimedModel(BaseModel):
     model_config = ConfigDict(frozen=True)
     exchange: str
     symbol: str
-    timestamp: datetime
+    timestamp: datetime | None = None
     exchange_timestamp: datetime | None = None
     received_at: datetime | None = None
     available_at: datetime | None = None
@@ -37,9 +37,13 @@ class TimedModel(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def populate_cross_venue_clock(cls, value: Any) -> Any:
-        if isinstance(value, dict) and "timestamp" in value:
+        if isinstance(value, dict):
             result = dict(value)
-            result.setdefault("exchange_timestamp", value["timestamp"])
+            # `timestamp` remains a compatibility alias for a genuine exchange timestamp.
+            # Callers without one must explicitly pass exchange_timestamp=None.
+            if "exchange_timestamp" not in result and result.get("timestamp") is not None:
+                result["exchange_timestamp"] = result["timestamp"]
+            result.setdefault("timestamp", result.get("exchange_timestamp"))
             result.setdefault("received_at", datetime.now(UTC))
             result.setdefault("available_at", result["received_at"])
             return result
@@ -56,14 +60,16 @@ class TimedModel(BaseModel):
 
     @model_validator(mode="after")
     def clock_order_is_causal(self) -> "TimedModel":
-        if self.exchange_timestamp is None or self.received_at is None or self.available_at is None:
-            raise ValueError("all cross-venue timestamps are required")
+        if self.received_at is None or self.available_at is None:
+            raise ValueError("received_at and available_at are required")
         if self.available_at < self.received_at:
             raise ValueError("available_at cannot precede received_at")
         return self
 
 
 class OHLCV(TimedModel):
+    # Candle open time is intrinsic to the datum (unlike a REST book observation).
+    timestamp: datetime
     timeframe: str
     open: Decimal = Field(gt=0)
     high: Decimal = Field(gt=0)

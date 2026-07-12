@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
@@ -9,9 +7,9 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
-import websockets
 
 from app.adapters.exchanges.base import CapabilityUnavailableError, MarketDataAdapter
+from app.adapters.exchanges.websocket import ResilientWebSocketSession, StreamClassification
 from app.domain.market_data.models import (
     OHLCV,
     FundingRate,
@@ -22,7 +20,11 @@ from app.domain.market_data.models import (
     Side,
     Trade,
 )
-from app.domain.venues.models import VenueCapabilityMatrix
+from app.domain.venues.models import (
+    CapabilitySupport,
+    VenueCapability,
+    VenueCapabilityMatrix,
+)
 from app.services.whale_analytics import WalletSnapshot
 
 
@@ -35,24 +37,31 @@ def _decimal(value: object) -> Decimal:
 
 
 async def _websocket_json(
-    url: str, subscribe: dict[str, object] | None = None
+    url: str,
+    subscribe: dict[str, object] | None = None,
+    *,
+    venue: str = "unknown",
+    classification: StreamClassification = StreamClassification.EVENTS,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    delay = 1.0
-    while True:
-        try:
-            async with websockets.connect(url, open_timeout=10, ping_interval=20) as socket:
-                if subscribe is not None:
-                    await socket.send(json.dumps(subscribe))
-                delay = 1.0
-                async for raw in socket:
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    if raw == "pong":
-                        continue
-                    yield json.loads(raw)
-        except (OSError, TimeoutError, websockets.WebSocketException, json.JSONDecodeError):
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30)
+    def acknowledged(message: Any) -> bool:
+        return isinstance(message, dict) and (
+            message.get("channel") == "subscriptionResponse"
+            or message.get("event") == "subscribe"
+            or message.get("result") is not None
+            or str(message.get("type", "")).startswith("subscribed")
+        )
+
+    session = ResilientWebSocketSession(
+        venue=venue,
+        url=url,
+        subscription_id=str(subscribe or url),
+        subscribe=subscribe,
+        acknowledgement=acknowledged if subscribe is not None else None,
+        classification=classification,
+    )
+    async for message in session.messages():
+        if isinstance(message.normalized_payload, dict):
+            yield message.normalized_payload
 
 
 class PublicRestAdapter(MarketDataAdapter):
@@ -176,10 +185,13 @@ class BinanceCompatiblePerpAdapter(PublicRestAdapter):
         )
         response.raise_for_status()
         data = response.json()
+        received = datetime.now(UTC)
         return OrderBook(
             exchange=self.venue,
             symbol=symbol,
-            timestamp=datetime.now(UTC),
+            exchange_timestamp=None,
+            received_at=received,
+            available_at=datetime.now(UTC),
             sequence=data.get("lastUpdateId"),
             bids=tuple(OrderBookLevel(price=row[0], quantity=row[1]) for row in data["bids"]),
             asks=tuple(OrderBookLevel(price=row[0], quantity=row[1]) for row in data["asks"]),
@@ -268,7 +280,13 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
 
     async def stream_order_book(self, symbol: str) -> AsyncIterator[OrderBook]:
         url = f"wss://fstream.asterdex.com/ws/{symbol.lower()}@depth20@100ms"
-        async with aclosing(_websocket_json(url)) as messages:
+        async with aclosing(
+            _websocket_json(
+                url,
+                venue=self.venue,
+                classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+            )
+        ) as messages:
             async for item in messages:
                 yield OrderBook(
                     exchange=self.venue,
@@ -281,7 +299,7 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
         url = f"wss://fstream.asterdex.com/ws/{symbol.lower()}@aggTrade"
-        async with aclosing(_websocket_json(url)) as messages:
+        async with aclosing(_websocket_json(url, venue=self.venue)) as messages:
             async for item in messages:
                 yield Trade(
                     exchange=self.venue,
@@ -295,7 +313,7 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
 
     async def stream_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:
         url = f"wss://fstream.asterdex.com/ws/{symbol.lower()}@bookTicker"
-        async with aclosing(_websocket_json(url)) as messages:
+        async with aclosing(_websocket_json(url, venue=self.venue)) as messages:
             async for item in messages:
                 yield item
 
@@ -339,6 +357,9 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
         return _ms(data["time"])
 
     async def fetch_markets(self) -> Sequence[Market]:
+        return await self.fetch_perpetual_markets()
+
+    async def fetch_perpetual_markets(self) -> Sequence[Market]:
         data = await self._info({"type": "meta"})
         return tuple(
             Market(
@@ -352,6 +373,72 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
             for item in data["universe"]
         )
 
+    async def fetch_spot_markets(self) -> Sequence[dict[str, object]]:
+        data = await self._info({"type": "spotMeta"})
+        tokens = {int(item["index"]): item for item in data["tokens"]}
+        result: list[dict[str, object]] = []
+        for pair in data["universe"]:
+            base, quote = (tokens[int(index)] for index in pair["tokens"])
+            result.append(
+                {
+                    "token_index": int(base["index"]),
+                    "canonical_token_name": base["name"],
+                    "venue_internal_pair_name": pair["name"],
+                    "base_token": base["name"],
+                    "quote_token": quote["name"],
+                    "szDecimals": base["szDecimals"],
+                    "weiDecimals": base["weiDecimals"],
+                    "index": pair["index"],
+                    "deployer": base.get("deployer"),
+                }
+            )
+        return tuple(result)
+
+    async def fetch_perpetual_asset_contexts(self) -> Sequence[dict[str, object]]:
+        meta, contexts = await self._info({"type": "metaAndAssetCtxs"})
+        return tuple(
+            {"venue_symbol": item["name"], "kind": "perpetual", **context}
+            for item, context in zip(meta["universe"], contexts, strict=True)
+        )
+
+    async def fetch_spot_asset_contexts(self) -> Sequence[dict[str, object]]:
+        meta, contexts = await self._info({"type": "spotMetaAndAssetCtxs"})
+        return tuple(
+            {
+                "venue_internal_pair_name": item["name"],
+                "pair_index": item["index"],
+                "kind": "spot",
+                **context,
+            }
+            for item, context in zip(meta["universe"], contexts, strict=True)
+        )
+
+    async def fetch_predicted_funding(self) -> Sequence[dict[str, object]]:
+        data = await self._info({"type": "predictedFundings"})
+        return tuple({"venue_symbol": row[0], "venues": row[1]} for row in data)
+
+    async def fetch_liquidations(self, wallet: str | None = None) -> Sequence[dict[str, object]]:
+        if wallet is None:
+            raise CapabilityUnavailableError(
+                "Hyperliquid liquidations require a public wallet address"
+            )
+        fills = await self._info({"type": "userFills", "user": wallet})
+        return tuple(
+            item
+            for item in fills
+            if item.get("dir") in {"Liquidated Long", "Liquidated Short"}
+            or item.get("liquidation") is not None
+        )
+
+    async def fetch_wallet_transfers(self, wallet: str) -> Sequence[dict[str, object]]:
+        data = await self._info({"type": "userNonFundingLedgerUpdates", "user": wallet})
+        return tuple(
+            item
+            for item in data
+            if item.get("delta", {}).get("type")
+            in {"deposit", "withdraw", "internalTransfer", "spotTransfer", "accountClassTransfer"}
+        )
+
     async def fetch_ohlcv(
         self,
         symbol: str,
@@ -360,19 +447,35 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
         end: datetime | None = None,
         limit: int = 1000,
     ) -> Sequence[OHLCV]:
-        del limit
-        now = datetime.now(UTC)
-        data = await self._info(
-            {
-                "type": "candleSnapshot",
-                "req": {
-                    "coin": symbol,
-                    "interval": timeframe,
-                    "startTime": int((start or now.replace(hour=0)).timestamp() * 1000),
-                    "endTime": int((end or now).timestamp() * 1000),
-                },
-            }
-        )
+        if start is None or end is None:
+            raise ValueError("Hyperliquid OHLCV requires explicit start and end")
+        if end <= start:
+            raise ValueError("end must be after start")
+        interval_ms = _timeframe_ms(timeframe)
+        cursor_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+        rows: dict[int, dict[str, Any]] = {}
+        while cursor_ms < end_ms:
+            page_end = min(end_ms, cursor_ms + interval_ms * max(1, min(limit, 5000)))
+            page = await self._info(
+                {
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": symbol,
+                        "interval": timeframe,
+                        "startTime": cursor_ms,
+                        "endTime": page_end,
+                    },
+                }
+            )
+            for item in page:
+                opened = int(item["t"])
+                if cursor_ms <= opened < end_ms:
+                    rows[opened] = item
+            if not page:
+                cursor_ms = page_end
+            else:
+                cursor_ms = max(page_end, max(int(item["t"]) for item in page) + interval_ms)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         return tuple(
             OHLCV(
                 exchange=self.venue,
@@ -384,8 +487,10 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
                 low=item["l"],
                 close=item["c"],
                 volume=item["v"],
+                closed=opened + interval_ms <= now_ms,
             )
-            for item in data
+            for opened, item in sorted(rows.items())
+            if opened + interval_ms <= now_ms
         )
 
     async def fetch_order_book(self, symbol: str, depth: int = 50) -> OrderBook:
@@ -452,7 +557,9 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
             OpenInterest(
                 exchange=self.venue,
                 symbol=symbol,
-                timestamp=datetime.now(UTC),
+                exchange_timestamp=None,
+                received_at=datetime.now(UTC),
+                available_at=datetime.now(UTC),
                 value=item["openInterest"],
                 unit="base",
             ),
@@ -507,7 +614,9 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
 
     async def _stream(self, subscription: dict[str, object]) -> AsyncIterator[dict[str, Any]]:
         request: dict[str, object] = {"method": "subscribe", "subscription": subscription}
-        async with aclosing(_websocket_json("wss://api.hyperliquid.xyz/ws", request)) as messages:
+        async with aclosing(
+            _websocket_json("wss://api.hyperliquid.xyz/ws", request, venue=self.venue)
+        ) as messages:
             async for message in messages:
                 if message.get("channel") != "subscriptionResponse":
                     yield message
@@ -547,6 +656,14 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
             mids = message["data"]["mids"]
             if symbol in mids:
                 yield {"symbol": symbol, "mid": mids[symbol], "timestamp": datetime.now(UTC)}
+
+
+def _timeframe_ms(timeframe: str) -> int:
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+    try:
+        return int(timeframe[:-1]) * units[timeframe[-1]]
+    except (KeyError, ValueError, IndexError) as exc:
+        raise ValueError(f"unsupported timeframe: {timeframe}") from exc
 
 
 class BitgetMarketDataAdapter(PublicRestAdapter):
@@ -719,7 +836,7 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
             "args": [{"instType": "USDT-FUTURES", "channel": channel, "instId": symbol}],
         }
         async with aclosing(
-            _websocket_json("wss://ws.bitget.com/v2/ws/public", request)
+            _websocket_json("wss://ws.bitget.com/v2/ws/public", request, venue=self.venue)
         ) as messages:
             async for message in messages:
                 if "data" in message:
@@ -771,7 +888,16 @@ class MexcMarketDataAdapter(PublicRestAdapter):
         funding_current=True,
         funding_history=True,
         predicted_funding=True,
-        open_interest=False,
+        open_interest=VenueCapability(
+            name="open_interest",
+            support=CapabilitySupport.DEGRADED,
+            documented_at=datetime(2026, 7, 12, tzinfo=UTC),
+            implemented_at=datetime(2026, 7, 12, tzinfo=UTC),
+            live_verified_at=datetime(2026, 7, 12, tzinfo=UTC),
+            source_url="https://mexcdevelop.github.io/apidocs/contract_v1_en/",
+            verification_run_id="public-api-smoke-2026-07-12",
+            failure_reason="public endpoint returned HTTP 403 from deployment environment",
+        ),
         liquidations=True,
         orderbook_snapshot=True,
         orderbook_delta=True,
@@ -920,7 +1046,9 @@ class MexcMarketDataAdapter(PublicRestAdapter):
 
     async def _stream(self, method: str, symbol: str) -> AsyncIterator[dict[str, Any]]:
         request: dict[str, object] = {"method": method, "param": {"symbol": symbol}}
-        async with aclosing(_websocket_json("wss://contract.mexc.com/edge", request)) as messages:
+        async with aclosing(
+            _websocket_json("wss://contract.mexc.com/edge", request, venue=self.venue)
+        ) as messages:
             async for message in messages:
                 channel = str(message.get("channel", ""))
                 if channel != "pong" and not channel.startswith("rs.sub"):

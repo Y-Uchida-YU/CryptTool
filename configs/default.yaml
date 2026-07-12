@@ -78,6 +78,15 @@ venues:
     <<: *priority_data_only
     terms_version: "2026-04-17"
     reason: "web/API eligibility requires verification; mobile apps unavailable in Japan"
+  dydx:
+    <<: *priority_data_only
+    reason: "DATA_ONLY: public Indexer/Full Node data; execution intentionally disabled"
+  paradex:
+    <<: *priority_data_only
+    reason: "DATA_ONLY: public market data; JWT/Subkey execution intentionally disabled"
+  lighter:
+    <<: *priority_data_only
+    reason: "EXPERIMENTAL_DATA_ONLY: emerging venue health monitoring required"
   gmo_coin:
     <<: *priority_data_only
     reason: "domestic public data"
@@ -94,6 +103,13 @@ venues:
     jurisdiction: JP
     terms_checked_at: "2026-07-12T00:00:00Z"
     reason: "PENDING_API_VERIFICATION: full private real-time and permission requirements unverified"
+  gateio:
+    data_enabled: false
+    execution_enabled: false
+    eligibility_status: pending_verification
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    reason: "DISCOVERY_ONLY: requires 30-day incremental value observation and operator verification"
   bybit: &jp_execution_forbidden
     data_enabled: false
     execution_enabled: false
@@ -109,4 +125,7 @@ venue_risk:
   aster: {maximum_equity_fraction: 0.15}
   bitget: {maximum_equity_fraction: 0.20}
   mexc: {maximum_equity_fraction: 0.10}
+  dydx: {maximum_equity_fraction: 0.10}
+  paradex: {maximum_equity_fraction: 0.10}
+  lighter: {maximum_equity_fraction: 0.05}
   domestic_exchanges: {maximum_equity_fraction: 0.40}

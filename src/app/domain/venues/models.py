@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,35 +70,187 @@ class VenueEligibility:
         return False, f"status {self.status.value} does not permit execution"
 
 
+class CapabilitySupport(StrEnum):
+    UNAVAILABLE = "unavailable"
+    DOCUMENTED = "documented"
+    IMPLEMENTED = "implemented"
+    LIVE_VERIFIED = "live_verified"
+    DEGRADED = "degraded"
+
+
+@dataclass(frozen=True, kw_only=True)
+class VenueCapability:
+    name: str
+    support: CapabilitySupport
+    documented_at: datetime | None = None
+    implemented_at: datetime | None = None
+    live_verified_at: datetime | None = None
+    source_url: str | None = None
+    verification_run_id: str | None = None
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("documented_at", "implemented_at", "live_verified_at"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _utc(value))
+        if self.support == CapabilitySupport.DEGRADED and not self.failure_reason:
+            raise ValueError("degraded capabilities require a failure_reason")
+        if self.support == CapabilitySupport.LIVE_VERIFIED and self.live_verified_at is None:
+            raise ValueError("live-verified capabilities require live_verified_at")
+
+    def usable_for_new_exposure(self, now: datetime, maximum_age: timedelta) -> bool:
+        return (
+            self.support == CapabilitySupport.LIVE_VERIFIED
+            and self.live_verified_at is not None
+            and timedelta(0) <= _utc(now) - self.live_verified_at <= maximum_age
+        )
+
+    def transition(
+        self,
+        support: CapabilitySupport,
+        *,
+        at: datetime,
+        source_url: str | None = None,
+        verification_run_id: str | None = None,
+        failure_reason: str | None = None,
+    ) -> VenueCapability:
+        allowed = {
+            CapabilitySupport.UNAVAILABLE: {CapabilitySupport.DOCUMENTED},
+            CapabilitySupport.DOCUMENTED: {CapabilitySupport.IMPLEMENTED},
+            CapabilitySupport.IMPLEMENTED: {
+                CapabilitySupport.LIVE_VERIFIED,
+                CapabilitySupport.DEGRADED,
+            },
+            CapabilitySupport.LIVE_VERIFIED: {CapabilitySupport.DEGRADED},
+            CapabilitySupport.DEGRADED: {
+                CapabilitySupport.IMPLEMENTED,
+                CapabilitySupport.LIVE_VERIFIED,
+            },
+        }
+        if support not in allowed[self.support]:
+            raise ValueError(f"invalid capability transition {self.support} -> {support}")
+        when = _utc(at)
+        return VenueCapability(
+            name=self.name,
+            support=support,
+            documented_at=self.documented_at
+            or (when if support != CapabilitySupport.UNAVAILABLE else None),
+            implemented_at=self.implemented_at
+            or (
+                when
+                if support
+                in {
+                    CapabilitySupport.IMPLEMENTED,
+                    CapabilitySupport.LIVE_VERIFIED,
+                    CapabilitySupport.DEGRADED,
+                }
+                else None
+            ),
+            live_verified_at=when
+            if support == CapabilitySupport.LIVE_VERIFIED
+            else self.live_verified_at,
+            source_url=source_url or self.source_url,
+            verification_run_id=verification_run_id,
+            failure_reason=failure_reason if support == CapabilitySupport.DEGRADED else None,
+        )
+
+    def __bool__(self) -> bool:
+        """Compatibility only; strategy code must call usable_for_new_exposure()."""
+        return self.support not in {
+            CapabilitySupport.UNAVAILABLE,
+            CapabilitySupport.DEGRADED,
+        }
+
+
+CAPABILITY_NAMES = (
+    "spot",
+    "perpetual",
+    "dated_futures",
+    "funding_current",
+    "funding_history",
+    "predicted_funding",
+    "open_interest",
+    "liquidations",
+    "orderbook_snapshot",
+    "orderbook_delta",
+    "trades",
+    "mark_price",
+    "index_price",
+    "long_short_ratio",
+    "wallet_positions",
+    "wallet_transfers",
+    "private_websocket",
+    "post_only",
+    "reduce_only",
+    "ioc",
+    "fok",
+    "batch_orders",
+    "subaccounts",
+)
+
+
 class VenueCapabilityMatrix(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     venue: str
     detected_at: datetime
     source_version: str
-    spot: bool = False
-    perpetual: bool = False
-    dated_futures: bool = False
-    funding_current: bool = False
-    funding_history: bool = False
-    predicted_funding: bool = False
-    open_interest: bool = False
-    liquidations: bool = False
-    orderbook_snapshot: bool = False
-    orderbook_delta: bool = False
-    trades: bool = False
-    mark_price: bool = False
-    index_price: bool = False
-    long_short_ratio: bool = False
-    wallet_positions: bool = False
-    wallet_transfers: bool = False
-    private_websocket: bool = False
-    post_only: bool = False
-    reduce_only: bool = False
-    ioc: bool = False
-    fok: bool = False
-    batch_orders: bool = False
-    subaccounts: bool = False
+    capabilities: dict[str, VenueCapability] = Field(default_factory=dict)
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
+    @model_validator(mode="before")
+    @classmethod
+    def collect_capabilities(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        detected_at = result.get("detected_at")
+        capabilities = dict(result.pop("capabilities", {}))
+        # Accept the old constructor shape while ensuring no bool survives in the model.
+        for name in CAPABILITY_NAMES:
+            if name not in result:
+                continue
+            raw = result.pop(name)
+            if isinstance(raw, VenueCapability):
+                capabilities[name] = raw
+            elif isinstance(raw, (CapabilitySupport, str)) and not isinstance(raw, bool):
+                support = CapabilitySupport(raw)
+                capabilities[name] = VenueCapability(
+                    name=name,
+                    support=support,
+                    documented_at=detected_at if support != CapabilitySupport.UNAVAILABLE else None,
+                    implemented_at=detected_at
+                    if support
+                    in {
+                        CapabilitySupport.IMPLEMENTED,
+                        CapabilitySupport.LIVE_VERIFIED,
+                        CapabilitySupport.DEGRADED,
+                    }
+                    else None,
+                    live_verified_at=detected_at
+                    if support == CapabilitySupport.LIVE_VERIFIED
+                    else None,
+                    failure_reason="legacy degraded declaration"
+                    if support == CapabilitySupport.DEGRADED
+                    else None,
+                )
+            else:
+                support = CapabilitySupport.IMPLEMENTED if raw else CapabilitySupport.UNAVAILABLE
+                capabilities[name] = VenueCapability(
+                    name=name,
+                    support=support,
+                    documented_at=detected_at if raw else None,
+                    implemented_at=detected_at if raw else None,
+                )
+        for name in CAPABILITY_NAMES:
+            capabilities.setdefault(
+                name, VenueCapability(name=name, support=CapabilitySupport.UNAVAILABLE)
+            )
+        result["capabilities"] = capabilities
+        return result
 
     @field_validator("detected_at")
     @classmethod
@@ -107,10 +260,21 @@ class VenueCapabilityMatrix(BaseModel):
     def require(self, capability: str) -> None:
         from app.adapters.exchanges.base import CapabilityUnavailableError
 
-        if capability not in type(self).model_fields:
+        if capability not in self.capabilities:
             raise ValueError(f"unknown capability: {capability}")
-        if not bool(getattr(self, capability)):
+        if self.capabilities[capability].support == CapabilitySupport.UNAVAILABLE:
             raise CapabilityUnavailableError(f"{self.venue} does not provide {capability}")
+
+    def require_live(self, capability: str, now: datetime, maximum_age: timedelta) -> None:
+        self.require(capability)
+        if not self.capabilities[capability].usable_for_new_exposure(now, maximum_age):
+            raise RuntimeError(f"{self.venue} {capability} is not current LIVE_VERIFIED evidence")
+
+    def __getattr__(self, name: str) -> VenueCapability:
+        capabilities = object.__getattribute__(self, "capabilities")
+        if name in capabilities:
+            return capabilities[name]  # type: ignore[no-any-return]
+        raise AttributeError(name)
 
 
 class InstrumentKind(StrEnum):
