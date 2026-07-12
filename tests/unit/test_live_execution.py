@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,11 +20,13 @@ from app.domain.execution.live_models import (
 )
 from app.domain.execution.models import OrderType
 from app.domain.market_data.models import Side
-from app.domain.risk.models import RiskDecision
+from app.domain.risk.models import PositionSizingResult, RiskDecision
 from app.services.live_trading.gateway import ExecutionAdapterError, LiveExecutionGateway
 from app.services.live_trading.preflight import (
     RUNTIME_CONFIRMATION,
     LivePreflightContext,
+    LivePreflightReport,
+    PreflightCheck,
     evaluate_live_preflight,
 )
 
@@ -36,6 +39,8 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.cancel_all_calls = 0
         self.healthy = True
         self.open_orders: list[LiveOpenOrder] = []
+        self.positions: list[LivePosition] = []
+        self.open_orders_symbol: str | None = "not-called"
         self.fail_place = False
         self.mismatch_request = False
         self.fail_cancel = False
@@ -81,11 +86,11 @@ class FakeExecutionAdapter(ExecutionAdapter):
         return ()
 
     async def fetch_open_orders(self, symbol: str | None = None) -> Sequence[LiveOpenOrder]:
-        del symbol
+        self.open_orders_symbol = symbol
         return tuple(self.open_orders)
 
     async def fetch_positions(self) -> Sequence[LivePosition]:
-        return ()
+        return tuple(self.positions)
 
     async def close_position(self, symbol: str) -> ExecutionOrderAck:
         if self.fail_close:
@@ -111,6 +116,7 @@ def live_settings(**live_overrides: object) -> Settings:
         "maximum_order_notional": 100,
         "maximum_open_orders": 3,
         "maximum_orders_per_minute": 5,
+        "preflight_ttl_seconds": 300,
         **live_overrides,
     }
     return Settings(
@@ -177,10 +183,28 @@ def order(
     return LiveOrderRequest.model_validate(values)
 
 
-def risk(allowed: bool = True, timestamp: datetime = NOW) -> RiskDecision:
+def risk(
+    allowed: bool = True,
+    timestamp: datetime = NOW,
+    decision_id: str = "risk-decision-0001",
+    quantity: Decimal = Decimal("0.1"),
+) -> RiskDecision:
     return RiskDecision(
+        decision_id=decision_id,
         allowed=allowed,
         reasons=("risk accepted" if allowed else "risk rejected",),
+        sizing=(
+            PositionSizingResult(
+                accepted=True,
+                quantity=quantity,
+                notional=quantity * Decimal("100"),
+                risk_amount=Decimal("0.25"),
+                binding_constraint="test",
+                reason="test approved size",
+            )
+            if allowed
+            else None
+        ),
         evaluated_at=timestamp,
     )
 
@@ -206,6 +230,26 @@ def test_preflight_requires_every_runtime_and_configuration_gate() -> None:
     }
 
 
+def test_gateway_rejects_inconsistent_or_incomplete_approved_preflight() -> None:
+    settings = live_settings()
+    adapter = FakeExecutionAdapter()
+    inconsistent = LivePreflightReport(
+        timestamp=NOW,
+        approved=True,
+        checks=(PreflightCheck(name="only", passed=False, reason="forged"),),
+        warning="forged",
+    )
+    with pytest.raises(ValueError, match="inconsistent"):
+        LiveExecutionGateway(settings, adapter, inconsistent)
+    incomplete = inconsistent.model_copy(
+        update={
+            "checks": (PreflightCheck(name="only", passed=True, reason="forged"),),
+        }
+    )
+    with pytest.raises(ValueError, match="missing required"):
+        LiveExecutionGateway(settings, adapter, incomplete)
+
+
 def test_live_settings_reject_unsafe_combinations() -> None:
     with pytest.raises(ValidationError, match="production"):
         live_settings().model_copy(update={"environment": "development"}).model_validate(
@@ -225,6 +269,13 @@ def test_live_settings_reject_unsafe_combinations() -> None:
         Settings.model_validate(invalid)
     with pytest.raises(ValidationError, match="subset"):
         Settings(_env_file=None, live={"allowed_symbols": ("DOGE",)})
+    duplicate = live_settings().model_dump()
+    duplicate["exchanges"] = (
+        {"name": "sandbox", "execution_enabled": True},
+        {"name": "sandbox", "execution_enabled": True},
+    )
+    with pytest.raises(ValidationError, match="exactly one"):
+        Settings.model_validate(duplicate)
 
 
 @pytest.mark.asyncio
@@ -258,7 +309,24 @@ async def test_gateway_calls_adapter_once_and_replays_idempotently() -> None:
     replay = await gateway.place_order(request, risk(), NOW + timedelta(seconds=2))
     assert receipt.state == LiveOrderState.ACCEPTED
     assert replay == receipt and adapter.place_calls == 1
+    assert adapter.open_orders_symbol is None
     assert any(event.event_type == "idempotent_replay" for event in gateway.audit_events)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_idempotent_orders_call_adapter_once() -> None:
+    settings = live_settings()
+    adapter = FakeExecutionAdapter()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    first, second = await asyncio.gather(
+        gateway.place_order(request, risk(), NOW),
+        gateway.place_order(request, risk(), NOW),
+    )
+    assert first == second
+    assert adapter.place_calls == 1
 
 
 @pytest.mark.asyncio
@@ -291,7 +359,49 @@ async def test_gateway_rejects_without_calling_adapter() -> None:
         NOW,
     )
     assert "stale" in stale.reason
+    mismatched = await gateway.place_order(
+        order("risk-id-1", "idempotency-risk-id"),
+        risk(decision_id="different-risk-decision"),
+        NOW,
+    )
+    assert "identity" in mismatched.reason
+    oversized = await gateway.place_order(
+        order("risk-size", "idempotency-risk-size", quantity=Decimal("0.2")),
+        risk(quantity=Decimal("0.1")),
+        NOW,
+    )
+    assert "risk-approved" in oversized.reason
     assert adapter.place_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_stale_preflight_and_request() -> None:
+    settings = live_settings(preflight_ttl_seconds=10)
+    adapter = FakeExecutionAdapter()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    stale_preflight = await gateway.place_order(
+        order(expires_at=NOW + timedelta(minutes=1)),
+        risk(timestamp=NOW + timedelta(seconds=11)),
+        NOW + timedelta(seconds=11),
+    )
+    assert "preflight is stale" in stale_preflight.reason
+
+    current_context = approved_context(timestamp=NOW + timedelta(seconds=40))
+    current = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, current_context)
+    )
+    stale_request = await current.place_order(
+        order(
+            "stale-request",
+            "idempotency-stale-request",
+            expires_at=NOW + timedelta(minutes=2),
+        ),
+        risk(timestamp=NOW + timedelta(seconds=40)),
+        NOW + timedelta(seconds=40),
+    )
+    assert "order request is stale" in stale_request.reason
 
 
 @pytest.mark.asyncio
@@ -416,6 +526,16 @@ async def test_kill_switch_blocks_entries_but_preserves_contingency_actions() ->
     assert adapter.cancel_all_calls == 1
     blocked = await gateway.place_order(order(), risk(), NOW)
     assert "kill switch" in blocked.reason
+    adapter.positions.append(
+        LivePosition(
+            exchange="sandbox",
+            symbol="BTC",
+            quantity=Decimal("0.1"),
+            mark_price=Decimal("100"),
+            unrealized_pnl=Decimal("0"),
+            observed_at=NOW,
+        )
+    )
     reduce = await gateway.place_order(
         order(
             "reduce-1",
@@ -430,6 +550,50 @@ async def test_kill_switch_blocks_entries_but_preserves_contingency_actions() ->
     canceled = await gateway.cancel_order("external-1", NOW)
     closed = await gateway.close_position("BTC", NOW)
     assert canceled.canceled and closed.request_id == "close-BTC"
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_is_bounded_by_observed_position() -> None:
+    settings = live_settings()
+    adapter = FakeExecutionAdapter()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    missing = await gateway.place_order(
+        order("reduce-none", "idempotency-reduce-none", side=Side.SELL, reduce_only=True),
+        risk(False),
+        NOW,
+    )
+    assert "no open position" in missing.reason
+    adapter.positions.append(
+        LivePosition(
+            exchange="sandbox",
+            symbol="BTC",
+            quantity=Decimal("0.1"),
+            mark_price=Decimal("100"),
+            unrealized_pnl=Decimal("0"),
+            observed_at=NOW,
+        )
+    )
+    wrong_side = await gateway.place_order(
+        order("reduce-side", "idempotency-reduce-side", side=Side.BUY, reduce_only=True),
+        risk(False),
+        NOW,
+    )
+    assert "increase exposure" in wrong_side.reason
+    too_large = await gateway.place_order(
+        order(
+            "reduce-large",
+            "idempotency-reduce-large",
+            side=Side.SELL,
+            reduce_only=True,
+            quantity=Decimal("0.2"),
+        ),
+        risk(False),
+        NOW,
+    )
+    assert "exceeds open position" in too_large.reason
+    assert adapter.place_calls == 0
 
 
 def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
@@ -456,6 +620,14 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
             request_id="request",
             state=LiveOrderState.ACCEPTED,
             accepted_at=datetime(2025, 1, 1),
+            reason="invalid",
+            adapter_called=True,
+        )
+    with pytest.raises(ValidationError, match="external_order_id"):
+        ExecutionOrderAck(
+            request_id="request",
+            state=LiveOrderState.ACCEPTED,
+            accepted_at=NOW,
             reason="invalid",
             adapter_called=True,
         )

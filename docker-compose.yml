@@ -7,13 +7,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["validate-config"]
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://cryptbot:${CRYPTBOT_DB_PASSWORD:-change-me}@db:5432/cryptbot
+    command: ["health-check"]
   db:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: cryptbot
       POSTGRES_USER: cryptbot
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${CRYPTBOT_DB_PASSWORD:-change-me}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cryptbot -d cryptbot"]
       interval: 5s

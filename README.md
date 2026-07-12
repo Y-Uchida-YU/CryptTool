@@ -4,7 +4,7 @@ Research-first crypto market regime, strategy validation, event-driven backtesti
 trading platform. It is designed to test whether an edge exists, not to manufacture an attractive
 backtest.
 
-Current implementation covers Phase 0–9:
+Current implementation provides tested foundations across Phase 0–9:
 
 - normalized market data contracts, validation and checkpointed ingestion primitives;
 - causal feature generation and feature quality/availability reports;
@@ -20,6 +20,8 @@ Current implementation covers Phase 0–9:
   durable audit integration, with only a permanently disabled execution adapter shipped.
 
 Concrete live execution is not implemented and remains disabled.
+Concrete exchange ingestion, production WebSocket operation and representative market validation
+are also still required; see [review readiness](docs/review-readiness.md) for the exact boundary.
 
 ## Setup
 
@@ -31,9 +33,15 @@ uv run pytest --cov
 
 The repository pins Python 3.12 through `.python-version` and declares `<3.13` to keep local,
 Docker and CI behavior aligned.
+`configs/default.yaml` is the checked-in baseline; explicit constructor values, `APP_` environment
+variables and `.env` override it, in that order. Secrets must stay in the environment or `.env`.
 
 If an editable-install path is not recognized by the local Python build, prefix development
 commands with `PYTHONPATH=src`.
+
+For the PostgreSQL smoke environment, copy `.env.example` to `.env`, replace
+`CRYPTBOT_DB_PASSWORD`, then run `docker compose up --build`. Compose injects the same database
+credential into PostgreSQL and the application and executes the read-only health check.
 
 ## Reproducible mechanical smoke run
 

@@ -75,6 +75,17 @@ class ExecutionOrderAck(BaseModel):
             raise ValueError("ack timestamp must be timezone-aware")
         return value.astimezone(UTC)
 
+    @model_validator(mode="after")
+    def accepted_orders_require_external_identity(self) -> "ExecutionOrderAck":
+        if self.state == LiveOrderState.ACCEPTED:
+            if not self.adapter_called or not self.external_order_id:
+                raise ValueError(
+                    "accepted live orders require adapter_called and an external_order_id"
+                )
+        elif self.external_order_id is not None and not self.adapter_called:
+            raise ValueError("an external_order_id requires an adapter call")
+        return self
+
 
 class CancelAck(BaseModel):
     model_config = ConfigDict(frozen=True)

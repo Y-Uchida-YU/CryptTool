@@ -1,18 +1,40 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: cryptbot_test
+          POSTGRES_USER: cryptbot
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cryptbot -d cryptbot_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      APP_DATABASE_URL: postgresql+psycopg://cryptbot:test-only-password@localhost:5432/cryptbot_test
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
         with: {python-version: "3.12"}
-      - run: uv sync --all-extras
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy
-      - run: uv run pytest --cov --cov-report=term-missing --cov-report=json:coverage.json
-      - run: uv run python scripts/check_coverage.py coverage.json
-      - run: uv run alembic upgrade head && uv run alembic check
-      - run: uv run bandit -r src
+      - run: uv sync --all-extras --frozen
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy
+      - run: uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json:coverage.json
+      - run: uv run --frozen python scripts/check_coverage.py coverage.json
+      - run: uv run --frozen alembic upgrade head && uv run --frozen alembic check
+      - run: uv run --frozen bandit -r src
       - uses: gitleaks/gitleaks-action@v2

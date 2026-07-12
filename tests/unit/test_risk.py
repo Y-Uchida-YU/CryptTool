@@ -246,12 +246,14 @@ def test_risk_state_and_decision_contract_validation() -> None:
         )
     with pytest.raises(ValidationError, match="timezone-aware"):
         RiskDecision(
+            decision_id="risk-test-allowed",
             allowed=False,
             reasons=("test",),
             evaluated_at=datetime(2024, 1, 1),
         )
     with pytest.raises(ValidationError, match="allowed risk decision"):
         RiskDecision(
+            decision_id="risk-test-rejected",
             allowed=True,
             reasons=("test",),
             sizing=rejected_size,

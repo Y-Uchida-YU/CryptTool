@@ -24,18 +24,19 @@ kill switch halt new risk. Discord is optional and disabled without an HTTPS web
 execution method is called.
 
 Phase 9 implements typed order/acknowledgement/position contracts, a permanently disabled adapter,
-a 16-check fail-closed preflight, per-order allowlists and limits, idempotent replay protection,
-adapter protocol checks, kill-switch cancel-all, reduce-only contingency actions and durable
+a 16-check fail-closed preflight with a short TTL, per-order allowlists and limits, risk-decision
+identity/size binding, serialized idempotent submission, adapter protocol checks, global open-order
+limits, kill-switch cancel-all, position-bounded reduce-only contingency actions and durable
 sanitized audit events. No concrete venue execution adapter is included.
 
 ## Verification snapshot
 
-- 135 automated tests pass on Python 3.12, including async integration and Hypothesis invariants.
-- Overall line coverage: 95.02%.
+- 140 automated tests pass on Python 3.12, including async integration and Hypothesis invariants.
+- Overall line coverage: 95.03%.
 - Risk coverage: 100.00%.
-- Execution/backtest coverage: 98.90%.
-- Regime coverage: 94.93%.
-- Phase 9 live-interface coverage: at least 95% and enforced separately in CI.
+- Execution/backtest coverage: 98.94%.
+- Regime coverage: 95.30%.
+- Phase 9 live-interface coverage: 99.00% and enforced at 95% in CI.
 - Paper execution coverage: 98.57% and enforced at 95% in CI.
 - `ruff check`, `ruff format --check`, strict `mypy`, Alembic upgrade/check and Bandit pass.
 - Mechanical fixture: two causal fills and final equity 1000.166610 from 1000 initial cash.
@@ -59,3 +60,7 @@ market history and must not be cited as a trading edge.
 
 Until those items are complete, the correct conclusion is **no demonstrated reproducible edge and
 not ready for live trading**.
+
+See `review-readiness.md` for the precise implemented/partial/deferred boundary. Phase numbering in
+this repository means a safe tested foundation exists for that phase; it does not mean external
+venue integration or empirical edge validation has been completed.

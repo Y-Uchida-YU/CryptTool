@@ -36,11 +36,16 @@ The runtime confirmation is never stored in `.env` or configuration files.
 
 ## Per-order controls
 
-The gateway requires a prior approved preflight report, an allowed exchange and symbol, an
-unexpired request, a passing RiskDecision, notional below the configured maximum, open-order
-capacity, rate-limit capacity and a healthy adapter. Each order has an idempotency key; replaying it
-returns the original receipt without calling the adapter again. Adapter receipt/request mismatches
-fail closed.
+The gateway requires a complete and internally consistent preflight report that is no older than
+the configured TTL, an allowed exchange and symbol, a fresh unexpired request, a matching fresh
+RiskDecision, quantity no larger than the risk-approved size, notional below the configured
+maximum, global open-order capacity, rate-limit capacity and a healthy adapter. Each order has an
+idempotency key; replaying it returns the original receipt without calling the adapter again. Order
+placement is serialized so concurrent duplicate requests cannot race through the checks. Adapter
+receipt/request mismatches and accepted receipts without an external order ID fail closed.
+
+Reduce-only requests bypass entry approval only after the gateway independently observes a
+matching open position, confirms the side reduces it and caps quantity at the observed position.
 
 Every preview, rejection, adapter error, acknowledgement, replay, cancellation, close and kill
 switch decision creates a sanitized, versioned audit event. `SqlExecutionAuditSink` persists those

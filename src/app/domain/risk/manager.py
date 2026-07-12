@@ -129,6 +129,7 @@ class RiskManager:
     ) -> RiskDecision:
         if signal.intent in {SignalIntent.EXIT, SignalIntent.REDUCE}:
             return RiskDecision(
+                decision_id=f"risk:{signal.signal_id}:{state.timestamp.isoformat()}",
                 allowed=True,
                 reasons=("risk-reducing action bypasses entry limits",),
                 evaluated_at=state.timestamp,
@@ -207,6 +208,7 @@ class RiskManager:
             reasons.append(f"circuit breaker active: {breaker_text}")
         if reasons:
             return RiskDecision(
+                decision_id=f"risk:{signal.signal_id}:{state.timestamp.isoformat()}",
                 allowed=False,
                 reasons=tuple(dict.fromkeys(reasons)),
                 evaluated_at=state.timestamp,
@@ -235,12 +237,14 @@ class RiskManager:
             )
         if not sizing.accepted:
             return RiskDecision(
+                decision_id=f"risk:{signal.signal_id}:{state.timestamp.isoformat()}",
                 allowed=False,
                 reasons=(sizing.reason,),
                 sizing=sizing,
                 evaluated_at=state.timestamp,
             )
         return RiskDecision(
+            decision_id=f"risk:{signal.signal_id}:{state.timestamp.isoformat()}",
             allowed=True,
             reasons=("all entry risk checks passed",),
             sizing=sizing,

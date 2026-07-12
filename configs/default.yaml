@@ -54,5 +54,6 @@ live:
   maximum_open_orders: 3
   maximum_orders_per_minute: 5
   maximum_clock_skew_seconds: 2
+  preflight_ttl_seconds: 30
   minimum_data_quality: 0.90
   withdrawal_permission_confirmed_disabled: true

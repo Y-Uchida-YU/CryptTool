@@ -139,6 +139,7 @@ class PositionSizingResult(BaseModel):
 class RiskDecision(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    decision_id: str = Field(min_length=8, max_length=160)
     allowed: bool
     reasons: tuple[str, ...] = Field(min_length=1)
     sizing: PositionSizingResult | None = None

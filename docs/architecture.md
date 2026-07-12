@@ -14,7 +14,12 @@ are separate from new-exposure authorization.
 
 ## Reliability
 
-REST uses bounded exponential retry only for transient failures. Rate limiting precedes calls. WebSockets require heartbeat, sequence tracking, reconnect with jitter, snapshot/delta reconciliation and REST recovery. Checkpoints advance only after successful validation and persistence. Natural keys prevent duplicates. Raw payloads are retained separately from normalized facts in production.
+The ingestion contracts require REST retries to be bounded and limited to transient failures. Rate
+limiting precedes calls, and checkpoints advance only after successful validation and persistence.
+A future concrete WebSocket adapter must implement heartbeat, sequence tracking, reconnect with
+jitter, snapshot/delta reconciliation and REST recovery. Those venue-specific loops are not shipped
+today. Natural keys prevent normalized OHLCV duplicates; production raw-payload retention remains a
+deployment requirement rather than an implemented repository feature.
 
 ## Exchange comparison (design-time)
 

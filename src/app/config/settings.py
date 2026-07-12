@@ -2,7 +2,12 @@ from functools import lru_cache
 from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
 
 
 class RiskSettings(BaseModel):
@@ -77,13 +82,19 @@ class LiveTradingSettings(BaseModel):
     maximum_open_orders: int = Field(3, ge=1, le=20)
     maximum_orders_per_minute: int = Field(5, ge=1, le=60)
     maximum_clock_skew_seconds: float = Field(2.0, ge=0, le=30)
+    preflight_ttl_seconds: int = Field(30, ge=1, le=300)
     minimum_data_quality: float = Field(0.90, ge=0.8, le=1)
     withdrawal_permission_confirmed_disabled: bool = True
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="APP_", env_nested_delimiter="__", env_file=".env", extra="ignore"
+        env_prefix="APP_",
+        env_nested_delimiter="__",
+        env_file=".env",
+        yaml_file="configs/default.yaml",
+        yaml_file_encoding="utf-8",
+        extra="ignore",
     )
 
     environment: Literal["development", "test", "production"] = "development"
@@ -106,6 +117,24 @@ class Settings(BaseSettings):
         ExchangeSettings(name="bybit_public", data_enabled=False),
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Explicit constructor values and environment secrets always override checked-in YAML.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            YamlConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )
+
     @model_validator(mode="after")
     def guard_live_mode(self) -> "Settings":
         confirmation = self.live_confirmation.get_secret_value() if self.live_confirmation else ""
@@ -114,12 +143,17 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "live mode requires paper=false, dry_run=false, and exact confirmation"
                 )
-            if not any(exchange.execution_enabled for exchange in self.exchanges):
+            enabled_execution = [
+                exchange for exchange in self.exchanges if exchange.execution_enabled
+            ]
+            if not enabled_execution:
                 raise ValueError("live mode requires an explicitly execution-enabled exchange")
             if self.environment != "production":
                 raise ValueError("live mode requires environment=production")
             if self.live.adapter_name == "disabled":
                 raise ValueError("live mode requires a concrete execution adapter")
+            if sum(exchange.name == self.live.adapter_name for exchange in enabled_execution) != 1:
+                raise ValueError("live adapter must match exactly one execution-enabled exchange")
             if self.exchange_api_key is None or self.exchange_api_secret is None:
                 raise ValueError("live mode requires API credentials from the environment")
             if not self.live.withdrawal_permission_confirmed_disabled:
