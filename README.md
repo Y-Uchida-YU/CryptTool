@@ -23,6 +23,12 @@ Concrete live execution is not implemented and remains disabled.
 Concrete exchange ingestion, production WebSocket operation and representative market validation
 are also still required; see [review readiness](docs/review-readiness.md) for the exact boundary.
 
+Venue policy is account- and terms-based rather than domestic-only. Priority public adapters cover
+Hyperliquid, Aster, Bitget and MEXC, with domestic public adapters for GMO Coin, bitbank and
+bitFlyer. Every venue starts execution-disabled; BTCC is pending verification, while Bybit and
+Binance Global execution are forbidden for the Japan-resident profile. See the
+[venue policy and emergency runbook](docs/venue-policy.md).
+
 ## Setup
 
 ```bash
@@ -56,6 +62,9 @@ uv run app generate-report tests/fixtures/equity.csv \
   --trades-path tests/fixtures/trades.csv
 uv run app paper-trade tests/fixtures/paper_quotes.csv --quantity 0.1
 uv run app live-preflight  # intentionally exits 2 with the disabled adapter
+uv run app venue-status
+uv run app venue-capabilities hyperliquid
+uv run app public-data-smoke hyperliquid  # public metadata only
 ```
 
 The generated research report deliberately returns `INSUFFICIENT_EVIDENCE` until external,

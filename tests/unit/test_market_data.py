@@ -23,7 +23,11 @@ def bar(minute: int, volume: str = "10") -> OHLCV:
 
 
 def test_ohlcv_normalizes_utc_and_rejects_inconsistent() -> None:
-    assert bar(0).timestamp.tzinfo == UTC
+    observation = bar(0)
+    assert observation.timestamp.tzinfo == UTC
+    assert observation.exchange_timestamp == observation.timestamp
+    assert observation.received_at is not None and observation.available_at is not None
+    assert observation.local_monotonic_time >= 0
     with pytest.raises(ValidationError, match="inconsistent"):
         OHLCV(
             exchange="x",

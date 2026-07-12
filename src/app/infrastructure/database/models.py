@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Numeric, String, UniqueConstraint
+from sqlalchemy import DateTime, Float, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -17,6 +17,11 @@ class OHLCVRow(Base):
     symbol: Mapped[str] = mapped_column(String(40), index=True)
     timeframe: Mapped[str] = mapped_column(String(8))
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    local_monotonic_time: Mapped[float | None] = mapped_column(Float)
+    clock_offset_estimate: Mapped[float | None] = mapped_column(Float)
     open: Mapped[Decimal] = mapped_column(Numeric(30, 12))
     high: Mapped[Decimal] = mapped_column(Numeric(30, 12))
     low: Mapped[Decimal] = mapped_column(Numeric(30, 12))

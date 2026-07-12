@@ -22,10 +22,19 @@ THRESHOLDS = {
     "live_execution_interface": (
         95.0,
         (
-            "src/app/adapters/exchanges/",
+            "src/app/adapters/exchanges/base.py",
+            "src/app/adapters/exchanges/disabled.py",
+            "src/app/adapters/exchanges/staged_execution.py",
             "src/app/domain/execution/live_models.py",
             "src/app/infrastructure/database/audit.py",
             "src/app/services/live_trading/",
+        ),
+    ),
+    "venue_market_data_adapters": (
+        25.0,
+        (
+            "src/app/adapters/exchanges/public.py",
+            "src/app/adapters/exchanges/domestic.py",
         ),
     ),
     "paper_execution": (95.0, ("src/app/services/paper_trading/",)),

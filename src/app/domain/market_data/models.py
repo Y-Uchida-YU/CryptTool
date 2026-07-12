@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from time import monotonic
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -26,13 +28,39 @@ class TimedModel(BaseModel):
     exchange: str
     symbol: str
     timestamp: datetime
+    exchange_timestamp: datetime | None = None
+    received_at: datetime | None = None
+    available_at: datetime | None = None
+    local_monotonic_time: float = Field(default_factory=monotonic, ge=0)
+    clock_offset_estimate: float | None = None
 
-    @field_validator("timestamp")
+    @model_validator(mode="before")
     @classmethod
-    def timestamp_must_be_utc(cls, value: datetime) -> datetime:
+    def populate_cross_venue_clock(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "timestamp" in value:
+            result = dict(value)
+            result.setdefault("exchange_timestamp", value["timestamp"])
+            result.setdefault("received_at", datetime.now(UTC))
+            result.setdefault("available_at", result["received_at"])
+            return result
+        return value
+
+    @field_validator("timestamp", "exchange_timestamp", "received_at", "available_at")
+    @classmethod
+    def timestamp_must_be_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None:
             raise ValueError("timestamp must be timezone-aware")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def clock_order_is_causal(self) -> "TimedModel":
+        if self.exchange_timestamp is None or self.received_at is None or self.available_at is None:
+            raise ValueError("all cross-venue timestamps are required")
+        if self.available_at < self.received_at:
+            raise ValueError("available_at cannot precede received_at")
+        return self
 
 
 class OHLCV(TimedModel):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,13 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
 
+from app.adapters.exchanges.public import (
+    AsterMarketDataAdapter,
+    BitgetMarketDataAdapter,
+    HyperliquidMarketDataAdapter,
+    MexcMarketDataAdapter,
+    PublicRestAdapter,
+)
 from app.config.settings import Settings
 from app.domain.execution.models import InstrumentRules, MarketSnapshot, OrderType, TimeInForce
 from app.domain.features.engine import FeatureEngine
@@ -31,6 +39,7 @@ from app.services.regime_engine.rules import DeterministicRuleEngine
 from app.services.reporting.report import evaluate_acceptance, generate_report
 from app.services.validation.resampling import monte_carlo_paths
 from app.services.validation.splits import anchored_walk_forward, rolling_walk_forward
+from app.services.venue_eligibility import eligibility_from_settings
 
 app = typer.Typer(help="CryptBot research and market-regime CLI", no_args_is_help=True)
 
@@ -450,6 +459,63 @@ def health_check() -> None:
         connection.execute(text("SELECT 1"))
     engine.dispose()
     typer.echo("health check passed: configuration and database; execution API not contacted")
+
+
+def _priority_adapter(name: str) -> PublicRestAdapter:
+    adapters: dict[str, type[PublicRestAdapter]] = {
+        "hyperliquid": HyperliquidMarketDataAdapter,
+        "aster": AsterMarketDataAdapter,
+        "bitget": BitgetMarketDataAdapter,
+        "mexc": MexcMarketDataAdapter,
+    }
+    try:
+        return adapters[name]()
+    except KeyError as exc:
+        raise typer.BadParameter(f"unsupported priority venue: {name}") from exc
+
+
+@app.command("venue-status")
+def venue_status() -> None:
+    """Print configured eligibility without contacting an execution API."""
+    settings = Settings()
+    now = datetime.now(UTC)
+    for name in sorted(settings.venues):
+        item = eligibility_from_settings(settings, name)
+        allowed, reason = item.permits_new_orders(now)
+        typer.echo(
+            f"{name}: status={item.status.value} data={item.api_market_data_available} "
+            f"execution_allowed={allowed} reason={reason if not allowed else item.reason}"
+        )
+
+
+@app.command("venue-capabilities")
+def venue_capabilities(
+    venue: Annotated[str, typer.Argument(help="hyperliquid|aster|bitget|mexc")],
+) -> None:
+    """Print the audited Priority-1 capability matrix."""
+    adapter = _priority_adapter(venue)
+    typer.echo(adapter.capabilities.model_dump_json(indent=2))
+    asyncio.run(adapter.close())
+
+
+@app.command("public-data-smoke")
+def public_data_smoke(
+    venue: Annotated[str, typer.Argument(help="hyperliquid|aster|bitget|mexc")],
+) -> None:
+    """Fetch public market metadata only; never reads credentials or calls execution APIs."""
+
+    async def run() -> tuple[int, bool]:
+        adapter = _priority_adapter(venue)
+        try:
+            markets = await adapter.fetch_markets()
+            return len(markets), bool(markets)
+        finally:
+            await adapter.close()
+
+    count, healthy = asyncio.run(run())
+    typer.echo(f"{venue}: public_markets={count} healthy={healthy} execution_calls=0")
+    if not healthy:
+        raise typer.Exit(1)
 
 
 @app.command("live-preflight")

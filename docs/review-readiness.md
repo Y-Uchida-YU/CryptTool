@@ -24,10 +24,9 @@ domain foundation and safety boundary exist; they do not imply production venue 
 
 ## Partial or intentionally deferred
 
-- No concrete public-data exchange adapter is selected or enabled. The backfill CLI therefore
-  refuses or reports that deployment composition is required.
-- No venue WebSocket reconnect/reconciliation loop is shipped. Only the contracts and ingestion
-  quality/checkpoint primitives exist.
+- Priority-1 public REST and reconnecting public WebSocket adapters are implemented and were
+  smoke-tested on 2026-07-12. Backfill persistence still requires deployment composition and raw
+  payload retention for the selected feeds.
 - The database schema currently persists normalized OHLCV and audit events, not every listed raw
   market-data family. Production raw payload retention and quarantine tables remain to be designed
   alongside the selected data source and its licensing constraints.
@@ -37,7 +36,8 @@ domain foundation and safety boundary exist; they do not imply production venue 
   Operational scheduling for daily/weekly reports is deployment work.
 - The fixtures validate mechanics only. No representative historical dataset, untouched OOS
   period, cost calibration, walk-forward campaign or prolonged paper run has been supplied.
-- No concrete execution adapter or command capable of placing a real order is included.
+- Required Priority-1 execution adapter classes are staged fail-closed shells, not authenticated
+  implementations. No command capable of placing a real order is included.
 
 ## Required before production consideration
 

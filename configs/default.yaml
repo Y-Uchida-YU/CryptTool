@@ -57,3 +57,56 @@ live:
   preflight_ttl_seconds: 30
   minimum_data_quality: 0.90
   withdrawal_permission_confirmed_disabled: true
+venues:
+  hyperliquid: &priority_data_only
+    data_enabled: true
+    execution_enabled: false
+    eligibility_status: data_only
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    api_market_data_available: true
+    reason: "public data enabled; operator account, withdrawals and execution smoke unverified"
+  aster:
+    <<: *priority_data_only
+    terms_version: "2026-02-25"
+    reason: "official API and terms found; operator execution gates unverified"
+  bitget:
+    <<: *priority_data_only
+    terms_version: "2026-02-04"
+    reason: "Japan absent from current prohibited-country list; account verification required"
+  mexc:
+    <<: *priority_data_only
+    terms_version: "2026-04-17"
+    reason: "web/API eligibility requires verification; mobile apps unavailable in Japan"
+  gmo_coin:
+    <<: *priority_data_only
+    reason: "domestic public data"
+  bitbank:
+    <<: *priority_data_only
+    reason: "domestic public data"
+  bitflyer:
+    <<: *priority_data_only
+    reason: "domestic public data"
+  btcc:
+    data_enabled: false
+    execution_enabled: false
+    eligibility_status: pending_verification
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    reason: "PENDING_API_VERIFICATION: full private real-time and permission requirements unverified"
+  bybit: &jp_execution_forbidden
+    data_enabled: false
+    execution_enabled: false
+    eligibility_status: disabled
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    requires_location_evasion: true
+    reason: "execution adapter prohibited for Japan-resident operation"
+  binance_global:
+    <<: *jp_execution_forbidden
+venue_risk:
+  hyperliquid: {maximum_equity_fraction: 0.30}
+  aster: {maximum_equity_fraction: 0.15}
+  bitget: {maximum_equity_fraction: 0.20}
+  mexc: {maximum_equity_fraction: 0.10}
+  domestic_exchanges: {maximum_equity_fraction: 0.40}

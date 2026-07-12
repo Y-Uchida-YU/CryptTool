@@ -16,6 +16,7 @@ from app.domain.execution.live_models import (
 )
 from app.domain.risk.models import RiskDecision
 from app.services.live_trading.preflight import LivePreflightReport
+from app.services.venue_eligibility import execution_eligibility_reason
 
 
 class ExecutionAdapterError(RuntimeError):
@@ -249,6 +250,14 @@ class LiveExecutionGateway:
         }
         if request.exchange not in enabled_exchanges:
             return "exchange is not execution-enabled"
+        try:
+            eligibility_failure = execution_eligibility_reason(
+                self.settings, request.exchange, timestamp, reduce_only=request.reduce_only
+            )
+        except KeyError:
+            return "venue eligibility is not configured"
+        if eligibility_failure is not None:
+            return f"venue eligibility rejected execution: {eligibility_failure}"
         if request.symbol not in self.settings.live.allowed_symbols:
             return "symbol is not live-allowed"
         maximum = Decimal(str(self.settings.live.maximum_order_notional))

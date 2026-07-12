@@ -138,6 +138,23 @@ def live_settings(**live_overrides: object) -> Settings:
                 "execution_enabled": True,
             },
         ),
+        venues={
+            "sandbox": {
+                "data_enabled": True,
+                "execution_enabled": True,
+                "eligibility_status": "enabled",
+                "jurisdiction": "JP",
+                "terms_checked_at": NOW,
+                "operator_account_verified": True,
+                "api_market_data_available": True,
+                "api_execution_available": True,
+                "deposits_available": True,
+                "withdrawals_available": True,
+                "execution_smoke_test_passed": True,
+                "requires_location_evasion": False,
+                "reason": "test fixture",
+            }
+        },
     )
 
 
@@ -594,6 +611,40 @@ async def test_reduce_only_is_bounded_by_observed_position() -> None:
     )
     assert "exceeds open position" in too_large.reason
     assert adapter.place_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exit_only_blocks_entry_and_allows_position_bounded_reduction() -> None:
+    payload = live_settings().model_dump()
+    payload["venues"]["sandbox"]["eligibility_status"] = "exit_only"
+    settings = Settings.model_validate(payload)
+    adapter = FakeExecutionAdapter()
+    adapter.positions.append(
+        LivePosition(
+            exchange="sandbox",
+            symbol="BTC",
+            quantity=Decimal("0.1"),
+            mark_price=Decimal("100"),
+            unrealized_pnl=Decimal("0"),
+            observed_at=NOW,
+        )
+    )
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    entry = await gateway.place_order(order(), risk(), NOW)
+    assert "status is exit_only" in entry.reason
+    reduction = await gateway.place_order(
+        order(
+            "exit-only",
+            "idempotency-exit-only",
+            side=Side.SELL,
+            reduce_only=True,
+        ),
+        risk(False),
+        NOW,
+    )
+    assert reduction.state == LiveOrderState.ACCEPTED
 
 
 def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:

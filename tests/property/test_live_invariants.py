@@ -33,6 +33,22 @@ def settings() -> Settings:
             "maximum_order_notional": 100,
         },
         exchanges=({"name": "sandbox", "execution_enabled": True},),
+        venues={
+            "sandbox": {
+                "data_enabled": True,
+                "execution_enabled": True,
+                "eligibility_status": "enabled",
+                "jurisdiction": "JP",
+                "terms_checked_at": NOW,
+                "operator_account_verified": True,
+                "api_market_data_available": True,
+                "api_execution_available": True,
+                "deposits_available": True,
+                "withdrawals_available": True,
+                "execution_smoke_test_passed": True,
+                "reason": "property test",
+            }
+        },
     )
 
 

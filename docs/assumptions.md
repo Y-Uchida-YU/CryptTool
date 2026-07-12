@@ -1,7 +1,11 @@
 # Assumptions and defaults
 
 - Jurisdiction and exchange terms can change. The operator must confirm eligibility before enabling an adapter. Data access does not imply permission to trade.
-- Bybit is configured disabled and considered a public-data research candidate only; no execution implementation is supplied. Binance public market-data endpoints are a data-only candidate, not a required dependency. Kraken/Coinbase and Japanese registered venues require separate capability adapters because derivative fields differ.
+- Venue scope is not limited to domestically registered exchanges. It is based on a Japan-resident
+  operator's real account and official API access without location evasion. Hyperliquid, Aster,
+  Bitget and MEXC are Priority 1 public-data venues; GMO Coin, bitbank and bitFlyer are Priority 2.
+  BTCC remains pending verification. Bybit and Binance Global execution adapters are prohibited for
+  this operator profile, and both are disabled by default.
 - PostgreSQL 16 is production storage; SQLite is the zero-dependency development default.
 - Observation timestamps represent event/exchange time in UTC; ingestion time is separate. Naive timestamps are rejected.
 - Bars are usable only after closure. No intra-bar high/low is visible to a close-time signal before the close event.

@@ -23,7 +23,12 @@ deployment requirement rather than an implemented repository feature.
 
 ## Exchange comparison (design-time)
 
-Official APIs show differing capabilities: Binance publishes a separate public market-data endpoint and spot streams; Bybit V5 publishes derivative OI, funding, mark/index, ticker and public WebSockets. These sources justify capability negotiation rather than a common lowest-denominator implementation. Terms/availability are operational checks, so neither venue is enabled by default. See the official [Binance spot API repository](https://github.com/binance/binance-spot-api-docs), [Bybit OI endpoint](https://bybit-exchange.github.io/docs/v5/market/open-interest), [Bybit instrument metadata](https://bybit-exchange.github.io/docs/v5/market/instrument), and [Bybit public ticker](https://bybit-exchange.github.io/docs/v5/websocket/public/ticker).
+Official APIs expose materially different contracts, funding intervals, settlement assets and data
+families, so each venue has a capability matrix and instrument mapping rather than a common
+lowest-denominator assumption. Priority-1 public adapters are Hyperliquid, Aster, Bitget and MEXC;
+Priority-2 public adapters are GMO Coin, bitbank and bitFlyer. BTCC is pending verification. Bybit
+and Binance Global execution is forbidden for the Japan-resident profile. Terms and real-account
+eligibility are rechecked operationally rather than inferred permanently from API reachability.
 
 ## Technology decisions
 

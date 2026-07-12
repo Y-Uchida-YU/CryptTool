@@ -35,7 +35,8 @@ async def test_backfill_persists_only_after_quality_gate_and_advances_checkpoint
 
     result = await service.ingest(healthy)
     assert result.quality_score == 1
-    assert persisted == [(bar(0), bar(1))]
+    assert len(persisted) == 1
+    assert [item.timestamp for item in persisted[0]] == [bar(0).timestamp, bar(1).timestamp]
     assert service.checkpoint == bar(1).timestamp
 
     async def duplicate():  # type: ignore[no-untyped-def]

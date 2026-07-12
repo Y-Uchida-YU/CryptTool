@@ -7,3 +7,10 @@ Derived tables are `feature_sets(feature_time, available_at, feature_version, va
 PostgreSQL partitions high-volume facts monthly by event time; BRIN indexes serve time scans and B-tree indexes serve natural keys. Retention is configurable by data class. Migrations are forward-only in production and checked by CI. `OHLCVRow` and `AuditEvent` are the Phase 1 executable schema nucleus; other tables are added with concrete adapters to avoid premature schemas.
 
 Feature availability time is explicit: OHLCV features become available after bar close plus configured data delay; funding at publication time; OI at exchange timestamp plus observed latency; order-book features at sequence application time. Joins are backward as-of joins only.
+## Cross-venue additions
+
+Every normalized timed observation carries `exchange_timestamp`, `received_at`, `available_at`,
+`local_monotonic_time` and an optional `clock_offset_estimate`. Migration
+`0002_cross_venue_clock` adds those provenance columns to OHLCV persistence. `CanonicalAsset`,
+`CanonicalInstrument` and `VenueInstrumentMapping` prevent ticker-only cross-venue joins by checking
+quote, settlement, contract multiplier, inverse flag, funding interval and index composition.

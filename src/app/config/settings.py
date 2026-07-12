@@ -1,13 +1,16 @@
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
+
+from app.domain.venues.models import VenueEligibilityStatus
 
 
 class RiskSettings(BaseModel):
@@ -41,6 +44,34 @@ class ExchangeSettings(BaseModel):
     execution_enabled: bool = False
     rest_url: str | None = None
     ws_url: str | None = None
+
+
+class VenueSettings(BaseModel):
+    data_enabled: bool = False
+    execution_enabled: bool = False
+    eligibility_status: VenueEligibilityStatus = VenueEligibilityStatus.DATA_ONLY
+    jurisdiction: str = "JP"
+    terms_checked_at: datetime = Field(default_factory=lambda: datetime(1970, 1, 1, tzinfo=UTC))
+    terms_version: str | None = None
+    operator_account_verified: bool = False
+    api_market_data_available: bool = False
+    api_execution_available: bool = False
+    deposits_available: bool = False
+    withdrawals_available: bool = False
+    execution_smoke_test_passed: bool = False
+    requires_location_evasion: bool = False
+    reason: str = "not verified"
+
+    @field_validator("terms_checked_at")
+    @classmethod
+    def terms_checked_at_must_be_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("terms_checked_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+
+class VenueRiskSettings(BaseModel):
+    maximum_equity_fraction: float = Field(gt=0, le=1)
 
 
 class BacktestSettings(BaseModel):
@@ -116,6 +147,8 @@ class Settings(BaseSettings):
     exchanges: tuple[ExchangeSettings, ...] = (
         ExchangeSettings(name="bybit_public", data_enabled=False),
     )
+    venues: dict[str, VenueSettings] = Field(default_factory=dict)
+    venue_risk: dict[str, VenueRiskSettings] = Field(default_factory=dict)
 
     @classmethod
     def settings_customise_sources(
@@ -168,6 +201,17 @@ class Settings(BaseSettings):
             symbol not in self.symbols for symbol in self.live.allowed_symbols
         ):
             raise ValueError("live allowed symbols must be a non-empty subset of symbols")
+        forbidden_execution = {"bybit", "binance_global"}
+        if any(
+            name in forbidden_execution and venue.execution_enabled
+            for name, venue in self.venues.items()
+        ):
+            raise ValueError("Bybit and Binance Global execution is forbidden for JP operators")
+        if any(
+            venue.requires_location_evasion and (venue.data_enabled or venue.execution_enabled)
+            for venue in self.venues.values()
+        ):
+            raise ValueError("venues requiring location evasion must remain disabled")
         return self
 
 

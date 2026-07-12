@@ -31,12 +31,14 @@ sanitized audit events. No concrete venue execution adapter is included.
 
 ## Verification snapshot
 
-- 140 automated tests pass on Python 3.12, including async integration and Hypothesis invariants.
-- Overall line coverage: 95.03%.
+- 150 automated tests pass on Python 3.12, including async integration and Hypothesis invariants.
+- Overall line coverage: 89.03% after adding externally smoke-tested venue adapters.
 - Risk coverage: 100.00%.
-- Execution/backtest coverage: 98.94%.
+- Execution/backtest coverage: 97.67%.
 - Regime coverage: 95.30%.
-- Phase 9 live-interface coverage: 99.00% and enforced at 95% in CI.
+- Phase 9 live-interface coverage: 96.23% and enforced at 95% in CI.
+- Venue market-data adapter coverage: 36.62%, enforced at 25% plus explicit public API smoke;
+  external venue availability is not made a CI dependency.
 - Paper execution coverage: 98.57% and enforced at 95% in CI.
 - `ruff check`, `ruff format --check`, strict `mypy`, Alembic upgrade/check and Bandit pass.
 - Mechanical fixture: two causal fills and final equity 1000.166610 from 1000 initial cash.
@@ -50,7 +52,8 @@ market history and must not be cited as a trading edge.
 ## Remaining before an edge can be evaluated
 
 - Select an exchange/data vendor that the operator is currently permitted to use.
-- Implement and contract-test that concrete public-data adapter.
+- Compose the implemented public-data adapters with durable raw ingestion, quarantine and
+  checkpoint storage for the selected production feeds.
 - Acquire licensed, point-in-time OHLCV, funding, OI, liquidation and book data with survivorship
   and outage records.
 - Freeze hypotheses and parameter grids before observing final results.
