@@ -1,0 +1,4 @@
+symbol,timestamp,bid,ask,bid_size,ask_size,data_quality_score,sequence
+BTC,2025-01-01T00:00:00Z,99,101,10,10,1.0,1
+BTC,2025-01-01T00:00:01Z,100,102,10,10,1.0,2
+BTC,2025-01-01T00:00:02Z,101,103,10,10,1.0,3

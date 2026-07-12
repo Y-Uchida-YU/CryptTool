@@ -1,0 +1,5 @@
+entry_time,exit_time,net_pnl,gross_pnl,notional,fee,funding_pnl,slippage_cost,market_impact_cost,regime,strategy,symbol
+2025-01-01T00:00:00Z,2025-01-01T01:00:00Z,2.0,2.3,100,0.1,-0.05,0.1,0.05,TREND_UP,trend_following,BTC
+2025-01-02T00:00:00Z,2025-01-02T00:30:00Z,-1.0,-0.7,100,0.1,-0.05,0.1,0.05,RANGE,mean_reversion,ETH
+2025-01-03T00:00:00Z,2025-01-03T02:00:00Z,1.5,1.8,100,0.1,-0.05,0.1,0.05,TREND_UP,trend_following,SOL
+2025-01-04T00:00:00Z,2025-01-04T00:20:00Z,-2.5,-2.2,100,0.1,-0.05,0.1,0.05,HIGH_VOLATILITY,flash_crash_reversal,BTC

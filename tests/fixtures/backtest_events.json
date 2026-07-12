@@ -1,0 +1,24 @@
+{
+  "initial_cash": "1000",
+  "rules": [
+    {
+      "exchange": "simulation",
+      "symbol": "BTC/USDT",
+      "tick_size": "0.1",
+      "lot_size": "0.001",
+      "minimum_notional": "5",
+      "maker_fee_rate": "0.0002",
+      "taker_fee_rate": "0.0006",
+      "maintenance_margin_rate": "0.005"
+    }
+  ],
+  "events": [
+    {"type": "market", "timestamp": "2025-01-01T00:00:00Z", "exchange": "simulation", "symbol": "BTC/USDT", "bid": "99", "ask": "101", "bid_quantity": "10", "ask_quantity": "10", "mark_price": "100"},
+    {"type": "signal", "timestamp": "2025-01-01T00:00:00.100Z", "signal_id": "fixture-entry", "exchange": "simulation", "symbol": "BTC/USDT", "side": "buy", "quantity": "0.1", "calculation_delay_ms": 50, "submission_delay_ms": 100, "stop_loss": "90", "take_profit": "110"},
+    {"type": "market", "timestamp": "2025-01-01T00:00:01Z", "exchange": "simulation", "symbol": "BTC/USDT", "bid": "100", "ask": "102", "bid_quantity": "10", "ask_quantity": "10", "mark_price": "101"},
+    {"type": "funding", "timestamp": "2025-01-01T00:00:02Z", "exchange": "simulation", "symbol": "BTC/USDT", "rate": "0.0001", "mark_price": "103"},
+    {"type": "market", "timestamp": "2025-01-01T00:00:03Z", "exchange": "simulation", "symbol": "BTC/USDT", "bid": "105", "ask": "107", "bid_quantity": "10", "ask_quantity": "10", "mark_price": "106"},
+    {"type": "signal", "timestamp": "2025-01-01T00:00:03.100Z", "signal_id": "fixture-exit", "exchange": "simulation", "symbol": "BTC/USDT", "side": "sell", "quantity": "0.1", "calculation_delay_ms": 50, "submission_delay_ms": 100, "reduce_only": true},
+    {"type": "market", "timestamp": "2025-01-01T00:00:04Z", "exchange": "simulation", "symbol": "BTC/USDT", "bid": "104", "ask": "106", "bid_quantity": "10", "ask_quantity": "10", "mark_price": "105"}
+  ]
+}
