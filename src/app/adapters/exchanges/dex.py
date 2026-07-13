@@ -20,6 +20,16 @@ from app.domain.market_data.models import (
 )
 from app.domain.venues.models import CapabilitySupport, VenueCapabilityMatrix
 
+DYDX_RESOLUTIONS = {
+    "1m": "1MIN",
+    "5m": "5MINS",
+    "15m": "15MINS",
+    "30m": "30MINS",
+    "1h": "1HOUR",
+    "4h": "4HOURS",
+    "1d": "1DAY",
+}
+
 
 class DataSourceLayer(StrEnum):
     INDEXER = "indexer"
@@ -53,8 +63,7 @@ def _matrix(venue: str, **supports: CapabilitySupport) -> VenueCapabilityMatrix:
 class DydxMarketDataAdapter(PublicRestAdapter):
     venue = "dydx"
     base_url = "https://indexer.dydx.trade/v4"
-    node_url = "https://dydx-ops-rpc.kingnodes.com"
-    data_enabled, execution_enabled, status = True, False, "DATA_ONLY"
+    data_enabled, execution_enabled, status = False, False, "EXPERIMENTAL_DATA_ONLY"
     capabilities = _matrix(
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
@@ -62,7 +71,7 @@ class DydxMarketDataAdapter(PublicRestAdapter):
         funding_history=CapabilitySupport.IMPLEMENTED,
         open_interest=CapabilitySupport.IMPLEMENTED,
         orderbook_snapshot=CapabilitySupport.IMPLEMENTED,
-        orderbook_delta=CapabilitySupport.IMPLEMENTED,
+        orderbook_delta=CapabilitySupport.DOCUMENTED,
         trades=CapabilitySupport.IMPLEMENTED,
         mark_price=CapabilitySupport.IMPLEMENTED,
         index_price=CapabilitySupport.IMPLEMENTED,
@@ -100,9 +109,13 @@ class DydxMarketDataAdapter(PublicRestAdapter):
         end: datetime | None = None,
         limit: int = 100,
     ) -> Sequence[OHLCV]:
+        try:
+            resolution = DYDX_RESOLUTIONS[timeframe]
+        except KeyError as exc:
+            raise ValueError(f"unsupported dYdX timeframe: {timeframe}") from exc
         data = await self._get(
             f"/candles/perpetualMarkets/{symbol}",
-            resolution=timeframe,
+            resolution=resolution,
             limit=limit,
             fromISO=start.isoformat() if start else None,
             toISO=end.isoformat() if end else None,
@@ -171,27 +184,31 @@ class DydxMarketDataAdapter(PublicRestAdapter):
             for x in data.get("historicalFunding", [])
         )
 
-    async def fetch_system_status(self) -> SourcedData:
-        return SourcedData(DataSourceLayer.INDEXER, await self._get("/screen"))
+    async def fetch_indexer_time(self) -> SourcedData:
+        return SourcedData(DataSourceLayer.INDEXER, await self._get("/time"))
 
-    async def fetch_block_time(self) -> SourcedData:
-        response = await self.client.get(self.node_url + "/status")
-        response.raise_for_status()
-        return SourcedData(DataSourceLayer.FULL_NODE, response.json())
+    async def fetch_indexer_height(self) -> SourcedData:
+        return SourcedData(DataSourceLayer.INDEXER, await self._get("/height"))
+
+    async def screen_address(self, address: str) -> SourcedData:
+        if not address.strip():
+            raise ValueError("address is required")
+        return SourcedData(DataSourceLayer.INDEXER, await self._get("/screen", address=address))
 
     async def fetch_liquidations(self, symbol: str) -> SourcedData:
-        return SourcedData(DataSourceLayer.INDEXER, await self._get("/liquidations", market=symbol))
+        del symbol
+        raise CapabilityUnavailableError("dYdX liquidation contract is not verified")
 
     async def fetch_current_market_state(self, symbol: str) -> SourcedData:
         return SourcedData(
             DataSourceLayer.INDEXER,
-            await self._get("/perpetualMarkets", ticker=symbol),
+            await self._get("/perpetualMarkets", market=symbol),
         )
 
 
 class ParadexMarketDataAdapter(PublicRestAdapter):
     venue, base_url = "paradex", "https://api.prod.paradex.trade/v1"
-    data_enabled, execution_enabled, status = True, False, "DATA_ONLY"
+    data_enabled, execution_enabled, status = False, False, "EXPERIMENTAL_DATA_ONLY"
     capabilities = _matrix(
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
@@ -337,13 +354,13 @@ class ParadexMarketDataAdapter(PublicRestAdapter):
 
 class LighterMarketDataAdapter(PublicRestAdapter):
     venue, base_url = "lighter", "https://mainnet.zklighter.elliot.ai/api/v1"
-    data_enabled, execution_enabled, status = True, False, "EXPERIMENTAL_DATA_ONLY"
+    data_enabled, execution_enabled, status = False, False, "EXPERIMENTAL_DATA_ONLY"
     capabilities = _matrix(
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
         funding_current=CapabilitySupport.IMPLEMENTED,
         orderbook_snapshot=CapabilitySupport.IMPLEMENTED,
-        orderbook_delta=CapabilitySupport.IMPLEMENTED,
+        orderbook_delta=CapabilitySupport.DOCUMENTED,
         trades=CapabilitySupport.IMPLEMENTED,
         mark_price=CapabilitySupport.IMPLEMENTED,
         index_price=CapabilitySupport.IMPLEMENTED,

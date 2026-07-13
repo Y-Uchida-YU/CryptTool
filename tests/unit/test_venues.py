@@ -29,6 +29,8 @@ from app.domain.strategies.cross_venue import (
 )
 from app.domain.venues.models import (
     CanonicalInstrument,
+    CapabilitySupport,
+    CapabilityUseCase,
     InstrumentKind,
     VenueCapabilityMatrix,
     VenueEligibility,
@@ -83,11 +85,13 @@ def test_eligibility_fails_closed_and_exit_only_reduces() -> None:
 
 def test_capability_and_instrument_identity_are_explicit() -> None:
     matrix = VenueCapabilityMatrix(venue="x", detected_at=NOW, source_version="test", spot=True)
-    matrix.require("spot")
+    matrix.require("spot", CapabilityUseCase.RESEARCH_COLLECTION, NOW, timedelta(days=1))
     with pytest.raises(CapabilityUnavailableError):
-        matrix.require("open_interest")
+        matrix.require(
+            "open_interest", CapabilityUseCase.RESEARCH_COLLECTION, NOW, timedelta(days=1)
+        )
     with pytest.raises(ValueError, match="unknown"):
-        matrix.require("made_up")
+        matrix.require("made_up", CapabilityUseCase.RESEARCH_COLLECTION, NOW, timedelta(days=1))
     canonical = CanonicalInstrument(
         instrument_id="BTC-USDT-PERP",
         base_asset_id="BTC",
@@ -359,6 +363,6 @@ def test_priority_one_capability_matrices_exist() -> None:
         BitgetMarketDataAdapter,
         MexcMarketDataAdapter,
     ):
-        assert adapter.capabilities.perpetual
-        assert adapter.capabilities.orderbook_snapshot
-    assert not MexcMarketDataAdapter.capabilities.open_interest
+        assert adapter.capabilities.perpetual.support != CapabilitySupport.UNAVAILABLE
+        assert adapter.capabilities.orderbook_snapshot.support != CapabilitySupport.UNAVAILABLE
+    assert MexcMarketDataAdapter.capabilities.open_interest.support == CapabilitySupport.DEGRADED

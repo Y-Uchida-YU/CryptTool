@@ -15,7 +15,7 @@ from app.adapters.exchanges.websocket import ResilientWebSocketSession, StreamCl
 from app.domain.market_data.models import OrderBook, OrderBookLevel
 from app.domain.venues.attribution import VenueValueAttribution, aggregate_venue_value
 from app.domain.venues.discovery import DISCOVERY_REGISTRY, DiscoveryDecision
-from app.domain.venues.models import CapabilitySupport, VenueCapability
+from app.domain.venues.models import CapabilitySupport, CapabilityUseCase, VenueCapability
 
 NOW = datetime(2026, 7, 12, tzinfo=UTC)
 
@@ -31,8 +31,14 @@ def test_capability_lifecycle_and_stale_expiry() -> None:
         at=NOW + timedelta(hours=2),
         verification_run_id="run-1",
     )
-    assert capability.usable_for_new_exposure(NOW + timedelta(hours=3), timedelta(days=1))
-    assert not capability.usable_for_new_exposure(NOW + timedelta(days=2), timedelta(days=1))
+    assert capability.supports(
+        CapabilityUseCase.NEW_EXPOSURE, now=NOW + timedelta(hours=3), maximum_age=timedelta(days=1)
+    )
+    assert not capability.supports(
+        CapabilityUseCase.NEW_EXPOSURE, now=NOW + timedelta(days=2), maximum_age=timedelta(days=1)
+    )
+    with pytest.raises(TypeError):
+        bool(capability)
     assert MexcMarketDataAdapter.capabilities.open_interest.support == CapabilitySupport.DEGRADED
     assert MexcMarketDataAdapter.capabilities.open_interest.failure_reason
 
@@ -125,7 +131,7 @@ async def test_dex_public_fixtures_and_execution_disabled() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://test")
         adapter = adapter_type(client)
         assert await adapter.fetch_markets(), path
-        assert adapter.data_enabled and not adapter.execution_enabled
+        assert not adapter.data_enabled and not adapter.execution_enabled
         await client.aclose()
     with pytest.raises(CapabilityUnavailableError):
         await LighterMarketDataAdapter().fetch_liquidations("0")

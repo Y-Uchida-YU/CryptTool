@@ -48,6 +48,7 @@ class ExchangeSettings(BaseModel):
 
 class VenueSettings(BaseModel):
     data_enabled: bool = False
+    experimental_recording_enabled: bool = False
     execution_enabled: bool = False
     eligibility_status: VenueEligibilityStatus = VenueEligibilityStatus.DATA_ONLY
     jurisdiction: str = "JP"

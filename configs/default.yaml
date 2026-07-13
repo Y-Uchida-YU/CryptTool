@@ -80,12 +80,18 @@ venues:
     reason: "web/API eligibility requires verification; mobile apps unavailable in Japan"
   dydx:
     <<: *priority_data_only
+    data_enabled: false
+    experimental_recording_enabled: true
     reason: "DATA_ONLY: public Indexer/Full Node data; execution intentionally disabled"
   paradex:
     <<: *priority_data_only
+    data_enabled: false
+    experimental_recording_enabled: true
     reason: "DATA_ONLY: public market data; JWT/Subkey execution intentionally disabled"
   lighter:
     <<: *priority_data_only
+    data_enabled: false
+    experimental_recording_enabled: true
     reason: "EXPERIMENTAL_DATA_ONLY: emerging venue health monitoring required"
   gmo_coin:
     <<: *priority_data_only
