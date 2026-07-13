@@ -5,6 +5,7 @@ from typing import Any
 
 from app.domain.execution.live_models import (
     CancelAck,
+    ExecutionFill,
     ExecutionOrderAck,
     LiveOpenOrder,
     LiveOrderRequest,
@@ -69,7 +70,7 @@ class ExecutionAdapter(ABC):
     @abstractmethod
     async def fetch_positions(self) -> Sequence[LivePosition]: ...
     @abstractmethod
-    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]: ...
+    async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]: ...
     @abstractmethod
     async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
     @abstractmethod

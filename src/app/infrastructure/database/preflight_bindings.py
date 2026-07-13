@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any, cast
 
 from sqlalchemy import insert, update
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.infrastructure.database.models import PreflightBindingRow
 from app.services.live_trading.cross_venue_preflight import (
+    PositionReconciliationSnapshot,
     PreflightBinding,
     PreflightBindingState,
 )
@@ -72,6 +74,18 @@ class PostgreSQLPreflightBindingRepository:
             "created_at": binding.created_at,
             "updated_at": binding.updated_at,
             "failure_reason": binding.failure_reason,
+            "position_venue": (
+                binding.position_snapshot.venue if binding.position_snapshot else None
+            ),
+            "position_symbol": (
+                binding.position_snapshot.symbol if binding.position_snapshot else None
+            ),
+            "position_quantity_before": (
+                binding.position_snapshot.quantity_before if binding.position_snapshot else None
+            ),
+            "position_captured_at": (
+                binding.position_snapshot.captured_at if binding.position_snapshot else None
+            ),
         }
 
     @staticmethod
@@ -89,4 +103,21 @@ class PostgreSQLPreflightBindingRepository:
             created_at=row.created_at,
             updated_at=row.updated_at,
             failure_reason=row.failure_reason,
+            position_snapshot=(
+                PositionReconciliationSnapshot(
+                    venue=row.position_venue,
+                    symbol=row.position_symbol,
+                    quantity_before=row.position_quantity_before,
+                    captured_at=(
+                        row.position_captured_at.replace(tzinfo=UTC)
+                        if row.position_captured_at.tzinfo is None
+                        else row.position_captured_at
+                    ),
+                )
+                if row.position_venue is not None
+                and row.position_symbol is not None
+                and row.position_quantity_before is not None
+                and row.position_captured_at is not None
+                else None
+            ),
         )

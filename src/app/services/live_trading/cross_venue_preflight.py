@@ -5,6 +5,7 @@ import hmac
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from threading import Lock
 from typing import Any, Protocol
@@ -25,6 +26,21 @@ class PreflightBindingState(StrEnum):
 
 
 @dataclass(frozen=True)
+class PositionReconciliationSnapshot:
+    venue: str
+    symbol: str
+    quantity_before: Decimal
+    captured_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.venue or not self.symbol:
+            raise ValueError("position snapshot venue and symbol are required")
+        if self.captured_at.tzinfo is None:
+            raise ValueError("position snapshot timestamp must be timezone-aware")
+        object.__setattr__(self, "captured_at", self.captured_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
 class PreflightBinding:
     signal_id: str
     preflight_hash: str | None
@@ -38,6 +54,7 @@ class PreflightBinding:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     failure_reason: str | None = None
+    position_snapshot: PositionReconciliationSnapshot | None = None
 
 
 class PreflightBindingRepository(Protocol):

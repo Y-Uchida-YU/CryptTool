@@ -1,9 +1,11 @@
 from collections.abc import Sequence
+from datetime import datetime
 from typing import NoReturn
 
 from app.adapters.exchanges.base import ExecutionAdapter
 from app.domain.execution.live_models import (
     CancelAck,
+    ExecutionFill,
     ExecutionOrderAck,
     LiveOpenOrder,
     LiveOrderRequest,
@@ -51,8 +53,8 @@ class StagedExecutionAdapter(ExecutionAdapter):
     async def fetch_positions(self) -> Sequence[LivePosition]:
         self._blocked()
 
-    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
-        del symbol
+    async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]:
+        del symbol, since
         self._blocked()
 
     async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:

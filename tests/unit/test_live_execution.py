@@ -22,6 +22,7 @@ from app.domain.execution.leg_state import LegExecutionMachine, LegRiskPolicy, P
 from app.domain.execution.live_models import (
     CancelAck,
     ExecutionAuditEvent,
+    ExecutionFill,
     ExecutionOrderAck,
     LiveOpenOrder,
     LiveOrderRequest,
@@ -51,6 +52,7 @@ from app.infrastructure.database.preflight_bindings import (
 from app.services.live_trading.cross_venue_preflight import (
     CrossVenuePreflightService,
     InMemoryPreflightBindingRepository,
+    PositionReconciliationSnapshot,
     PreflightBinding,
     PreflightBindingState,
     new_binding,
@@ -156,7 +158,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.trusted_capability_registry = trusted_registry()
         self.cross_venue_preflight_service = PREFLIGHT_SERVICE
         self.preflight_binding_repository = DurableTestBindingRepository()
-        self.recent_fills: list[ExecutionOrderAck] = []
+        self.recent_fills: list[ExecutionFill] = []
         self.lookup_result: ExecutionOrderAck | None = None
         self.recent_fills_calls = 0
         self.fail_recent_fills = False
@@ -225,8 +227,8 @@ class FakeExecutionAdapter(ExecutionAdapter):
     async def health_check(self) -> bool:
         return self.healthy
 
-    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
-        del symbol
+    async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]:
+        del symbol, since
         self.recent_fills_calls += 1
         if self.fail_recent_fills:
             raise ConnectionError("recent fills unavailable")
@@ -544,9 +546,23 @@ async def test_non_concrete_reconciliation_methods_fail_closed(
     adapter: ExecutionAdapter, error: type[Exception]
 ) -> None:
     with pytest.raises(error):
-        await adapter.fetch_recent_fills("BTC")
+        await adapter.fetch_recent_fills("BTC", NOW)
     with pytest.raises(error):
         await adapter.lookup_order_by_client_id("request-id")
+    if isinstance(adapter, StagedExecutionAdapter):
+        assert adapter.adapter_name == "staged"
+        with pytest.raises(error):
+            await adapter.place_order(order())
+        with pytest.raises(error):
+            await adapter.cancel_order("external-id")
+        with pytest.raises(error):
+            await adapter.cancel_all_orders("BTC")
+        with pytest.raises(error):
+            await adapter.fetch_open_orders("BTC")
+        with pytest.raises(error):
+            await adapter.fetch_positions()
+        with pytest.raises(error):
+            await adapter.close_position("BTC")
 
 
 def test_unknown_strategy_and_required_capability_mismatch_fail_closed() -> None:
@@ -799,11 +815,14 @@ async def test_pre_submit_failure_releases_preflight_reservation() -> None:
     adapter = FakeExecutionAdapter()
     adapter.open_orders = [
         LiveOpenOrder(
+            client_order_id=f"unrelated-{index}",
             external_order_id=f"open-{index}",
             exchange="sandbox",
             symbol="BTC",
             side=Side.BUY,
             quantity=Decimal("0.1"),
+            filled_quantity=Decimal(0),
+            price=Decimal("100"),
             reduce_only=False,
             created_at=NOW,
         )
@@ -995,7 +1014,8 @@ async def test_reconciliation_uses_all_order_sources_and_resolves_first_leg() ->
     )
     binding = await gateway.reconcile_binding(request, NOW)
     assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
-    assert adapter.recent_fills_calls == adapter.lookup_calls == adapter.positions_calls == 1
+    assert adapter.recent_fills_calls == adapter.lookup_calls == 1
+    assert adapter.positions_calls == 2  # submission snapshot plus reconciliation snapshot
     assert request.symbol in adapter.open_orders_symbols
 
 
@@ -1011,6 +1031,215 @@ async def test_unknown_reconciliation_halts_binding() -> None:
     with pytest.raises(ExecutionAdapterError):
         await gateway.place_order(request, risk(), NOW)
     adapter.fail_recent_fills = True
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
+
+
+def open_order_for(
+    request: LiveOrderRequest,
+    *,
+    client_order_id: str | None = None,
+    created_at: datetime = NOW,
+) -> LiveOpenOrder:
+    return LiveOpenOrder(
+        client_order_id=client_order_id or request.request_id,
+        external_order_id=f"external-{client_order_id or request.request_id}",
+        exchange=request.exchange,
+        symbol=request.symbol,
+        side=request.side,
+        quantity=request.quantity,
+        filled_quantity=Decimal(0),
+        price=request.reference_price,
+        reduce_only=request.reduce_only,
+        created_at=created_at,
+    )
+
+
+def fill_for(
+    request: LiveOrderRequest,
+    *,
+    client_order_id: str | None = None,
+    quantity: Decimal | None = None,
+) -> ExecutionFill:
+    identity = client_order_id or request.request_id
+    return ExecutionFill(
+        fill_id=f"fill-{identity}",
+        exchange_order_id=f"external-{identity}",
+        client_order_id=identity,
+        exchange=request.exchange,
+        symbol=request.symbol,
+        side=request.side,
+        price=request.reference_price,
+        quantity=quantity or request.quantity,
+        fee=Decimal("0.01"),
+        executed_at=NOW,
+        liquidity_role="taker",
+    )
+
+
+async def timed_out_gateway(
+    *, positions: list[LivePosition] | None = None
+) -> tuple[LiveExecutionGateway, FakeExecutionAdapter, LiveOrderRequest]:
+    adapter = FakeExecutionAdapter()
+    adapter.positions = positions or []
+    adapter.fail_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(request, risk(), NOW)
+    adapter.fail_place = False
+    return gateway, adapter, request
+
+
+@pytest.mark.asyncio
+async def test_unrelated_open_order_for_same_symbol_is_not_accepted() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.open_orders = [open_order_for(request, client_order_id="unrelated-request")]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_existing_position_alone_is_not_accepted() -> None:
+    existing = LivePosition(
+        exchange="sandbox",
+        symbol="BTC",
+        quantity=Decimal("5"),
+        mark_price=Decimal("100"),
+        unrealized_pnl=Decimal(0),
+        observed_at=NOW,
+    )
+    gateway, _adapter, request = await timed_out_gateway(positions=[existing])
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_only_matching_client_order_id_open_order_is_recognized() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.open_orders = [
+        open_order_for(request, client_order_id="unrelated-request"),
+        open_order_for(request),
+    ]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert binding.first_external_order_id == f"external-{request.request_id}"
+
+
+@pytest.mark.asyncio
+async def test_only_matching_client_order_id_fill_is_recognized() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.recent_fills = [fill_for(request, client_order_id="unrelated-request")]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_position_without_delta_means_order_not_filled() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.recent_fills = []
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_matching_fill_and_position_delta_confirm_order() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.recent_fills = [fill_for(request)]
+    adapter.positions = [
+        LivePosition(
+            exchange=request.exchange,
+            symbol=request.symbol,
+            quantity=request.quantity,
+            mark_price=request.reference_price,
+            unrealized_pnl=Decimal(0),
+            observed_at=NOW,
+        )
+    ]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert binding.first_external_order_id == f"external-{request.request_id}"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_matching_open_orders_halt_as_ambiguous() -> None:
+    repository = FailOnceBindingRepository()
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    request = order()
+    adapter.open_orders = [open_order_for(request), open_order_for(request)]
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert adapter.place_calls == 0
+    assert gateway.preflight_binding(request.signal_id).state == PreflightBindingState.HALTED
+
+
+@pytest.mark.asyncio
+async def test_duplicate_fill_identity_halts_reconciliation() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    duplicate = fill_for(request)
+    adapter.recent_fills = [duplicate, duplicate]
+    adapter.positions = [
+        LivePosition(
+            exchange=request.exchange,
+            symbol=request.symbol,
+            quantity=request.quantity,
+            mark_price=request.reference_price,
+            unrealized_pnl=Decimal(0),
+            observed_at=NOW,
+        )
+    ]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
+
+
+@pytest.mark.asyncio
+async def test_fill_without_matching_position_delta_halts_reconciliation() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.recent_fills = [fill_for(request)]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
+
+
+@pytest.mark.asyncio
+async def test_unexplained_position_delta_halts_reconciliation() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.positions = [
+        LivePosition(
+            exchange=request.exchange,
+            symbol=request.symbol,
+            quantity=request.quantity,
+            mark_price=request.reference_price,
+            unrealized_pnl=Decimal(0),
+            observed_at=NOW,
+        )
+    ]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
+
+
+@pytest.mark.asyncio
+async def test_duplicate_positions_make_fill_reconciliation_ambiguous() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.recent_fills = [fill_for(request)]
+    position = LivePosition(
+        exchange=request.exchange,
+        symbol=request.symbol,
+        quantity=request.quantity,
+        mark_price=request.reference_price,
+        unrealized_pnl=Decimal(0),
+        observed_at=NOW,
+    )
+    adapter.positions = [position, position]
     binding = await gateway.reconcile_binding(request, NOW)
     assert binding.state == PreflightBindingState.HALTED
 
@@ -1219,7 +1448,18 @@ def test_postgresql_binding_repository_persists_and_rejects_concurrent_cas(tmp_p
         state=PreflightBindingState.RESERVED,
         now=NOW,
     )
+    initial = replace(
+        initial,
+        position_snapshot=PositionReconciliationSnapshot(
+            venue="sandbox",
+            symbol="BTC",
+            quantity_before=Decimal("2.5"),
+            captured_at=NOW,
+        ),
+    )
     assert repository.compare_and_set("signal-cas", 0, initial)
+    assert not repository.compare_and_set("wrong-signal", 1, replace(initial, version=2))
+    assert not repository.compare_and_set("signal-cas", 0, initial)
     candidate = replace(
         initial,
         state=PreflightBindingState.FIRST_LEG_ACCEPTED,
@@ -1233,10 +1473,18 @@ def test_postgresql_binding_repository_persists_and_rejects_concurrent_cas(tmp_p
     assert sorted(results) == [False, True]
     restored = PostgreSQLPreflightBindingRepository(engine).get("signal-cas")
     assert restored is not None and restored.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert restored.position_snapshot == initial.position_snapshot
+
+
+def test_position_reconciliation_snapshot_rejects_invalid_identity_and_time() -> None:
+    with pytest.raises(ValueError, match="venue and symbol"):
+        PositionReconciliationSnapshot("", "BTC", Decimal(0), NOW)
+    with pytest.raises(ValueError, match="timestamp"):
+        PositionReconciliationSnapshot("sandbox", "BTC", Decimal(0), datetime(2025, 1, 1))
 
 
 @pytest.mark.asyncio
-async def test_cas_conflict_reloads_binding_and_all_exchange_state() -> None:
+async def test_cas_conflict_unknown_state_requires_reconciliation() -> None:
     repository = FailOnceBindingRepository()
     adapter = FakeExecutionAdapter()
     settings = live_settings()
@@ -1248,12 +1496,37 @@ async def test_cas_conflict_reloads_binding_and_all_exchange_state() -> None:
     )
     request = order()
     receipt = await gateway.place_order(request, risk(), NOW)
-    assert receipt.state == LiveOrderState.ACCEPTED
+    assert receipt.state == LiveOrderState.REJECTED
+    assert gateway.preflight_binding(request.signal_id).state == (
+        PreflightBindingState.RECONCILIATION_REQUIRED
+    )
+    assert adapter.place_calls == 0
     assert repository.get_calls >= 3
     assert adapter.recent_fills_calls >= 1
     assert adapter.lookup_calls >= 1
     assert adapter.positions_calls >= 1
     assert request.symbol in adapter.open_orders_symbols
+
+
+@pytest.mark.asyncio
+async def test_cas_conflict_detects_existing_order_without_resubmission() -> None:
+    repository = FailOnceBindingRepository()
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    request = order()
+    adapter.open_orders = [open_order_for(request)]
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert adapter.place_calls == 0
+    binding = gateway.preflight_binding(request.signal_id)
+    assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert binding.first_external_order_id == f"external-{request.request_id}"
 
 
 @pytest.mark.asyncio
@@ -1720,11 +1993,14 @@ async def test_gateway_health_open_order_rate_and_adapter_failures() -> None:
     adapter.healthy = True
     adapter.open_orders.append(
         LiveOpenOrder(
+            client_order_id="unrelated-request",
             external_order_id="open",
             exchange="sandbox",
             symbol="BTC",
             side=Side.BUY,
             quantity=Decimal("0.1"),
+            filled_quantity=Decimal(0),
+            price=Decimal("100"),
             reduce_only=False,
             created_at=NOW,
         )
@@ -1985,13 +2261,68 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
         )
     with pytest.raises(ValidationError, match="open-order timestamp"):
         LiveOpenOrder(
+            client_order_id="request",
             external_order_id="order",
             exchange="sandbox",
             symbol="BTC",
             side=Side.BUY,
             quantity=Decimal("1"),
+            filled_quantity=Decimal(0),
+            price=Decimal("100"),
             reduce_only=False,
             created_at=datetime(2025, 1, 1),
+        )
+    with pytest.raises(ValidationError, match="filled quantity"):
+        LiveOpenOrder(
+            client_order_id="request",
+            external_order_id="order",
+            exchange="sandbox",
+            symbol="BTC",
+            side=Side.BUY,
+            quantity=Decimal("1"),
+            filled_quantity=Decimal("2"),
+            price=Decimal("100"),
+            reduce_only=False,
+            created_at=NOW,
+        )
+    with pytest.raises(ValueError, match="identities"):
+        ExecutionFill(
+            fill_id="",
+            exchange_order_id="order",
+            client_order_id="request",
+            exchange="sandbox",
+            symbol="BTC",
+            side=Side.BUY,
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+            fee=Decimal(0),
+            executed_at=NOW,
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        ExecutionFill(
+            fill_id="fill",
+            exchange_order_id="order",
+            client_order_id="request",
+            exchange="sandbox",
+            symbol="BTC",
+            side=Side.BUY,
+            price=Decimal(0),
+            quantity=Decimal("1"),
+            fee=Decimal(0),
+            executed_at=NOW,
+        )
+    with pytest.raises(ValueError, match="fill timestamp"):
+        ExecutionFill(
+            fill_id="fill",
+            exchange_order_id="order",
+            client_order_id="request",
+            exchange="sandbox",
+            symbol="BTC",
+            side=Side.BUY,
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+            fee=Decimal(0),
+            executed_at=datetime(2025, 1, 1),
         )
     with pytest.raises(ValidationError, match="position timestamp"):
         LivePosition(

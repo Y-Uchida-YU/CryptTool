@@ -63,3 +63,7 @@ class PreflightBindingRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     failure_reason: Mapped[str | None] = mapped_column(String(500))
+    position_venue: Mapped[str | None] = mapped_column(String(40))
+    position_symbol: Mapped[str | None] = mapped_column(String(40))
+    position_quantity_before: Mapped[Decimal | None] = mapped_column(Numeric(38, 12))
+    position_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
