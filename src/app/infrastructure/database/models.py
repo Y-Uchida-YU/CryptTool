@@ -38,3 +38,19 @@ class AuditEvent(Base):
     payload_json: Mapped[str]
     model_version: Mapped[str | None] = mapped_column(String(80))
     config_version: Mapped[str | None] = mapped_column(String(80))
+
+
+class PreflightBindingRow(Base):
+    __tablename__ = "preflight_bindings"
+    signal_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    preflight_hash: Mapped[str | None] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(40), index=True)
+    first_leg_role: Mapped[str | None] = mapped_column(String(20))
+    first_order_request_id: Mapped[str | None] = mapped_column(String(100))
+    first_external_order_id: Mapped[str | None] = mapped_column(String(160))
+    second_order_request_id: Mapped[str | None] = mapped_column(String(100))
+    second_external_order_id: Mapped[str | None] = mapped_column(String(160))
+    version: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(500))

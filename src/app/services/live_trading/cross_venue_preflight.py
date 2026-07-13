@@ -4,9 +4,10 @@ import hashlib
 import hmac
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from threading import Lock
+from typing import Any, Protocol
 
 from app.domain.execution.live_models import CrossVenueExecutionPreflight
 
@@ -15,8 +16,12 @@ class PreflightBindingState(StrEnum):
     UNBOUND = "unbound"
     RESERVED = "reserved"
     FIRST_LEG_ACCEPTED = "first_leg_accepted"
+    SECOND_LEG_SUBMITTED = "second_leg_submitted"
+    HEDGING_REQUIRED = "hedging_required"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
     COMPLETED = "completed"
     ABORTED = "aborted"
+    HALTED = "halted"
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,70 @@ class PreflightBinding:
     preflight_hash: str | None
     state: PreflightBindingState
     first_leg_role: str | None = None
+    first_order_request_id: str | None = None
+    first_external_order_id: str | None = None
+    second_order_request_id: str | None = None
+    second_external_order_id: str | None = None
+    version: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    failure_reason: str | None = None
+
+
+class PreflightBindingRepository(Protocol):
+    def get(self, signal_id: str) -> PreflightBinding | None: ...
+
+    def compare_and_set(
+        self,
+        signal_id: str,
+        expected_version: int,
+        binding: PreflightBinding,
+    ) -> bool: ...
+
+
+class InMemoryPreflightBindingRepository:
+    """Thread-safe test/local repository with the same CAS contract as PostgreSQL."""
+
+    def __init__(self) -> None:
+        self._bindings: dict[str, PreflightBinding] = {}
+        self._lock = Lock()
+
+    def get(self, signal_id: str) -> PreflightBinding | None:
+        with self._lock:
+            return self._bindings.get(signal_id)
+
+    def compare_and_set(
+        self, signal_id: str, expected_version: int, binding: PreflightBinding
+    ) -> bool:
+        with self._lock:
+            current = self._bindings.get(signal_id)
+            actual_version = current.version if current is not None else 0
+            if (
+                binding.signal_id != signal_id
+                or actual_version != expected_version
+                or binding.version != expected_version + 1
+            ):
+                return False
+            self._bindings[signal_id] = binding
+            return True
+
+
+def new_binding(
+    *,
+    signal_id: str,
+    preflight_hash: str,
+    state: PreflightBindingState,
+    now: datetime,
+) -> PreflightBinding:
+    now = now.astimezone(UTC)
+    return PreflightBinding(
+        signal_id=signal_id,
+        preflight_hash=preflight_hash,
+        state=state,
+        version=1,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 class CrossVenuePreflightService:
