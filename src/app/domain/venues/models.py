@@ -78,6 +78,13 @@ class CapabilitySupport(StrEnum):
     DEGRADED = "degraded"
 
 
+class CapabilityUseCase(StrEnum):
+    RESEARCH_COLLECTION = "research_collection"
+    SIGNAL_GENERATION = "signal_generation"
+    NEW_EXPOSURE = "new_exposure"
+    EMERGENCY_EXIT = "emergency_exit"
+
+
 @dataclass(frozen=True, kw_only=True)
 class VenueCapability:
     name: str
@@ -88,6 +95,7 @@ class VenueCapability:
     source_url: str | None = None
     verification_run_id: str | None = None
     failure_reason: str | None = None
+    emergency_exit_approved: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("documented_at", "implemented_at", "live_verified_at"):
@@ -99,12 +107,35 @@ class VenueCapability:
         if self.support == CapabilitySupport.LIVE_VERIFIED and self.live_verified_at is None:
             raise ValueError("live-verified capabilities require live_verified_at")
 
-    def usable_for_new_exposure(self, now: datetime, maximum_age: timedelta) -> bool:
-        return (
+    def supports(
+        self,
+        use_case: CapabilityUseCase,
+        *,
+        now: datetime,
+        maximum_age: timedelta,
+    ) -> bool:
+        if maximum_age < timedelta(0):
+            raise ValueError("maximum_age cannot be negative")
+        live_is_fresh = (
             self.support == CapabilitySupport.LIVE_VERIFIED
             and self.live_verified_at is not None
             and timedelta(0) <= _utc(now) - self.live_verified_at <= maximum_age
         )
+        if use_case == CapabilityUseCase.RESEARCH_COLLECTION:
+            return self.support in {
+                CapabilitySupport.IMPLEMENTED,
+                CapabilitySupport.LIVE_VERIFIED,
+            }
+        if use_case in {
+            CapabilityUseCase.SIGNAL_GENERATION,
+            CapabilityUseCase.NEW_EXPOSURE,
+        }:
+            return live_is_fresh
+        if use_case == CapabilityUseCase.EMERGENCY_EXIT:
+            return live_is_fresh or (
+                self.support == CapabilitySupport.DEGRADED and self.emergency_exit_approved
+            )
+        raise ValueError(f"unsupported capability use case: {use_case}")
 
     def transition(
         self,
@@ -153,14 +184,14 @@ class VenueCapability:
             source_url=source_url or self.source_url,
             verification_run_id=verification_run_id,
             failure_reason=failure_reason if support == CapabilitySupport.DEGRADED else None,
+            emergency_exit_approved=False,
         )
 
     def __bool__(self) -> bool:
-        """Compatibility only; strategy code must call usable_for_new_exposure()."""
-        return self.support not in {
-            CapabilitySupport.UNAVAILABLE,
-            CapabilitySupport.DEGRADED,
-        }
+        raise TypeError(
+            "VenueCapability cannot be evaluated implicitly; "
+            "use supports_collection(), supports_signal(), or supports_execution()"
+        )
 
 
 CAPABILITY_NAMES = (
@@ -257,18 +288,21 @@ class VenueCapabilityMatrix(BaseModel):
     def detected_at_must_be_aware(cls, value: datetime) -> datetime:
         return _utc(value)
 
-    def require(self, capability: str) -> None:
+    def require(
+        self,
+        capability: str,
+        use_case: CapabilityUseCase,
+        now: datetime,
+        maximum_age: timedelta,
+    ) -> None:
         from app.adapters.exchanges.base import CapabilityUnavailableError
 
         if capability not in self.capabilities:
             raise ValueError(f"unknown capability: {capability}")
-        if self.capabilities[capability].support == CapabilitySupport.UNAVAILABLE:
-            raise CapabilityUnavailableError(f"{self.venue} does not provide {capability}")
-
-    def require_live(self, capability: str, now: datetime, maximum_age: timedelta) -> None:
-        self.require(capability)
-        if not self.capabilities[capability].usable_for_new_exposure(now, maximum_age):
-            raise RuntimeError(f"{self.venue} {capability} is not current LIVE_VERIFIED evidence")
+        if not self.capabilities[capability].supports(use_case, now=now, maximum_age=maximum_age):
+            raise CapabilityUnavailableError(
+                f"{self.venue} {capability} does not support {use_case.value}"
+            )
 
     def __getattr__(self, name: str) -> VenueCapability:
         capabilities = object.__getattribute__(self, "capabilities")

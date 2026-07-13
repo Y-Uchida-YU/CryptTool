@@ -37,6 +37,8 @@ THRESHOLDS = {
             "src/app/adapters/exchanges/domestic.py",
         ),
     ),
+    "venue_dex_adapters": (90.0, ("src/app/adapters/exchanges/dex.py",)),
+    "websocket_reliability": (95.0, ("src/app/adapters/exchanges/websocket.py",)),
     "paper_execution": (95.0, ("src/app/services/paper_trading/",)),
 }
 
