@@ -35,8 +35,26 @@ jobs:
       - run: uv run --frozen ruff check .
       - run: uv run --frozen ruff format --check .
       - run: uv run --frozen mypy
-      - run: uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json:coverage.json
+      - run: >-
+          uv run --frozen pytest --cov --cov-report=term-missing
+          --cov-report=json:coverage.json
+          --junitxml=artifacts/build-verification/pytest.xml
       - run: uv run --frozen python scripts/check_coverage.py coverage.json
+      - name: Generate build verification
+        run: >-
+          uv run --frozen python scripts/write_build_verification.py
+          --coverage coverage.json
+          --junit artifacts/build-verification/pytest.xml
+          --output artifacts/build-verification/latest.json
+          --commit-sha "${GITHUB_SHA}"
+          --ci-run-id "${GITHUB_RUN_ID}"
+      - name: Upload build verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-verification-${{ github.sha }}
+          path: artifacts/build-verification/
+          if-no-files-found: error
+          retention-days: 30
       - run: uv run --frozen app audit-capabilities
       - name: Package capability audit artifact
         run: >-

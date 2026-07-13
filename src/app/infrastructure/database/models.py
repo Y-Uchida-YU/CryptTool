@@ -1,7 +1,17 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, DateTime, Float, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Float,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -74,3 +84,87 @@ class PreflightBindingRow(Base):
     position_symbol: Mapped[str | None] = mapped_column(String(40))
     position_quantity_before: Mapped[Decimal | None] = mapped_column(Numeric(38, 12))
     position_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RawMarketEventRow(Base):
+    __tablename__ = "raw_market_events"
+    event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
+    venue_symbol: Mapped[str] = mapped_column(String(100))
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sequence: Mapped[int | None] = mapped_column(BigInteger)
+    connection_id: Mapped[str | None] = mapped_column(String(36))
+    reconciliation_state: Mapped[str | None] = mapped_column(String(40))
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    raw_payload: Mapped[str] = mapped_column(Text)
+    normalizer_version: Mapped[str] = mapped_column(String(80))
+    capability_verification_run_id: Mapped[str] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MarketDataQuarantineRow(Base):
+    __tablename__ = "market_data_quarantine"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(160), index=True)
+    reason: Mapped[str] = mapped_column(String(500))
+    raw_payload: Mapped[str] = mapped_column(Text)
+    quarantined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MarketDataCheckpointRow(Base):
+    __tablename__ = "market_data_checkpoints"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    connection_id: Mapped[str] = mapped_column(String(36))
+    last_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    last_event_id: Mapped[str | None] = mapped_column(String(160))
+    reconciliation_state: Mapped[str] = mapped_column(String(40))
+    checkpointed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DataSnapshotRow(Base):
+    __tablename__ = "data_snapshots"
+    snapshot_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    event_count: Mapped[int] = mapped_column(Integer)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchRunRow(Base):
+    __tablename__ = "research_runs"
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    hypothesis_version: Mapped[str] = mapped_column(String(80))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40))
+    acceptance_verdict: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FrozenHypothesisRow(Base):
+    __tablename__ = "frozen_hypotheses"
+    hypothesis_version: Mapped[str] = mapped_column(String(80), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    content_json: Mapped[str] = mapped_column(Text)
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchArtifactRow(Base):
+    __tablename__ = "research_artifacts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(80))
+    path: Mapped[str] = mapped_column(String(500))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

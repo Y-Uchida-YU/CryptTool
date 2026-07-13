@@ -49,6 +49,8 @@ class BacktestResult:
     rejected_signals: tuple[RejectedSignal, ...]
     final_cash: Decimal
     final_equity: Decimal
+    run_id: str = ""
+    data_snapshot_id: str = ""
 
 
 class BacktestEngine:
@@ -59,6 +61,8 @@ class BacktestEngine:
         *,
         leverage: Decimal = Decimal("1"),
         execution_config: ExecutionModelConfig | None = None,
+        run_id: str = "",
+        data_snapshot_id: str = "",
     ) -> None:
         self.queue = EventQueue()
         self.execution = ExecutionSimulator(rules, execution_config)
@@ -71,6 +75,8 @@ class BacktestEngine:
         self._trace: list[tuple[datetime, str]] = []
         self._liquidations: list[LiquidationDecision] = []
         self._rejected_signals: list[RejectedSignal] = []
+        self.run_id = run_id
+        self.data_snapshot_id = data_snapshot_id
 
     def add_event(self, event: BacktestEvent) -> None:
         self.queue.push(event)
@@ -99,6 +105,8 @@ class BacktestEngine:
             rejected_signals=tuple(self._rejected_signals),
             final_cash=self.portfolio.cash,
             final_equity=self.portfolio.equity,
+            run_id=self.run_id,
+            data_snapshot_id=self.data_snapshot_id,
         )
 
     def _dispatch(self, event: BacktestEvent) -> None:

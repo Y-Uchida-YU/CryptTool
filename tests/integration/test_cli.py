@@ -41,7 +41,7 @@ def test_backtest_walk_forward_monte_carlo_and_paper_cli(tmp_path: Path) -> None
     walk = runner.invoke(
         app,
         [
-            "run-walk-forward",
+            "generate-walk-forward-windows",
             "--observations",
             "100",
             "--train",

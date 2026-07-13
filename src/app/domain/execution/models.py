@@ -71,8 +71,8 @@ class InstrumentRules:
             raise ValueError("tick_size and lot_size must be positive")
         if self.minimum_notional < ZERO:
             raise ValueError("minimum_notional cannot be negative")
-        if self.maker_fee_rate < ZERO or self.taker_fee_rate < ZERO:
-            raise ValueError("fee rates cannot be negative")
+        if self.maker_fee_rate < Decimal("-0.01") or self.taker_fee_rate < ZERO:
+            raise ValueError("maker rebate is capped at 1% and taker fee cannot be negative")
         if not ZERO <= self.maintenance_margin_rate < ONE:
             raise ValueError("maintenance_margin_rate must be in [0, 1)")
 
@@ -236,8 +236,8 @@ class Fill:
             raise ValueError("fill timestamps must preserve causality and use a later market event")
         if self.quantity <= ZERO or self.price <= ZERO:
             raise ValueError("fill quantity and price must be positive")
-        if min(self.fee, self.spread_cost, self.slippage_cost, self.market_impact_cost) < ZERO:
-            raise ValueError("execution costs cannot be negative")
+        if min(self.spread_cost, self.slippage_cost, self.market_impact_cost) < ZERO:
+            raise ValueError("spread, slippage and impact costs cannot be negative")
 
     @property
     def notional(self) -> Decimal:

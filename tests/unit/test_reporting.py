@@ -9,7 +9,7 @@ import pytest
 from app.services.reporting import (
     aggregate_trade_performance,
     calculate_performance_metrics,
-    evaluate_acceptance,
+    evaluate_legacy_acceptance,
     generate_report,
     monthly_returns,
     regime_distribution,
@@ -215,16 +215,16 @@ def test_group_aggregation_retains_losing_groups() -> None:
 
 
 def test_acceptance_never_promotes_missing_or_failed_evidence() -> None:
-    missing = evaluate_acceptance(oos_return=0.1)
+    missing = evaluate_legacy_acceptance(oos_return=0.1)
     assert missing.overall == "INSUFFICIENT_EVIDENCE"
 
-    failed = evaluate_acceptance(
+    failed = evaluate_legacy_acceptance(
         oos_return=-0.01,
         walk_forward_returns=[0.1, -0.1, -0.2],
     )
     assert failed.overall == "FAIL"
 
-    passed = evaluate_acceptance(
+    passed = evaluate_legacy_acceptance(
         oos_return=0.1,
         walk_forward_returns=[0.1, 0.2, -0.01],
         fee_stress_return=0.03,
@@ -243,15 +243,15 @@ def test_acceptance_never_promotes_missing_or_failed_evidence() -> None:
 
 def test_acceptance_validates_limits_and_symbol_evidence() -> None:
     with pytest.raises(ValueError, match="drawdown_limit"):
-        evaluate_acceptance(maximum_drawdown_limit=1)
+        evaluate_legacy_acceptance(maximum_drawdown_limit=1)
     with pytest.raises(ValueError, match="ruin_probability"):
-        evaluate_acceptance(maximum_ruin_probability=1)
+        evaluate_legacy_acceptance(maximum_ruin_probability=1)
     with pytest.raises(ValueError, match="walk_forward"):
-        evaluate_acceptance(walk_forward_returns=[])
+        evaluate_legacy_acceptance(walk_forward_returns=[])
     with pytest.raises(ValueError, match="leave_one"):
-        evaluate_acceptance(leave_one_period_out_returns=[])
+        evaluate_legacy_acceptance(leave_one_period_out_returns=[])
     with pytest.raises(ValueError, match="at least two"):
-        evaluate_acceptance(symbol_returns={"BTC": 0.1})
+        evaluate_legacy_acceptance(symbol_returns={"BTC": 0.1})
 
 
 def test_generate_report_writes_full_markdown_csv_and_json(tmp_path: Path) -> None:
@@ -295,7 +295,7 @@ class _MetadataState(StrEnum):
 
 
 def test_generate_report_handles_no_trades_extra_tables_and_json_types(tmp_path: Path) -> None:
-    assessment = evaluate_acceptance(oos_return=-0.1)
+    assessment = evaluate_legacy_acceptance(oos_return=-0.1)
     equity = pd.Series([100.0, 99.0, 98.0], name="equity")
     artifacts = generate_report(
         tmp_path,

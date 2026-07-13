@@ -5,9 +5,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
+.coverage*
 coverage.json
 htmlcov/
+artifacts/build-verification/
+artifacts/capability-audit/
+artifacts/research/
 reports/*
 !reports/.gitkeep
 *.db

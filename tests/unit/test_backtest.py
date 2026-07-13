@@ -368,7 +368,7 @@ def test_instrument_and_market_contracts_reject_unsafe_values() -> None:
         InstrumentRules(Decimal("0"), Decimal("1"), Decimal("0"))
     with pytest.raises(ValueError, match="minimum_notional"):
         InstrumentRules(Decimal("1"), Decimal("1"), Decimal("-1"))
-    with pytest.raises(ValueError, match="fee rates"):
+    with pytest.raises(ValueError, match="maker rebate"):
         InstrumentRules(Decimal("1"), Decimal("1"), Decimal("0"), maker_fee_rate=Decimal("-0.1"))
     with pytest.raises(ValueError, match="maintenance"):
         InstrumentRules(
@@ -478,8 +478,7 @@ def test_order_and_fill_contract_boundaries() -> None:
         raw_fill("time", filled_at=NOW)
     with pytest.raises(ValueError, match="quantity and price"):
         raw_fill("quantity", quantity="0")
-    with pytest.raises(ValueError, match="costs"):
-        raw_fill("fee", fee="-1")
+    assert raw_fill("rebate", fee="-1").fee == Decimal("-1")
 
 
 def test_execution_configuration_and_submission_rejections() -> None:
