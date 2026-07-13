@@ -42,6 +42,14 @@ class DisabledExecutionAdapter(ExecutionAdapter):
     async def fetch_positions(self) -> Sequence[LivePosition]:
         raise LiveTradingDisabledError("live execution adapter is disabled")
 
+    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
+        del symbol
+        raise LiveTradingDisabledError("live execution adapter is disabled")
+
+    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
+        del request_id
+        raise LiveTradingDisabledError("live execution adapter is disabled")
+
     async def close_position(self, symbol: str) -> ExecutionOrderAck:
         del symbol
         raise LiveTradingDisabledError("live execution adapter is disabled")

@@ -59,6 +59,19 @@ class TrustedCapabilityRegistry:
             raise ValueError("capability use case is not executable")
         return record
 
+    def require_live_verified(
+        self, *, venue: str, capability: str, now: datetime
+    ) -> TrustedCapabilityRecord:
+        record = self._records.get((venue, capability))
+        if record is None:
+            raise ValueError("trusted capability record is missing")
+        current = now.astimezone(UTC)
+        if record.support != CapabilitySupport.LIVE_VERIFIED:
+            raise ValueError("trusted capability is not LIVE_VERIFIED")
+        if not record.verified_at <= current <= record.expires_at:
+            raise ValueError("trusted capability record is expired or future-dated")
+        return record
+
     @classmethod
     def from_artifacts(
         cls,

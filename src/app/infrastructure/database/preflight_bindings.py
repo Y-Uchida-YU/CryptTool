@@ -20,6 +20,10 @@ class PostgreSQLPreflightBindingRepository:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
 
+    @property
+    def durable(self) -> bool:
+        return True
+
     def get(self, signal_id: str) -> PreflightBinding | None:
         with Session(self.engine) as session:
             row = session.get(PreflightBindingRow, signal_id)

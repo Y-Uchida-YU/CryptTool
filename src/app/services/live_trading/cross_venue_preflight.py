@@ -41,6 +41,9 @@ class PreflightBinding:
 
 
 class PreflightBindingRepository(Protocol):
+    @property
+    def durable(self) -> bool: ...
+
     def get(self, signal_id: str) -> PreflightBinding | None: ...
 
     def compare_and_set(
@@ -57,6 +60,10 @@ class InMemoryPreflightBindingRepository:
     def __init__(self) -> None:
         self._bindings: dict[str, PreflightBinding] = {}
         self._lock = Lock()
+
+    @property
+    def durable(self) -> bool:
+        return False
 
     def get(self, signal_id: str) -> PreflightBinding | None:
         with self._lock:

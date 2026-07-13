@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Float, Numeric, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, Float, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -42,6 +42,15 @@ class AuditEvent(Base):
 
 class PreflightBindingRow(Base):
     __tablename__ = "preflight_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('unbound','reserved','first_leg_accepted','second_leg_submitted',"
+            "'hedging_required','reconciliation_required','completed','aborted','halted')",
+            name="ck_preflight_bindings_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_preflight_bindings_version"),
+        CheckConstraint("updated_at >= created_at", name="ck_preflight_bindings_timestamp_order"),
+    )
     signal_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     preflight_hash: Mapped[str | None] = mapped_column(String(64))
     state: Mapped[str] = mapped_column(String(40), index=True)
