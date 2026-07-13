@@ -412,3 +412,55 @@ def test_duplicate_cache_remains_bounded() -> None:
     assert current.payload_hash_order == deque(("b", "c", "d"))
     assert current.payload_hashes == {"b", "c", "d"}
     assert value._seen_payload(current, "d")
+
+
+def active_reader_tasks() -> list[asyncio.Task[object]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done() and "_socket_reader" in task.get_coro().__qualname__
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["malformed", "snapshot", "overflow"])
+async def test_reader_task_is_cleaned_up_on_failure(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    socket = QueueSocket()
+    await socket.queue.put(json.dumps({"ok": True}))
+    overrides: dict[str, object] = {"maximum_reconnects_per_minute": 1}
+    if failure == "malformed":
+        await socket.queue.put("{")
+    else:
+        overrides.update(
+            classification=StreamClassification.SNAPSHOT_DELTA,
+            snapshot_applier=lambda item: item["seq"],
+            delta_applier=lambda item: None,
+        )
+        if failure == "snapshot":
+
+            async def failed_snapshot() -> object:
+                raise OSError("snapshot failed")
+
+            overrides["rest_snapshot"] = failed_snapshot
+        else:
+
+            async def delayed_snapshot() -> object:
+                await asyncio.sleep(0.001)
+                return {"seq": 1}
+
+            overrides["rest_snapshot"] = delayed_snapshot
+            overrides["maximum_buffered_deltas"] = 1
+            await socket.queue.put(json.dumps({"seq": 2, "kind": "delta"}))
+            await socket.queue.put(json.dumps({"seq": 3, "kind": "delta"}))
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect",
+        lambda *args, **kwargs: FakeConnect(socket),
+    )
+    value = session(**overrides)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(anext(value.messages()), 0.03)
+    await value.close()
+    await asyncio.sleep(0)
+    assert active_reader_tasks() == []

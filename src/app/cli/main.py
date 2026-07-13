@@ -526,14 +526,17 @@ def audit_capabilities() -> None:
     ]
     auditor = CapabilityContractAuditor(Path.cwd())
     failed = False
+    reports = []
     for adapter in adapters:
         report = auditor.audit(adapter, adapter.capabilities)
+        reports.append(report)
         status = "PASS" if report.passed else ("N/A" if not report.findings else "FAIL")
         typer.echo(f"{report.venue}: {status} ({len(report.findings)})")
         for finding in report.findings:
             if not finding.passed:
                 failed = True
                 typer.echo(f"  {finding.capability}: {'; '.join(finding.reasons)}")
+    auditor.write_artifact(tuple(reports))
 
     async def close() -> None:
         for adapter in adapters:

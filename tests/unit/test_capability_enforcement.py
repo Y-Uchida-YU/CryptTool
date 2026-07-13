@@ -89,10 +89,33 @@ def test_same_capability_from_two_venues_is_preserved_and_duplicate_key_rejected
 
 def test_auditor_manifest_owner_hash_and_empty_report() -> None:
     root = Path(__file__).parents[2]
-    auditor = CapabilityContractAuditor(root, now=NOW)
+
+    def test_runner(arguments: list[str]) -> int:
+        return 1 if "test_node_that_does_not_exist" in arguments[-1] else 0
+
+    auditor = CapabilityContractAuditor(root, now=NOW, test_runner=test_runner)
     adapter = DydxMarketDataAdapter()
     report = auditor.audit(adapter, adapter.capabilities)
     assert report.passed and report.findings
+    assert all(
+        finding.test_node_id
+        and finding.test_file_sha256
+        and finding.test_result == "passed"
+        and finding.audit_run_id
+        and finding.audited_at == NOW
+        for finding in report.findings
+    )
+    capability = report.findings[0].capability
+    original = auditor.entries[("dydx", capability)]
+    auditor.entries[("dydx", capability)] = {
+        **original,
+        "normalization_test": {
+            "test_id": "tests/unit/test_venues.py::test_node_that_does_not_exist"
+        },
+    }
+    failed_node = auditor.audit(adapter, adapter.capabilities)
+    assert not failed_node.passed
+    assert any(item.test_result == "not_collected" for item in failed_node.findings)
     assert not CapabilityAuditReport("x", NOW, ()).passed
     assert auditor._implementation_owner(DydxMarketDataAdapter, "health_check") is PublicRestAdapter
     assert auditor._implementation_owner(DydxMarketDataAdapter, "missing") is None

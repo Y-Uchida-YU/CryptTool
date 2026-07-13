@@ -45,6 +45,10 @@ class CapabilityEvidence:
     verified_at: datetime
     verification_run_id: str
     source_events: tuple[SourceEventEvidence, ...]
+    adapter_version: str = ""
+    source_version: str = ""
+    contract_fixture_sha256: str = ""
+    audit_run_id: str = ""
 
     def __post_init__(self) -> None:
         if self.verified_at.tzinfo is None:

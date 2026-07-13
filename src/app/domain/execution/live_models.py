@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -16,6 +21,40 @@ class LiveOrderState(StrEnum):
     CANCELED = "canceled"
 
 
+@dataclass(frozen=True)
+class CrossVenueExecutionPreflight:
+    signal_id: str
+    receive_venue: str
+    pay_venue: str
+    canonical_instrument_id: str
+    receive_capability_hash: str
+    pay_capability_hash: str
+    receive_source_event_hash: str
+    pay_source_event_hash: str
+    receive_execution_health: bool
+    pay_execution_health: bool
+    receive_available_collateral: Decimal
+    pay_available_collateral: Decimal
+    receive_fillable_quantity: Decimal
+    pay_fillable_quantity: Decimal
+    receive_expected_vwap: Decimal
+    pay_expected_vwap: Decimal
+    maximum_naked_exposure_duration_ms: int
+    created_at: datetime
+    expires_at: datetime
+    preflight_hash: str
+
+    @classmethod
+    def build(cls, **values: object) -> CrossVenueExecutionPreflight:
+        payload = json.dumps(values, sort_keys=True, default=str, separators=(",", ":")).encode()
+        return cls(**values, preflight_hash=hashlib.sha256(payload).hexdigest())  # type: ignore[arg-type]
+
+    def valid_hash(self) -> bool:
+        values = asdict(self)
+        values.pop("preflight_hash")
+        return self == self.build(**values)
+
+
 class LiveOrderRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -28,6 +67,7 @@ class LiveOrderRequest(BaseModel):
     cross_venue_signal_hash: str = Field(min_length=64, max_length=64)
     order_leg_role: str = Field(pattern="^(receive_leg|pay_leg)$")
     order_leg_evidence: LegDataEvidence
+    cross_venue_preflight: CrossVenueExecutionPreflight
     required_capabilities: tuple[str, ...] = Field(min_length=1)
     risk_decision_id: str = Field(min_length=8, max_length=100)
     model_version: str = Field(min_length=1, max_length=100)
@@ -52,7 +92,7 @@ class LiveOrderRequest(BaseModel):
         return value.astimezone(UTC)
 
     @model_validator(mode="after")
-    def validate_order(self) -> "LiveOrderRequest":
+    def validate_order(self) -> LiveOrderRequest:
         if self.expires_at <= self.created_at:
             raise ValueError("live order expiry must follow creation")
         if self.order_type == OrderType.LIMIT and self.limit_price is None:
@@ -84,7 +124,7 @@ class ExecutionOrderAck(BaseModel):
         return value.astimezone(UTC)
 
     @model_validator(mode="after")
-    def accepted_orders_require_external_identity(self) -> "ExecutionOrderAck":
+    def accepted_orders_require_external_identity(self) -> ExecutionOrderAck:
         if self.state == LiveOrderState.ACCEPTED:
             if not self.adapter_called or not self.external_order_id:
                 raise ValueError(
