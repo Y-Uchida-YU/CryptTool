@@ -29,6 +29,8 @@ from app.domain.execution.live_models import (
     LiveOrderState,
     LivePosition,
     PreflightRecoveryAction,
+    ReconciledOrder,
+    ReconciledOrderStatus,
 )
 from app.domain.execution.models import OrderType
 from app.domain.market_data.evidence import (
@@ -159,7 +161,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.cross_venue_preflight_service = PREFLIGHT_SERVICE
         self.preflight_binding_repository = DurableTestBindingRepository()
         self.recent_fills: list[ExecutionFill] = []
-        self.lookup_result: ExecutionOrderAck | None = None
+        self.lookup_result: ReconciledOrder | None = None
         self.recent_fills_calls = 0
         self.fail_recent_fills = False
         self.lookup_calls = 0
@@ -234,8 +236,8 @@ class FakeExecutionAdapter(ExecutionAdapter):
             raise ConnectionError("recent fills unavailable")
         return tuple(self.recent_fills)
 
-    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
-        del request_id
+    async def lookup_order_by_client_id(self, client_order_id: str) -> ReconciledOrder | None:
+        del client_order_id
         self.lookup_calls += 1
         return self.lookup_result
 
@@ -1004,19 +1006,46 @@ async def test_reconciliation_uses_all_order_sources_and_resolves_first_leg() ->
     request = order()
     with pytest.raises(ExecutionAdapterError):
         await gateway.place_order(request, risk(), NOW)
-    adapter.lookup_result = ExecutionOrderAck(
-        request_id=request.request_id,
+    adapter.lookup_result = ReconciledOrder(
+        client_order_id=request.request_id,
         external_order_id="reconciled-order",
-        state=LiveOrderState.ACCEPTED,
-        accepted_at=NOW,
-        reason="found by client order id",
-        adapter_called=True,
+        exchange=request.exchange,
+        symbol=request.symbol,
+        side=request.side,
+        original_quantity=request.quantity,
+        filled_quantity=Decimal(0),
+        average_fill_price=None,
+        reduce_only=request.reduce_only,
+        status=ReconciledOrderStatus.OPEN,
+        created_at=NOW,
+        updated_at=NOW,
     )
     binding = await gateway.reconcile_binding(request, NOW)
     assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
     assert adapter.recent_fills_calls == adapter.lookup_calls == 1
     assert adapter.positions_calls == 2  # submission snapshot plus reconciliation snapshot
     assert request.symbol in adapter.open_orders_symbols
+
+
+@pytest.mark.asyncio
+async def test_reconciled_order_identity_mismatch_halts() -> None:
+    gateway, adapter, request = await timed_out_gateway()
+    adapter.lookup_result = ReconciledOrder(
+        client_order_id=request.request_id,
+        external_order_id="wrong-venue-order",
+        exchange="unrelated-venue",
+        symbol=request.symbol,
+        side=request.side,
+        original_quantity=request.quantity,
+        filled_quantity=Decimal(0),
+        average_fill_price=None,
+        reduce_only=request.reduce_only,
+        status=ReconciledOrderStatus.OPEN,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
 
 
 @pytest.mark.asyncio
@@ -1071,10 +1100,51 @@ def fill_for(
         side=request.side,
         price=request.reference_price,
         quantity=quantity or request.quantity,
-        fee=Decimal("0.01"),
+        signed_fee=Decimal("0.01"),
         executed_at=NOW,
         liquidity_role="taker",
     )
+
+
+def test_execution_fill_allows_negative_signed_fee_for_maker_rebate() -> None:
+    rebate = replace(fill_for(order()), signed_fee=Decimal("-0.01"))
+    assert rebate.signed_fee == Decimal("-0.01")
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"client_order_id": ""}, "identities"),
+        ({"original_quantity": Decimal(0)}, "quantities"),
+        ({"average_fill_price": Decimal(0)}, "average fill price"),
+        (
+            {"filled_quantity": Decimal("0.1"), "average_fill_price": None},
+            "require an average fill price",
+        ),
+        ({"created_at": datetime(2025, 1, 1)}, "timestamps"),
+        ({"updated_at": NOW - timedelta(seconds=1)}, "precede creation"),
+    ],
+)
+def test_reconciled_order_rejects_invalid_domain_values(
+    updates: dict[str, object], message: str
+) -> None:
+    values: dict[str, object] = {
+        "client_order_id": "request-1",
+        "external_order_id": "external-1",
+        "exchange": "sandbox",
+        "symbol": "BTC",
+        "side": Side.BUY,
+        "original_quantity": Decimal("1"),
+        "filled_quantity": Decimal(0),
+        "average_fill_price": None,
+        "reduce_only": False,
+        "status": ReconciledOrderStatus.OPEN,
+        "created_at": NOW,
+        "updated_at": NOW,
+        **updates,
+    }
+    with pytest.raises(ValueError, match=message):
+        ReconciledOrder(**values)  # type: ignore[arg-type]
 
 
 async def timed_out_gateway(
@@ -1274,13 +1344,19 @@ async def test_reconciliation_resolves_missing_and_accepted_second_leg() -> None
     adapter.fail_place = True
     with pytest.raises(ExecutionAdapterError):
         await gateway.place_order(retry, risk(), NOW)
-    adapter.lookup_result = ExecutionOrderAck(
-        request_id=retry.request_id,
+    adapter.lookup_result = ReconciledOrder(
+        client_order_id=retry.request_id,
         external_order_id="second-reconciled",
-        state=LiveOrderState.ACCEPTED,
-        accepted_at=NOW,
-        reason="found",
-        adapter_called=True,
+        exchange=retry.exchange,
+        symbol=retry.symbol,
+        side=retry.side,
+        original_quantity=retry.quantity,
+        filled_quantity=Decimal(0),
+        average_fill_price=None,
+        reduce_only=retry.reduce_only,
+        status=ReconciledOrderStatus.OPEN,
+        created_at=NOW,
+        updated_at=NOW,
     )
     completed = await gateway.reconcile_binding(retry, NOW)
     assert completed.state == PreflightBindingState.COMPLETED
@@ -1553,6 +1629,7 @@ def test_preflight_binding_database_constraints_are_declared() -> None:
         "ck_preflight_bindings_state",
         "ck_preflight_bindings_version",
         "ck_preflight_bindings_timestamp_order",
+        "ck_preflight_bindings_position_snapshot_complete",
     }.issubset(names)
 
 
@@ -2295,7 +2372,7 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
             side=Side.BUY,
             price=Decimal("100"),
             quantity=Decimal("1"),
-            fee=Decimal(0),
+            signed_fee=Decimal(0),
             executed_at=NOW,
         )
     with pytest.raises(ValueError, match="invalid"):
@@ -2308,7 +2385,7 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
             side=Side.BUY,
             price=Decimal(0),
             quantity=Decimal("1"),
-            fee=Decimal(0),
+            signed_fee=Decimal(0),
             executed_at=NOW,
         )
     with pytest.raises(ValueError, match="fill timestamp"):
@@ -2321,7 +2398,7 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
             side=Side.BUY,
             price=Decimal("100"),
             quantity=Decimal("1"),
-            fee=Decimal(0),
+            signed_fee=Decimal(0),
             executed_at=datetime(2025, 1, 1),
         )
     with pytest.raises(ValidationError, match="position timestamp"):

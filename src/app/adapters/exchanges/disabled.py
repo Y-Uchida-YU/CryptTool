@@ -9,6 +9,7 @@ from app.domain.execution.live_models import (
     LiveOpenOrder,
     LiveOrderRequest,
     LivePosition,
+    ReconciledOrder,
 )
 
 
@@ -48,8 +49,8 @@ class DisabledExecutionAdapter(ExecutionAdapter):
         del symbol, since
         raise LiveTradingDisabledError("live execution adapter is disabled")
 
-    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
-        del request_id
+    async def lookup_order_by_client_id(self, client_order_id: str) -> ReconciledOrder | None:
+        del client_order_id
         raise LiveTradingDisabledError("live execution adapter is disabled")
 
     async def close_position(self, symbol: str) -> ExecutionOrderAck:

@@ -10,6 +10,7 @@ from app.domain.execution.live_models import (
     LiveOpenOrder,
     LiveOrderRequest,
     LivePosition,
+    ReconciledOrder,
 )
 from app.domain.market_data.models import OHLCV, FundingRate, Market, OpenInterest, OrderBook, Trade
 
@@ -72,7 +73,7 @@ class ExecutionAdapter(ABC):
     @abstractmethod
     async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]: ...
     @abstractmethod
-    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
+    async def lookup_order_by_client_id(self, client_order_id: str) -> ReconciledOrder | None: ...
     @abstractmethod
     async def close_position(self, symbol: str) -> ExecutionOrderAck: ...
     @abstractmethod

@@ -10,6 +10,7 @@ from app.domain.execution.live_models import (
     LiveOpenOrder,
     LiveOrderRequest,
     LivePosition,
+    ReconciledOrder,
 )
 
 
@@ -57,8 +58,8 @@ class StagedExecutionAdapter(ExecutionAdapter):
         del symbol, since
         self._blocked()
 
-    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
-        del request_id
+    async def lookup_order_by_client_id(self, client_order_id: str) -> ReconciledOrder | None:
+        del client_order_id
         self._blocked()
 
     async def close_position(self, symbol: str) -> ExecutionOrderAck:
