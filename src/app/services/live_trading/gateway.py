@@ -3,6 +3,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import cast
 from uuid import uuid4
 
 from app.adapters.exchanges.base import ExecutionAdapter
@@ -16,6 +17,7 @@ from app.domain.execution.live_models import (
     LiveOrderState,
 )
 from app.domain.market_data.evidence import CapabilityEvidence
+from app.domain.market_data.source_event_repository import SourceEventRepository, StoredSourceEvent
 from app.domain.risk.models import RiskDecision
 from app.domain.strategies.capabilities import STRATEGY_CAPABILITY_REGISTRY
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
@@ -35,6 +37,7 @@ class LiveExecutionGateway:
         settings: Settings,
         adapter: ExecutionAdapter,
         preflight: LivePreflightReport,
+        source_event_repository: SourceEventRepository | None = None,
         audit_sink: Callable[[ExecutionAuditEvent], None] | None = None,
         model_version: str = "phase9-interface-1.0",
         config_version: str = "runtime",
@@ -42,6 +45,9 @@ class LiveExecutionGateway:
         self.settings = settings
         self.adapter = adapter
         self.preflight = preflight
+        self.source_event_repository = source_event_repository or (
+            cast(SourceEventRepository, adapter) if hasattr(adapter, "get") else None
+        )
         self._validate_preflight_integrity()
         self.audit_sink = audit_sink
         self.model_version = model_version
@@ -249,28 +255,61 @@ class LiveExecutionGateway:
             return "order request is stale"
         if request.expires_at <= timestamp:
             return "order request has expired"
-        evidence = request.signal_data_evidence
-        if evidence.signal_id != request.signal_id or not evidence.valid_hash():
-            return "signal capability evidence identity or hash is invalid"
+        evidence = request.cross_venue_signal_evidence
+        if (
+            evidence.signal_id != request.signal_id
+            or not evidence.valid_hash()
+            or request.cross_venue_signal_hash != evidence.evidence_hash
+        ):
+            return "cross-venue signal evidence identity or hash is invalid"
+        if evidence.receive_leg is None:
+            return "receive leg evidence is missing"
+        if evidence.pay_leg is None:
+            return "pay leg evidence is missing"
+        if evidence.receive_leg.venue == evidence.pay_leg.venue:
+            return "receive and pay venues must differ"
+        if not evidence.receive_leg.valid_hash() or not evidence.pay_leg.valid_hash():
+            return "cross-venue leg evidence hash is invalid"
+        order_leg = evidence.leg(request.order_leg_role)
+        if order_leg is None or order_leg != request.order_leg_evidence:
+            return "order leg evidence does not match full signal"
+        if order_leg.venue != request.exchange:
+            return "order venue does not match leg role"
         registered_capabilities = STRATEGY_CAPABILITY_REGISTRY.get(
             (request.strategy_id, request.strategy_version)
         )
         if registered_capabilities is None:
             return "unknown strategy id or version"
-        if request.required_capabilities != registered_capabilities:
+        role_capabilities = tuple(
+            item.capability
+            for item in registered_capabilities
+            if item.venue_role == request.order_leg_role
+        )
+        if request.required_capabilities != role_capabilities:
             return "required capabilities do not exactly match strategy registry"
         required_use_case = (
             CapabilityUseCase.EMERGENCY_EXIT
             if request.reduce_only
             else CapabilityUseCase.NEW_EXPOSURE
         )
-        if not evidence.capabilities:
-            return "signal capability evidence is empty"
-        evidence_by_capability = {item.capability: item for item in evidence.capabilities}
-        missing = set(registered_capabilities) - evidence_by_capability.keys()
+        all_capabilities = evidence.receive_leg.capabilities + evidence.pay_leg.capabilities
+        keys = [(item.venue, item.capability) for item in all_capabilities]
+        if len(keys) != len(set(keys)):
+            return "duplicate venue and capability evidence"
+        available = {(item.venue, item.capability): item for item in all_capabilities}
+        role_venues = {
+            "receive_leg": evidence.receive_leg.venue,
+            "pay_leg": evidence.pay_leg.venue,
+        }
+        missing = {
+            requirement
+            for requirement in registered_capabilities
+            if (role_venues.get(requirement.venue_role, ""), requirement.capability)
+            not in available
+        }
         if missing:
-            return f"required capability evidence is missing: {','.join(sorted(missing))}"
-        for item in evidence.capabilities:
+            return "required cross-venue capability evidence is missing"
+        for item in order_leg.capabilities:
             age = timestamp - item.verified_at
             if item.venue != request.exchange:
                 return "capability evidence venue does not match order venue"
@@ -278,7 +317,9 @@ class LiveExecutionGateway:
                 return "capability evidence use case does not match order intent"
             if item.support != CapabilitySupport.LIVE_VERIFIED:
                 return "capability evidence is not LIVE_VERIFIED"
-            if age < timedelta(0) or age > timedelta(seconds=self.settings.risk.stale_data_seconds):
+            if age < timedelta(0) or age > timedelta(
+                seconds=self.settings.live.capability_verification_max_age_seconds
+            ):
                 return "capability evidence is stale or future-dated"
             source_failure = self._validate_source_events(request, item, timestamp)
             if source_failure is not None:
@@ -346,22 +387,52 @@ class LiveExecutionGateway:
         for event in capability.source_events:
             if not event.event_id:
                 return "source event id is empty"
-            if event.venue != request.exchange:
-                return "source event venue does not match order venue"
-            if event.symbol != request.symbol:
-                return "source event symbol does not match order symbol"
-            if event.event_type not in event_types.get(capability.capability, set()):
+            if self.source_event_repository is None:
+                return "source event repository is unavailable"
+            stored = self.source_event_repository.get(event.event_id)
+            if stored is None:
+                return "source event does not exist in repository"
+            mismatch = self._stored_event_mismatch(event, stored)
+            if mismatch is not None:
+                return mismatch
+            if stored.venue != request.exchange:
+                return "stored source event venue does not match order venue"
+            if stored.symbol != request.symbol:
+                return "stored source event symbol does not match order symbol"
+            if stored.event_type not in event_types.get(capability.capability, set()):
                 return "source event type does not match capability"
-            age = timestamp - event.available_at
-            if age < timedelta(0) or age > timedelta(seconds=self.settings.risk.stale_data_seconds):
+            age = timestamp - stored.available_at
+            if age < timedelta(0) or age > timedelta(
+                seconds=self.settings.live.source_event_max_age_seconds
+            ):
                 return "source event is stale or future-dated"
-            if re.fullmatch(r"[0-9a-f]{64}", event.payload_sha256) is None:
+            if re.fullmatch(r"[0-9a-f]{64}", stored.payload_sha256) is None:
                 return "source event payload hash is invalid"
-            if event.data_quality_score < self.settings.live.minimum_data_quality:
+            if stored.data_quality_score < self.settings.live.minimum_data_quality:
                 return "source event data quality is below threshold"
-            snapshot_delta = event.event_type in {"orderbook_snapshot", "orderbook_delta"}
-            if snapshot_delta and event.reconciliation_state != ReconciliationState.SYNCHRONIZED:
+            snapshot_delta = stored.event_type in {"orderbook_snapshot", "orderbook_delta"}
+            if snapshot_delta and stored.reconciliation_state != ReconciliationState.SYNCHRONIZED:
                 return "source event is not synchronized"
+        return None
+
+    @staticmethod
+    def _stored_event_mismatch(event: object, stored: StoredSourceEvent) -> str | None:
+        fields = (
+            "venue",
+            "symbol",
+            "event_type",
+            "exchange_timestamp",
+            "received_at",
+            "available_at",
+            "payload_sha256",
+            "sequence",
+            "connection_id",
+            "reconciliation_state",
+            "data_quality_score",
+        )
+        for field in fields:
+            if getattr(event, field) != getattr(stored, field):
+                return f"source event {field} does not match repository"
         return None
 
     def _reject_and_remember(

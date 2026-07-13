@@ -5,7 +5,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.execution.models import OrderType
-from app.domain.market_data.evidence import SignalDataEvidence
+from app.domain.market_data.evidence import CrossVenueSignalEvidence, LegDataEvidence
 from app.domain.market_data.models import Side
 
 
@@ -24,7 +24,10 @@ class LiveOrderRequest(BaseModel):
     signal_id: str = Field(min_length=8, max_length=100)
     strategy_id: str = Field(min_length=1, max_length=100)
     strategy_version: str = Field(min_length=1, max_length=40)
-    signal_data_evidence: SignalDataEvidence
+    cross_venue_signal_evidence: CrossVenueSignalEvidence
+    cross_venue_signal_hash: str = Field(min_length=64, max_length=64)
+    order_leg_role: str = Field(pattern="^(receive_leg|pay_leg)$")
+    order_leg_evidence: LegDataEvidence
     required_capabilities: tuple[str, ...] = Field(min_length=1)
     risk_decision_id: str = Field(min_length=8, max_length=100)
     model_version: str = Field(min_length=1, max_length=100)

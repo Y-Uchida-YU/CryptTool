@@ -80,7 +80,8 @@ class CrossVenueFundingArbitrageStrategy:
         *,
         signal_id: str,
         evidence: SignalDataEvidence,
-        venue: str,
+        receive_venue: str,
+        pay_venue: str,
         now: datetime,
         maximum_age_seconds: int,
         expected_basis_convergence_loss: Decimal,
@@ -89,9 +90,14 @@ class CrossVenueFundingArbitrageStrategy:
         currency_risk_rate: Decimal = Decimal("0.0025"),
         funding_reversal_stress: Decimal = Decimal("1.5"),
     ) -> CrossVenueFundingOpportunity | RejectedSignal:
-        rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
-        if rejection is not None:
-            return rejection
+        if receive_venue == pay_venue:
+            return RejectedSignal(
+                signal_id, "receive and pay venues must differ", self.required_capabilities
+            )
+        for venue in (receive_venue, pay_venue):
+            rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
+            if rejection is not None:
+                return rejection
         notional = min(receive_leg.notional, pay_leg.notional)
         received = notional * sum(receive_leg.expected_rates, Decimal("0"))
         paid = notional * sum(pay_leg.expected_rates, Decimal("0"))
@@ -188,7 +194,8 @@ class CrossVenueBasisStrategy:
         *,
         signal_id: str,
         evidence: SignalDataEvidence,
-        venue: str,
+        receive_venue: str,
+        pay_venue: str,
         now: datetime,
         maximum_age_seconds: int,
         fees: Decimal,
@@ -196,9 +203,14 @@ class CrossVenueBasisStrategy:
         latency_buffer: Decimal,
         risk_premium: Decimal,
     ) -> BasisOpportunity | RejectedSignal:
-        rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
-        if rejection is not None:
-            return rejection
+        if receive_venue == pay_venue:
+            return RejectedSignal(
+                signal_id, "receive and pay venues must differ", self.required_capabilities
+            )
+        for venue in (receive_venue, pay_venue):
+            rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
+            if rejection is not None:
+                return rejection
         if not self.clock.comparable(buy_book.clock, sell_book.clock):
             raise ValueError("cross-venue books are not clock-comparable")
         buy = buy_book.ask_vwap(quantity)

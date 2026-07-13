@@ -77,6 +77,62 @@ class SignalDataEvidence:
 
 
 @dataclass(frozen=True)
+class LegDataEvidence:
+    role: str
+    venue: str
+    capabilities: tuple[CapabilityEvidence, ...]
+    evidence_hash: str
+
+    @classmethod
+    def build(
+        cls, role: str, venue: str, capabilities: tuple[CapabilityEvidence, ...]
+    ) -> LegDataEvidence:
+        payload = json.dumps(
+            {"role": role, "venue": venue, "capabilities": [asdict(x) for x in capabilities]},
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode()
+        return cls(role, venue, capabilities, hashlib.sha256(payload).hexdigest())
+
+    def valid_hash(self) -> bool:
+        return self == self.build(self.role, self.venue, self.capabilities)
+
+
+@dataclass(frozen=True)
+class CrossVenueSignalEvidence:
+    signal_id: str
+    receive_leg: LegDataEvidence | None
+    pay_leg: LegDataEvidence | None
+    evidence_hash: str
+
+    @classmethod
+    def build(
+        cls,
+        signal_id: str,
+        receive_leg: LegDataEvidence | None,
+        pay_leg: LegDataEvidence | None,
+    ) -> CrossVenueSignalEvidence:
+        payload = json.dumps(
+            {
+                "signal_id": signal_id,
+                "receive_leg": asdict(receive_leg) if receive_leg is not None else None,
+                "pay_leg": asdict(pay_leg) if pay_leg is not None else None,
+            },
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode()
+        return cls(signal_id, receive_leg, pay_leg, hashlib.sha256(payload).hexdigest())
+
+    def valid_hash(self) -> bool:
+        return self == self.build(self.signal_id, self.receive_leg, self.pay_leg)
+
+    def leg(self, role: str) -> LegDataEvidence | None:
+        return {"receive_leg": self.receive_leg, "pay_leg": self.pay_leg}.get(role)
+
+
+@dataclass(frozen=True)
 class RejectedSignal:
     signal_id: str
     reason: str
@@ -91,17 +147,19 @@ def require_signal_capabilities(
     now: datetime,
     maximum_age_seconds: int,
 ) -> RejectedSignal | None:
-    available = {item.capability: item for item in evidence.capabilities}
+    keys = [(item.venue, item.capability) for item in evidence.capabilities]
+    if len(keys) != len(set(keys)):
+        return RejectedSignal(signal_id, "duplicate venue and capability evidence", required)
+    available = {(item.venue, item.capability): item for item in evidence.capabilities}
     missing = tuple(
         name
         for name in required
-        if name not in available
-        or available[name].venue != venue
-        or available[name].use_case != CapabilityUseCase.SIGNAL_GENERATION
-        or available[name].support != CapabilitySupport.LIVE_VERIFIED
+        if (venue, name) not in available
+        or available[(venue, name)].use_case != CapabilityUseCase.SIGNAL_GENERATION
+        or available[(venue, name)].support != CapabilitySupport.LIVE_VERIFIED
         or not (
             0
-            <= (now.astimezone(UTC) - available[name].verified_at).total_seconds()
+            <= (now.astimezone(UTC) - available[(venue, name)].verified_at).total_seconds()
             <= maximum_age_seconds
         )
     )

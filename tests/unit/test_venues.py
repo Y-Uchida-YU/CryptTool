@@ -143,7 +143,9 @@ def test_capability_and_instrument_identity_are_explicit() -> None:
 
 
 def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
-    def signal_evidence(capabilities: tuple[str, ...], venue: str) -> SignalDataEvidence:
+    def signal_evidence(
+        capabilities: tuple[str, ...], venues: tuple[str, str]
+    ) -> SignalDataEvidence:
         return SignalDataEvidence.build(
             "signal-venues",
             tuple(
@@ -156,7 +158,7 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
                     "run",
                     (
                         SourceEventEvidence(
-                            f"event-{capability}",
+                            f"event-{venue}-{capability}",
                             venue,
                             "BTC",
                             capability,
@@ -171,6 +173,7 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
                         ),
                     ),
                 )
+                for venue in venues
                 for capability in capabilities
             ),
         )
@@ -197,8 +200,9 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
         sell,
         Decimal("2"),
         signal_id="signal-venues",
-        evidence=signal_evidence(("orderbook_snapshot", "index_price"), "first"),
-        venue="first",
+        evidence=signal_evidence(("orderbook_snapshot", "index_price"), ("first", "second")),
+        receive_venue="first",
+        pay_venue="second",
         now=NOW,
         maximum_age_seconds=30,
         fees=Decimal("1"),
@@ -234,8 +238,11 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
         leg,
         other,
         signal_id="signal-venues",
-        evidence=signal_evidence(("funding_current", "funding_history", "orderbook_snapshot"), "a"),
-        venue="a",
+        evidence=signal_evidence(
+            ("funding_current", "funding_history", "orderbook_snapshot"), ("a", "b")
+        ),
+        receive_venue="a",
+        pay_venue="b",
         now=NOW,
         maximum_age_seconds=30,
         expected_basis_convergence_loss=Decimal("0.2"),

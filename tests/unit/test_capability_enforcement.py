@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from inspect import signature
 from pathlib import Path
@@ -55,8 +56,35 @@ def test_signal_gate_requires_fresh_live_verified_evidence() -> None:
 
 def test_strategy_evaluate_contract_cannot_bypass_evidence() -> None:
     parameters = signature(CrossVenueFundingArbitrageStrategy.evaluate).parameters
-    for name in ("signal_id", "evidence", "venue", "now", "maximum_age_seconds"):
+    for name in (
+        "signal_id",
+        "evidence",
+        "receive_venue",
+        "pay_venue",
+        "now",
+        "maximum_age_seconds",
+    ):
         assert name in parameters and parameters[name].default is parameters[name].empty
+
+
+def test_same_capability_from_two_venues_is_preserved_and_duplicate_key_rejected() -> None:
+    first = evidence("funding_history")
+    second_event = replace(first.source_events[0], event_id="event-2", venue="other")
+    second = replace(first, venue="other", source_events=(second_event,))
+    dual = SignalDataEvidence.build("signal-1", (first, second))
+    assert (
+        require_signal_capabilities("signal-1", dual, ("funding_history",), "dydx", NOW, 30) is None
+    )
+    assert (
+        require_signal_capabilities("signal-1", dual, ("funding_history",), "other", NOW, 30)
+        is None
+    )
+
+    duplicate = SignalDataEvidence.build("signal-1", (first, replace(first)))
+    rejection = require_signal_capabilities(
+        "signal-1", duplicate, ("funding_history",), "dydx", NOW, 30
+    )
+    assert rejection is not None and "duplicate" in rejection.reason
 
 
 def test_auditor_manifest_owner_hash_and_empty_report() -> None:

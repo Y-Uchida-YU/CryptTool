@@ -48,6 +48,7 @@ class ConnectionReconciliationContext:
     snapshot_sequence: int | None
     buffered_deltas: list[tuple[int, Any]]
     payload_hashes: set[str]
+    payload_hash_order: deque[str]
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,7 @@ class ResilientWebSocketSession:
         snapshot_applier: Callable[[Any], int] | None = None,
         delta_applier: Callable[[Any], None] | None = None,
         maximum_buffered_deltas: int = 10_000,
+        duplicate_cache_size: int = 4096,
         raw_message_sink: Callable[[RawVenueMessage], Awaitable[None]] | None = None,
         classification: StreamClassification = StreamClassification.EVENTS,
         stale_timeout: float = 30.0,
@@ -116,6 +118,7 @@ class ResilientWebSocketSession:
         self.rest_snapshot, self.classification = rest_snapshot, classification
         self.snapshot_applier, self.delta_applier = snapshot_applier, delta_applier
         self.maximum_buffered_deltas = maximum_buffered_deltas
+        self.duplicate_cache_size = duplicate_cache_size
         self.raw_message_sink = raw_message_sink
         self.stale_timeout, self.acknowledgement_timeout = stale_timeout, acknowledgement_timeout
         self.maximum_reconnects_per_minute = maximum_reconnects_per_minute
@@ -156,6 +159,7 @@ class ResilientWebSocketSession:
                 snapshot_sequence=None,
                 buffered_deltas=[],
                 payload_hashes=set(),
+                payload_hash_order=deque(),
             )
             self.connection_context = context
             self._set_reconciliation(context, ReconciliationState.WAITING_FOR_SNAPSHOT)
@@ -172,20 +176,22 @@ class ResilientWebSocketSession:
                         if self.acknowledgement is None or not self.acknowledgement(ack):
                             raise RuntimeError("subscription acknowledgement validation failed")
                     self._set_state(ConnectionState.CONNECTED)
+                    message_queue: asyncio.Queue[bytes | str | BaseException] = asyncio.Queue()
+                    reader_task = asyncio.create_task(self._socket_reader(socket, message_queue))
                     if self.classification == StreamClassification.SNAPSHOT_DELTA:
-                        await self._bootstrap(socket, context)
+                        await self._bootstrap(message_queue, context)
                     else:
                         self._set_reconciliation(context, ReconciliationState.SYNCHRONIZED)
                     attempt = 0
-                    async for raw in self._socket_messages(socket):
+                    while not self._closing:
+                        raw = await self._next_queued(message_queue)
                         decoded = self._decode(raw)
                         if self.heartbeat(decoded):
                             continue
                         payload = raw if isinstance(raw, bytes) else raw.encode()
                         digest = hashlib.sha256(payload).hexdigest()
-                        if digest in context.payload_hashes:
+                        if self._seen_payload(context, digest):
                             continue
-                        context.payload_hashes.add(digest)
                         current = self.sequence(decoded)
                         if current is not None and context.previous_sequence is not None:
                             if current <= context.previous_sequence:
@@ -227,6 +233,8 @@ class ResilientWebSocketSession:
                         if self.raw_message_sink is not None:
                             await self.raw_message_sink(message)
                         yield message
+                    reader_task.cancel()
+                    await asyncio.gather(reader_task, return_exceptions=True)
             except asyncio.CancelledError:
                 await self.close()
                 raise
@@ -248,6 +256,32 @@ class ResilientWebSocketSession:
         while not self._closing:
             yield await asyncio.wait_for(socket.recv(), timeout=self.stale_timeout)
 
+    async def _socket_reader(
+        self, socket: Any, queue: asyncio.Queue[bytes | str | BaseException]
+    ) -> None:
+        try:
+            while not self._closing:
+                await queue.put(await asyncio.wait_for(socket.recv(), timeout=self.stale_timeout))
+        except BaseException as exc:
+            await queue.put(exc)
+
+    @staticmethod
+    async def _next_queued(queue: asyncio.Queue[bytes | str | BaseException]) -> bytes | str:
+        item = await queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def _seen_payload(self, context: ConnectionReconciliationContext, digest: str) -> bool:
+        if digest in context.payload_hashes:
+            return True
+        if len(context.payload_hash_order) >= self.duplicate_cache_size:
+            expired = context.payload_hash_order.popleft()
+            context.payload_hashes.remove(expired)
+        context.payload_hash_order.append(digest)
+        context.payload_hashes.add(digest)
+        return False
+
     def _set_reconciliation(
         self, context: ConnectionReconciliationContext, state: ReconciliationState
     ) -> None:
@@ -265,35 +299,28 @@ class ResilientWebSocketSession:
         self._set_reconciliation(context, ReconciliationState.BUFFERING_DELTAS)
         context.buffered_deltas.append((sequence, decoded))
 
-    async def _bootstrap(self, socket: Any, context: ConnectionReconciliationContext) -> None:
+    async def _bootstrap(
+        self,
+        queue: asyncio.Queue[bytes | str | BaseException],
+        context: ConnectionReconciliationContext,
+    ) -> None:
         """Start REST bootstrap after ACK while continuing to buffer socket deltas."""
         if self.rest_snapshot is None:
             raise RuntimeError("REST snapshot recovery unavailable")
         self._set_reconciliation(context, ReconciliationState.BUFFERING_DELTAS)
-        snapshot_task: asyncio.Future[Any] = asyncio.ensure_future(self.rest_snapshot())
-        receive_task: asyncio.Task[bytes | str] = asyncio.create_task(socket.recv())
-        try:
-            while not snapshot_task.done():
-                done, _ = await asyncio.wait(
-                    {snapshot_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if receive_task in done:
-                    raw = receive_task.result()
-                    decoded = self._decode(raw)
-                    if not self.heartbeat(decoded):
-                        if not self.delta(decoded):
-                            raise RuntimeError("non-delta message received during REST bootstrap")
-                        payload = raw if isinstance(raw, bytes) else raw.encode()
-                        digest = hashlib.sha256(payload).hexdigest()
-                        if digest not in context.payload_hashes:
-                            context.payload_hashes.add(digest)
-                            self._buffer_delta(context, self.sequence(decoded), decoded)
-                    receive_task = asyncio.create_task(socket.recv())
-            snapshot = await snapshot_task
-        finally:
-            if not receive_task.done():
-                receive_task.cancel()
-                await asyncio.gather(receive_task, return_exceptions=True)
+        snapshot = await self.rest_snapshot()
+        await asyncio.sleep(0)
+        while not queue.empty():
+            raw = await self._next_queued(queue)
+            decoded = self._decode(raw)
+            if self.heartbeat(decoded):
+                continue
+            if not self.delta(decoded):
+                raise RuntimeError("non-delta message received during REST bootstrap")
+            payload = raw if isinstance(raw, bytes) else raw.encode()
+            digest = hashlib.sha256(payload).hexdigest()
+            if not self._seen_payload(context, digest):
+                self._buffer_delta(context, self.sequence(decoded), decoded)
         await self._apply_snapshot_and_replay(context, snapshot)
 
     async def _recover(
