@@ -51,6 +51,14 @@ class StagedExecutionAdapter(ExecutionAdapter):
     async def fetch_positions(self) -> Sequence[LivePosition]:
         self._blocked()
 
+    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
+        del symbol
+        self._blocked()
+
+    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
+        del request_id
+        self._blocked()
+
     async def close_position(self, symbol: str) -> ExecutionOrderAck:
         del symbol
         self._blocked()

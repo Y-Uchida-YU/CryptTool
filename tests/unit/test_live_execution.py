@@ -12,6 +12,10 @@ from sqlalchemy import create_engine
 
 from app.adapters.exchanges.base import ExecutionAdapter
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter, LiveTradingDisabledError
+from app.adapters.exchanges.staged_execution import (
+    ExecutionNotActivatedError,
+    StagedExecutionAdapter,
+)
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
 from app.domain.execution.leg_state import LegExecutionMachine, LegRiskPolicy, PreflightChangeAction
@@ -47,6 +51,7 @@ from app.infrastructure.database.preflight_bindings import (
 from app.services.live_trading.cross_venue_preflight import (
     CrossVenuePreflightService,
     InMemoryPreflightBindingRepository,
+    PreflightBinding,
     PreflightBindingState,
     new_binding,
 )
@@ -71,6 +76,12 @@ PREFLIGHT_SERVICE = CrossVenuePreflightService(
 def trusted_registry(
     *, verified_at: datetime = NOW, expires_at: datetime = NOW + timedelta(days=1)
 ) -> TrustedCapabilityRegistry:
+    reconciliation_capabilities = {
+        "order_lookup_by_client_id",
+        "recent_fills",
+        "open_orders",
+        "positions",
+    }
     return TrustedCapabilityRegistry(
         tuple(
             TrustedCapabilityRecord(
@@ -78,17 +89,53 @@ def trusted_registry(
                 capability=capability,
                 support=CapabilitySupport.LIVE_VERIFIED,
                 verification_run_id="test-live-smoke",
-                verified_at=verified_at,
-                expires_at=expires_at,
+                verified_at=NOW if capability in reconciliation_capabilities else verified_at,
+                expires_at=(
+                    NOW + timedelta(days=3650)
+                    if capability in reconciliation_capabilities
+                    else expires_at
+                ),
                 adapter_version="test-adapter-1",
                 source_version="test-source-1",
                 contract_fixture_sha256="f" * 64,
                 audit_run_id="test-audit-pass",
             )
             for venue in ("sandbox", "counterparty")
-            for capability in ("orderbook_snapshot", "index_price")
+            for capability in (
+                "orderbook_snapshot",
+                "index_price",
+                "order_lookup_by_client_id",
+                "recent_fills",
+                "open_orders",
+                "positions",
+            )
         )
     )
+
+
+class DurableTestBindingRepository(InMemoryPreflightBindingRepository):
+    @property
+    def durable(self) -> bool:
+        return True
+
+
+class FailOnceBindingRepository(DurableTestBindingRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+        self.get_calls = 0
+
+    def get(self, signal_id: str) -> PreflightBinding | None:
+        self.get_calls += 1
+        return super().get(signal_id)
+
+    def compare_and_set(
+        self, signal_id: str, expected_version: int, binding: PreflightBinding
+    ) -> bool:
+        if not self.failed:
+            self.failed = True
+            return False
+        return super().compare_and_set(signal_id, expected_version, binding)
 
 
 class FakeExecutionAdapter(ExecutionAdapter):
@@ -99,6 +146,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.open_orders: list[LiveOpenOrder] = []
         self.positions: list[LivePosition] = []
         self.open_orders_symbol: str | None = "not-called"
+        self.open_orders_symbols: list[str | None] = []
         self.fail_place = False
         self.reject_place = False
         self.mismatch_request = False
@@ -107,9 +155,11 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.fail_close = False
         self.trusted_capability_registry = trusted_registry()
         self.cross_venue_preflight_service = PREFLIGHT_SERVICE
+        self.preflight_binding_repository = DurableTestBindingRepository()
         self.recent_fills: list[ExecutionOrderAck] = []
         self.lookup_result: ExecutionOrderAck | None = None
         self.recent_fills_calls = 0
+        self.fail_recent_fills = False
         self.lookup_calls = 0
         self.positions_calls = 0
 
@@ -153,6 +203,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
 
     async def fetch_open_orders(self, symbol: str | None = None) -> Sequence[LiveOpenOrder]:
         self.open_orders_symbol = symbol
+        self.open_orders_symbols.append(symbol)
         return tuple(self.open_orders)
 
     async def fetch_positions(self) -> Sequence[LivePosition]:
@@ -177,6 +228,8 @@ class FakeExecutionAdapter(ExecutionAdapter):
     async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
         del symbol
         self.recent_fills_calls += 1
+        if self.fail_recent_fills:
+            raise ConnectionError("recent fills unavailable")
         return tuple(self.recent_fills)
 
     async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
@@ -425,6 +478,75 @@ def test_default_preflight_refuses_every_live_path() -> None:
     assert not report.approved
     assert report.warning.startswith("LIVE EXECUTION REFUSED")
     assert any(not check.passed for check in report.checks)
+
+
+def test_live_gateway_requires_durable_binding_repository() -> None:
+    settings = live_settings()
+    adapter = FakeExecutionAdapter()
+    adapter.preflight_binding_repository = None
+    with pytest.raises(ValueError, match="durable"):
+        LiveExecutionGateway(
+            settings, adapter, evaluate_live_preflight(settings, approved_context())
+        )
+    with pytest.raises(ValueError, match="durable"):
+        LiveExecutionGateway(
+            settings,
+            adapter,
+            evaluate_live_preflight(settings, approved_context()),
+            preflight_binding_repository=InMemoryPreflightBindingRepository(),
+        )
+    assert not InMemoryPreflightBindingRepository().durable
+
+
+def test_live_gateway_requires_reconciliation_api_and_live_verified_capabilities() -> None:
+    settings = live_settings()
+    adapter = FakeExecutionAdapter()
+    adapter.lookup_order_by_client_id = None  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValueError, match="lookup_order_by_client_id"):
+        LiveExecutionGateway(
+            settings, adapter, evaluate_live_preflight(settings, approved_context())
+        )
+
+    adapter = FakeExecutionAdapter()
+    adapter.trusted_capability_registry = TrustedCapabilityRegistry(
+        tuple(
+            record
+            for record in trusted_registry()._records.values()
+            if record.capability != "recent_fills"
+        )
+    )
+    with pytest.raises(ValueError, match=r"recent_fills.*LIVE_VERIFIED"):
+        LiveExecutionGateway(
+            settings, adapter, evaluate_live_preflight(settings, approved_context())
+        )
+
+    assert {"lookup_order_by_client_id", "fetch_recent_fills"}.issubset(
+        ExecutionAdapter.__abstractmethods__
+    )
+
+    adapter = FakeExecutionAdapter()
+    adapter.trusted_capability_registry = None
+    with pytest.raises(ValueError, match="trusted capability registry"):
+        LiveExecutionGateway(
+            settings, adapter, evaluate_live_preflight(settings, approved_context())
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter", "error"),
+    [
+        (DisabledExecutionAdapter(), LiveTradingDisabledError),
+        (StagedExecutionAdapter(), ExecutionNotActivatedError),
+    ],
+)
+async def test_non_concrete_reconciliation_methods_fail_closed(
+    adapter: ExecutionAdapter, error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        await adapter.fetch_recent_fills("BTC")
+    with pytest.raises(error):
+        await adapter.lookup_order_by_client_id("request-id")
 
 
 def test_unknown_strategy_and_required_capability_mismatch_fail_closed() -> None:
@@ -767,7 +889,7 @@ async def test_first_leg_rejection_aborts_binding() -> None:
 async def test_second_leg_rejection_requires_hedging_and_allows_retry() -> None:
     adapter = FakeExecutionAdapter()
     settings = live_settings()
-    repository = InMemoryPreflightBindingRepository()
+    repository = DurableTestBindingRepository()
     gateway = LiveExecutionGateway(
         settings,
         adapter,
@@ -874,7 +996,7 @@ async def test_reconciliation_uses_all_order_sources_and_resolves_first_leg() ->
     binding = await gateway.reconcile_binding(request, NOW)
     assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
     assert adapter.recent_fills_calls == adapter.lookup_calls == adapter.positions_calls == 1
-    assert adapter.open_orders_symbol == request.symbol
+    assert request.symbol in adapter.open_orders_symbols
 
 
 @pytest.mark.asyncio
@@ -888,7 +1010,7 @@ async def test_unknown_reconciliation_halts_binding() -> None:
     request = order()
     with pytest.raises(ExecutionAdapterError):
         await gateway.place_order(request, risk(), NOW)
-    adapter.fetch_recent_fills = None  # type: ignore[method-assign,assignment]
+    adapter.fail_recent_fills = True
     binding = await gateway.reconcile_binding(request, NOW)
     assert binding.state == PreflightBindingState.HALTED
 
@@ -955,7 +1077,7 @@ async def test_reconciliation_with_no_first_order_aborts_and_manual_halt_is_rest
 
 
 def test_manual_halt_transitions_recovery_binding() -> None:
-    repository = InMemoryPreflightBindingRepository()
+    repository = DurableTestBindingRepository()
     binding = replace(
         new_binding(
             signal_id="signal-manual-halt",
@@ -1008,7 +1130,7 @@ def test_non_orderable_binding_states_fail_closed(
     state: PreflightBindingState, reason: str
 ) -> None:
     request = order()
-    repository = InMemoryPreflightBindingRepository()
+    repository = DurableTestBindingRepository()
     binding = new_binding(
         signal_id=request.signal_id,
         preflight_hash=request.cross_venue_preflight.preflight_hash,
@@ -1028,7 +1150,7 @@ def test_non_orderable_binding_states_fail_closed(
 
 @pytest.mark.asyncio
 async def test_binding_is_restored_after_gateway_restart() -> None:
-    repository = InMemoryPreflightBindingRepository()
+    repository = DurableTestBindingRepository()
     adapter = FakeExecutionAdapter()
     settings = live_settings()
     first_gateway = LiveExecutionGateway(
@@ -1060,7 +1182,7 @@ async def test_binding_is_restored_after_gateway_restart() -> None:
     ],
 )
 def test_recovery_states_are_restored_after_restart(state: PreflightBindingState) -> None:
-    repository = InMemoryPreflightBindingRepository()
+    repository = DurableTestBindingRepository()
     binding = replace(
         new_binding(
             signal_id=f"signal-{state.value}",
@@ -1090,6 +1212,7 @@ def test_postgresql_binding_repository_persists_and_rejects_concurrent_cas(tmp_p
     )
     Base.metadata.create_all(engine)
     repository = PostgreSQLPreflightBindingRepository(engine)
+    assert repository.durable
     initial = new_binding(
         signal_id="signal-cas",
         preflight_hash="a" * 64,
@@ -1110,6 +1233,54 @@ def test_postgresql_binding_repository_persists_and_rejects_concurrent_cas(tmp_p
     assert sorted(results) == [False, True]
     restored = PostgreSQLPreflightBindingRepository(engine).get("signal-cas")
     assert restored is not None and restored.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_cas_conflict_reloads_binding_and_all_exchange_state() -> None:
+    repository = FailOnceBindingRepository()
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    request = order()
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.ACCEPTED
+    assert repository.get_calls >= 3
+    assert adapter.recent_fills_calls >= 1
+    assert adapter.lookup_calls >= 1
+    assert adapter.positions_calls >= 1
+    assert request.symbol in adapter.open_orders_symbols
+
+
+@pytest.mark.asyncio
+async def test_cas_conflict_fails_closed_when_exchange_refresh_fails() -> None:
+    repository = FailOnceBindingRepository()
+    adapter = FakeExecutionAdapter()
+    adapter.fail_recent_fills = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    receipt = await gateway.place_order(order(), risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert "CAS conflict and exchange refresh failed" in receipt.reason
+
+
+def test_preflight_binding_database_constraints_are_declared() -> None:
+    table = Base.metadata.tables["preflight_bindings"]
+    names = {constraint.name for constraint in table.constraints}
+    assert {
+        "ck_preflight_bindings_state",
+        "ck_preflight_bindings_version",
+        "ck_preflight_bindings_timestamp_order",
+    }.issubset(names)
 
 
 def test_cross_venue_dual_leg_order_binding_fails_closed() -> None:
@@ -1568,16 +1739,21 @@ async def test_gateway_health_open_order_rate_and_adapter_failures() -> None:
     )
     assert "rate limit" in limited.reason
 
+    failing_adapter = FakeExecutionAdapter()
     second_gateway = LiveExecutionGateway(
-        live_settings(), adapter, evaluate_live_preflight(live_settings(), approved_context())
+        live_settings(),
+        failing_adapter,
+        evaluate_live_preflight(live_settings(), approved_context()),
     )
-    adapter.fail_place = True
+    failing_adapter.fail_place = True
     with pytest.raises(ExecutionAdapterError, match="details retained"):
         await second_gateway.place_order(order("request-5", "idempotency-key-0005"), risk(), NOW)
-    adapter.fail_place = False
-    adapter.mismatch_request = True
+    mismatch_adapter = FakeExecutionAdapter()
+    mismatch_adapter.mismatch_request = True
     mismatch_gateway = LiveExecutionGateway(
-        live_settings(), adapter, evaluate_live_preflight(live_settings(), approved_context())
+        live_settings(),
+        mismatch_adapter,
+        evaluate_live_preflight(live_settings(), approved_context()),
     )
     with pytest.raises(ExecutionAdapterError, match="mismatched"):
         await mismatch_gateway.place_order(order("request-6", "idempotency-key-0006"), risk(), NOW)
@@ -1841,4 +2017,5 @@ def test_preview_never_calls_adapter_and_models_reject_invalid_orders() -> None:
             settings,
             DisabledExecutionAdapter(),
             evaluate_live_preflight(settings, approved_context()),
+            preflight_binding_repository=DurableTestBindingRepository(),
         )

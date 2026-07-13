@@ -48,6 +48,14 @@ class ReconciliationExecutionAdapter(Protocol):
     async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
 
 
+RECONCILIATION_CAPABILITIES = {
+    "lookup_order_by_client_id": "order_lookup_by_client_id",
+    "fetch_recent_fills": "recent_fills",
+    "fetch_open_orders": "open_orders",
+    "fetch_positions": "positions",
+}
+
+
 class LiveExecutionGateway:
     """Fail-closed boundary around an explicitly supplied execution adapter."""
 
@@ -74,7 +82,6 @@ class LiveExecutionGateway:
         self.trusted_capability_registry = trusted_capability_registry or getattr(
             adapter, "trusted_capability_registry", None
         )
-        self._validate_preflight_integrity()
         self.audit_sink = audit_sink
         self.model_version = model_version
         self.config_version = config_version
@@ -86,13 +93,38 @@ class LiveExecutionGateway:
         self.cross_venue_preflight_service = cross_venue_preflight_service or getattr(
             adapter, "cross_venue_preflight_service", None
         )
-        self.preflight_binding_repository = (
-            preflight_binding_repository
-            or getattr(adapter, "preflight_binding_repository", None)
-            or InMemoryPreflightBindingRepository()
+        repository = preflight_binding_repository or getattr(
+            adapter, "preflight_binding_repository", None
         )
+        if self.settings.live.enabled:
+            if repository is None or not repository.durable:
+                raise ValueError("live execution requires a durable preflight binding repository")
+            self.preflight_binding_repository = repository
+            self._validate_reconciliation_startup()
+        else:
+            self.preflight_binding_repository = repository or InMemoryPreflightBindingRepository()
+        self._validate_preflight_integrity()
         self.leg_execution_machine = leg_execution_machine
         self.last_preflight_action: PreflightChangeAction | None = None
+
+    def _validate_reconciliation_startup(self) -> None:
+        if not self.adapter.is_concrete:
+            return
+        if self.trusted_capability_registry is None:
+            raise ValueError("live execution requires a trusted capability registry")
+        for method_name, capability in RECONCILIATION_CAPABILITIES.items():
+            if not callable(getattr(self.adapter, method_name, None)):
+                raise ValueError(f"concrete execution adapter is missing {method_name}")
+            try:
+                self.trusted_capability_registry.require_live_verified(
+                    venue=self.adapter.adapter_name,
+                    capability=capability,
+                    now=datetime.now(UTC),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"reconciliation capability {capability} is not LIVE_VERIFIED: {exc}"
+                ) from exc
 
     def preview_order(self, request: LiveOrderRequest, timestamp: datetime) -> ExecutionOrderAck:
         timestamp = self._utc(timestamp)
@@ -132,6 +164,8 @@ class LiveExecutionGateway:
         request: LiveOrderRequest,
         risk_decision: RiskDecision,
         timestamp: datetime,
+        *,
+        cas_retry: bool = False,
     ) -> ExecutionOrderAck:
         timestamp = self._utc(timestamp)
         previous = self._idempotent_receipts.get(request.idempotency_key)
@@ -164,6 +198,18 @@ class LiveExecutionGateway:
                 return self._reject_and_remember(request, timestamp, "adapter health check failed")
             reservation_failure = self._reserve_preflight(request, timestamp)
             if reservation_failure is not None:
+                if reservation_failure == "preflight binding CAS conflict" and not cas_retry:
+                    try:
+                        await self._refresh_binding_and_exchange_state(request)
+                    except Exception:
+                        return self._reject_and_remember(
+                            request,
+                            timestamp,
+                            "preflight binding CAS conflict and exchange refresh failed",
+                        )
+                    return await self._place_order_locked(
+                        request, risk_decision, timestamp, cas_retry=True
+                    )
                 return self._reject_and_remember(request, timestamp, reservation_failure)
             reserved = True
             open_orders = await self.adapter.fetch_open_orders()
@@ -225,10 +271,18 @@ class LiveExecutionGateway:
         try:
             self._record_preflight_ack(request, receipt, timestamp)
         except ExecutionAdapterError:
-            self._mark_reconciliation_required(
-                request, timestamp, "binding conflict after adapter acknowledgement"
+            await self._refresh_binding_and_exchange_state(request)
+            refreshed = self.preflight_binding(request.signal_id)
+            expected = (
+                PreflightBindingState.COMPLETED
+                if request.order_leg_role != refreshed.first_leg_role
+                else PreflightBindingState.FIRST_LEG_ACCEPTED
             )
-            raise
+            if refreshed.state != expected:
+                self._mark_reconciliation_required(
+                    request, timestamp, "binding conflict after adapter acknowledgement"
+                )
+                raise
         self._idempotent_receipts[request.idempotency_key] = receipt
         self._order_timestamps.append(timestamp)
         self._audit(
@@ -767,6 +821,17 @@ class LiveExecutionGateway:
         elif reconciled_ack is not None:
             identifiers["first_external_order_id"] = reconciled_ack.external_order_id
         self._transition(current, target, timestamp, failure_reason=None, **identifiers)
+        return self.preflight_binding(request.signal_id)
+
+    async def _refresh_binding_and_exchange_state(
+        self, request: LiveOrderRequest
+    ) -> PreflightBinding:
+        reconciliation_adapter = cast(ReconciliationExecutionAdapter, self.adapter)
+        self.preflight_binding_repository.get(request.signal_id)
+        await reconciliation_adapter.fetch_recent_fills(request.symbol)
+        await reconciliation_adapter.lookup_order_by_client_id(request.request_id)
+        await self.adapter.fetch_open_orders(request.symbol)
+        await self.adapter.fetch_positions()
         return self.preflight_binding(request.signal_id)
 
     def halt_binding(self, signal_id: str, reason: str, timestamp: datetime) -> PreflightBinding:
