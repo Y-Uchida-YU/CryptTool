@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, cast
@@ -15,9 +15,12 @@ from app.domain.execution.leg_state import LegExecutionMachine, PreflightChangeA
 from app.domain.execution.live_models import (
     CancelAck,
     ExecutionAuditEvent,
+    ExecutionFill,
     ExecutionOrderAck,
+    LiveOpenOrder,
     LiveOrderRequest,
     LiveOrderState,
+    LivePosition,
     PreflightRecoveryAction,
 )
 from app.domain.market_data.evidence import CapabilityEvidence, LegDataEvidence
@@ -29,6 +32,7 @@ from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.services.live_trading.cross_venue_preflight import (
     CrossVenuePreflightService,
     InMemoryPreflightBindingRepository,
+    PositionReconciliationSnapshot,
     PreflightBinding,
     PreflightBindingRepository,
     PreflightBindingState,
@@ -43,7 +47,7 @@ class ExecutionAdapterError(RuntimeError):
 
 
 class ReconciliationExecutionAdapter(Protocol):
-    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]: ...
+    async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]: ...
 
     async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
 
@@ -54,6 +58,16 @@ RECONCILIATION_CAPABILITIES = {
     "fetch_open_orders": "open_orders",
     "fetch_positions": "positions",
 }
+
+
+@dataclass(frozen=True)
+class ExchangeReconciliationSnapshot:
+    binding: PreflightBinding
+    client_order: ExecutionOrderAck | None
+    matching_fills: tuple[ExecutionFill, ...]
+    matching_open_orders: tuple[LiveOpenOrder, ...]
+    positions: tuple[LivePosition, ...]
+    captured_at: datetime
 
 
 class LiveExecutionGateway:
@@ -200,15 +214,23 @@ class LiveExecutionGateway:
             if reservation_failure is not None:
                 if reservation_failure == "preflight binding CAS conflict" and not cas_retry:
                     try:
-                        await self._refresh_binding_and_exchange_state(request)
+                        snapshot = await self._refresh_binding_and_exchange_state(
+                            request, timestamp
+                        )
                     except Exception:
                         return self._reject_and_remember(
                             request,
                             timestamp,
                             "preflight binding CAS conflict and exchange refresh failed",
                         )
-                    return await self._place_order_locked(
-                        request, risk_decision, timestamp, cas_retry=True
+                    if self._handle_cas_snapshot(request, snapshot, timestamp):
+                        return await self._place_order_locked(
+                            request, risk_decision, timestamp, cas_retry=True
+                        )
+                    return self._reject_and_remember(
+                        request,
+                        timestamp,
+                        "preflight binding CAS conflict requires reconciliation",
                     )
                 return self._reject_and_remember(request, timestamp, reservation_failure)
             reserved = True
@@ -218,16 +240,21 @@ class LiveExecutionGateway:
                 return self._reject_and_remember(
                     request, timestamp, "maximum open order count reached"
                 )
+            positions = await self.adapter.fetch_positions()
+            position = next(
+                (
+                    item
+                    for item in positions
+                    if item.exchange == request.exchange and item.symbol == request.symbol
+                ),
+                None,
+            )
+            self._record_position_snapshot(
+                request,
+                timestamp,
+                position.quantity if position is not None else Decimal(0),
+            )
             if request.reduce_only:
-                positions = await self.adapter.fetch_positions()
-                position = next(
-                    (
-                        item
-                        for item in positions
-                        if item.exchange == request.exchange and item.symbol == request.symbol
-                    ),
-                    None,
-                )
                 if position is None or position.quantity == 0:
                     self._abort_preflight(request, timestamp, "reduce-only position is absent")
                     return self._reject_and_remember(
@@ -271,17 +298,13 @@ class LiveExecutionGateway:
         try:
             self._record_preflight_ack(request, receipt, timestamp)
         except ExecutionAdapterError:
-            await self._refresh_binding_and_exchange_state(request)
-            refreshed = self.preflight_binding(request.signal_id)
-            expected = (
-                PreflightBindingState.COMPLETED
-                if request.order_leg_role != refreshed.first_leg_role
-                else PreflightBindingState.FIRST_LEG_ACCEPTED
-            )
-            if refreshed.state != expected:
-                self._mark_reconciliation_required(
-                    request, timestamp, "binding conflict after adapter acknowledgement"
-                )
+            snapshot = await self._refresh_binding_and_exchange_state(request, timestamp)
+            self._handle_cas_snapshot(request, snapshot, timestamp)
+            reconciled = self.preflight_binding(request.signal_id)
+            if reconciled.state not in {
+                PreflightBindingState.FIRST_LEG_ACCEPTED,
+                PreflightBindingState.COMPLETED,
+            }:
                 raise
         self._idempotent_receipts[request.idempotency_key] = receipt
         self._order_timestamps.append(timestamp)
@@ -769,13 +792,7 @@ class LiveExecutionGateway:
         if current.state != PreflightBindingState.RECONCILIATION_REQUIRED:
             raise ValueError("preflight binding does not require reconciliation")
         try:
-            reconciliation_adapter = cast(ReconciliationExecutionAdapter, self.adapter)
-            recent_fills = await reconciliation_adapter.fetch_recent_fills(request.symbol)
-            client_order = await reconciliation_adapter.lookup_order_by_client_id(
-                request.request_id
-            )
-            open_orders = await self.adapter.fetch_open_orders(request.symbol)
-            positions = await self.adapter.fetch_positions()
+            snapshot = await self._refresh_binding_and_exchange_state(request, timestamp)
         except Exception as exc:
             self._transition(
                 current,
@@ -785,54 +802,320 @@ class LiveExecutionGateway:
             )
             return self.preflight_binding(request.signal_id)
 
-        matched_fill = next(
-            (fill for fill in recent_fills if fill.request_id == request.request_id), None
-        )
-        reconciled_ack = (
-            client_order
-            if client_order is not None and client_order.state == LiveOrderState.ACCEPTED
-            else matched_fill
-        )
-        accepted = reconciled_ack is not None
-        accepted = accepted or any(
-            item.exchange == request.exchange and item.symbol == request.symbol
-            for item in open_orders
-        )
-        exposed = any(
-            item.exchange == request.exchange
-            and item.symbol == request.symbol
-            and item.quantity != 0
-            for item in positions
-        )
-        is_second = current.second_order_request_id == request.request_id
-        if accepted or exposed:
-            target = (
-                PreflightBindingState.COMPLETED
-                if is_second
-                else PreflightBindingState.FIRST_LEG_ACCEPTED
-            )
-        elif is_second and current.first_external_order_id is not None:
-            target = PreflightBindingState.HEDGING_REQUIRED
-        else:
-            target = PreflightBindingState.ABORTED
-        identifiers: dict[str, Any] = {}
-        if reconciled_ack is not None and is_second:
-            identifiers["second_external_order_id"] = reconciled_ack.external_order_id
-        elif reconciled_ack is not None:
-            identifiers["first_external_order_id"] = reconciled_ack.external_order_id
-        self._transition(current, target, timestamp, failure_reason=None, **identifiers)
+        self._apply_reconciliation_snapshot(request, snapshot, timestamp)
         return self.preflight_binding(request.signal_id)
 
     async def _refresh_binding_and_exchange_state(
-        self, request: LiveOrderRequest
-    ) -> PreflightBinding:
+        self, request: LiveOrderRequest, captured_at: datetime
+    ) -> ExchangeReconciliationSnapshot:
         reconciliation_adapter = cast(ReconciliationExecutionAdapter, self.adapter)
-        self.preflight_binding_repository.get(request.signal_id)
-        await reconciliation_adapter.fetch_recent_fills(request.symbol)
-        await reconciliation_adapter.lookup_order_by_client_id(request.request_id)
-        await self.adapter.fetch_open_orders(request.symbol)
-        await self.adapter.fetch_positions()
+        binding = self.preflight_binding(request.signal_id)
+        since = (
+            binding.position_snapshot.captured_at
+            if binding.position_snapshot is not None
+            else request.created_at
+        )
+        fills = await reconciliation_adapter.fetch_recent_fills(request.symbol, since)
+        client_order = await reconciliation_adapter.lookup_order_by_client_id(request.request_id)
+        open_orders = await self.adapter.fetch_open_orders(request.symbol)
+        positions = await self.adapter.fetch_positions()
+        matching_fills = tuple(
+            item
+            for item in fills
+            if item.client_order_id == request.request_id
+            and item.exchange == request.exchange
+            and item.symbol == request.symbol
+            and item.side == request.side
+            and since <= item.executed_at <= captured_at
+        )
+        matching_open_orders = tuple(
+            item
+            for item in open_orders
+            if item.client_order_id == request.request_id
+            and item.exchange == request.exchange
+            and item.symbol == request.symbol
+            and item.side == request.side
+            and item.reduce_only == request.reduce_only
+            and item.quantity == request.quantity
+            and since <= item.created_at <= captured_at
+        )
+        return ExchangeReconciliationSnapshot(
+            binding=binding,
+            client_order=client_order,
+            matching_fills=matching_fills,
+            matching_open_orders=matching_open_orders,
+            positions=tuple(positions),
+            captured_at=captured_at,
+        )
+
+    def _record_position_snapshot(
+        self,
+        request: LiveOrderRequest,
+        timestamp: datetime,
+        quantity_before: Decimal,
+    ) -> None:
+        current = self.preflight_binding(request.signal_id)
+        self._transition(
+            current,
+            current.state,
+            timestamp,
+            position_snapshot=PositionReconciliationSnapshot(
+                venue=request.exchange,
+                symbol=request.symbol,
+                quantity_before=quantity_before,
+                captured_at=timestamp,
+            ),
+        )
+
+    def _handle_cas_snapshot(
+        self,
+        request: LiveOrderRequest,
+        snapshot: ExchangeReconciliationSnapshot,
+        timestamp: datetime,
+    ) -> bool:
+        """Return True only when the snapshot proves that reservation can be retried."""
+        if self._snapshot_proves_order_exists(request, snapshot):
+            current = self._ensure_reconciliation_required(
+                request,
+                snapshot.binding,
+                timestamp,
+                "CAS conflict found an existing exchange order",
+            )
+            if current.state == PreflightBindingState.RECONCILIATION_REQUIRED:
+                self._apply_reconciliation_snapshot(
+                    request, replace(snapshot, binding=current), timestamp
+                )
+            return False
+        if self._snapshot_is_ambiguous(request, snapshot):
+            current = self._ensure_reconciliation_required(
+                request,
+                snapshot.binding,
+                timestamp,
+                "CAS conflict exchange state is ambiguous",
+            )
+            if current.state == PreflightBindingState.RECONCILIATION_REQUIRED:
+                self._transition(
+                    current,
+                    PreflightBindingState.HALTED,
+                    timestamp,
+                    failure_reason="CAS conflict exchange state is ambiguous",
+                )
+            return False
+        if snapshot.binding.state in {
+            PreflightBindingState.UNBOUND,
+            PreflightBindingState.ABORTED,
+        } and self._snapshot_proves_order_absent(request, snapshot):
+            return True
+        self._ensure_reconciliation_required(
+            request,
+            snapshot.binding,
+            timestamp,
+            "CAS conflict requires exchange reconciliation",
+        )
+        return False
+
+    def _ensure_reconciliation_required(
+        self,
+        request: LiveOrderRequest,
+        current: PreflightBinding,
+        timestamp: datetime,
+        reason: str,
+    ) -> PreflightBinding:
+        latest = self.preflight_binding(request.signal_id)
+        if latest.version != current.version:
+            current = latest
+        if current.state == PreflightBindingState.RECONCILIATION_REQUIRED:
+            return current
+        if current.state in {
+            PreflightBindingState.UNBOUND,
+            PreflightBindingState.ABORTED,
+        }:
+            binding = new_binding(
+                signal_id=request.signal_id,
+                preflight_hash=request.cross_venue_preflight.preflight_hash,
+                state=PreflightBindingState.RECONCILIATION_REQUIRED,
+                now=timestamp,
+            )
+            binding = replace(
+                binding,
+                version=current.version + 1,
+                created_at=current.created_at or timestamp,
+                first_order_request_id=request.request_id,
+                failure_reason=reason,
+                position_snapshot=current.position_snapshot,
+            )
+            if not self._cas(current, binding):
+                raise ExecutionAdapterError("preflight binding CAS conflict")
+            return self.preflight_binding(request.signal_id)
+        updates: dict[str, str] = {}
+        if current.state == PreflightBindingState.RESERVED:
+            updates["first_order_request_id"] = request.request_id
+        elif current.state == PreflightBindingState.SECOND_LEG_SUBMITTED:
+            updates["second_order_request_id"] = request.request_id
+        else:
+            return current
+        self._transition(
+            current,
+            PreflightBindingState.RECONCILIATION_REQUIRED,
+            timestamp,
+            failure_reason=reason,
+            **updates,
+        )
         return self.preflight_binding(request.signal_id)
+
+    def _apply_reconciliation_snapshot(
+        self,
+        request: LiveOrderRequest,
+        snapshot: ExchangeReconciliationSnapshot,
+        timestamp: datetime,
+    ) -> None:
+        current = self.preflight_binding(request.signal_id)
+        if current.state != PreflightBindingState.RECONCILIATION_REQUIRED:
+            raise ExecutionAdapterError("binding changed during reconciliation")
+        if self._snapshot_is_ambiguous(request, snapshot):
+            self._transition(
+                current,
+                PreflightBindingState.HALTED,
+                timestamp,
+                failure_reason="exchange reconciliation is ambiguous",
+            )
+            return
+        second_leg = current.second_order_request_id == request.request_id
+        if self._snapshot_proves_order_exists(request, snapshot):
+            external_order_id = self._snapshot_external_order_id(request, snapshot)
+            if second_leg:
+                self._transition(
+                    current,
+                    PreflightBindingState.COMPLETED,
+                    timestamp,
+                    second_external_order_id=external_order_id,
+                )
+            else:
+                self._transition(
+                    current,
+                    PreflightBindingState.FIRST_LEG_ACCEPTED,
+                    timestamp,
+                    first_leg_role=request.order_leg_role,
+                    first_order_request_id=request.request_id,
+                    first_external_order_id=external_order_id,
+                )
+            return
+        if self._snapshot_proves_order_absent(request, snapshot):
+            self._transition(
+                current,
+                PreflightBindingState.HEDGING_REQUIRED
+                if second_leg
+                else PreflightBindingState.ABORTED,
+                timestamp,
+                failure_reason="exchange reconciliation found no submitted order",
+            )
+            return
+        self._transition(
+            current,
+            PreflightBindingState.HALTED,
+            timestamp,
+            failure_reason="exchange reconciliation could not determine order state",
+        )
+
+    def _snapshot_proves_order_exists(
+        self, request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> bool:
+        client_order = snapshot.client_order
+        if self._client_order_matches(request, snapshot) and (
+            client_order is not None and client_order.state == LiveOrderState.ACCEPTED
+        ):
+            return True
+        if len(snapshot.matching_open_orders) == 1:
+            return True
+        return self._fills_match_position_delta(request, snapshot)
+
+    def _snapshot_proves_order_absent(
+        self, request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> bool:
+        client_order = snapshot.client_order
+        if client_order is not None and not self._client_order_matches(request, snapshot):
+            return False
+        if snapshot.matching_fills or snapshot.matching_open_orders:
+            return False
+        delta = self._position_delta(request, snapshot)
+        return delta == 0 if delta is not None else False
+
+    def _snapshot_is_ambiguous(
+        self, request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> bool:
+        client_order = snapshot.client_order
+        if client_order is not None and not self._client_order_matches(request, snapshot):
+            return True
+        if len(snapshot.matching_open_orders) > 1:
+            return True
+        fills = snapshot.matching_fills
+        if fills:
+            if len({item.fill_id for item in fills}) != len(fills):
+                return True
+            if len({item.exchange_order_id for item in fills}) != 1:
+                return True
+            if sum((item.quantity for item in fills), Decimal(0)) > request.quantity:
+                return True
+            if not self._fills_match_position_delta(request, snapshot):
+                return True
+        delta = self._position_delta(request, snapshot)
+        return delta not in {None, Decimal(0)} and not fills
+
+    def _fills_match_position_delta(
+        self, request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> bool:
+        if not snapshot.matching_fills:
+            return False
+        delta = self._position_delta(request, snapshot)
+        if delta is None:
+            return False
+        filled = sum((item.quantity for item in snapshot.matching_fills), Decimal(0))
+        expected_delta = filled if request.side.value == "buy" else -filled
+        return filled <= request.quantity and delta == expected_delta
+
+    @staticmethod
+    def _position_delta(
+        request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> Decimal | None:
+        before = snapshot.binding.position_snapshot
+        if before is None or before.venue != request.exchange or before.symbol != request.symbol:
+            return None
+        matching = tuple(
+            item
+            for item in snapshot.positions
+            if item.exchange == request.exchange and item.symbol == request.symbol
+        )
+        if len(matching) > 1:
+            return None
+        quantity_after = matching[0].quantity if matching else Decimal(0)
+        return quantity_after - before.quantity_before
+
+    @staticmethod
+    def _client_order_matches(
+        request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> bool:
+        client_order = snapshot.client_order
+        before = snapshot.binding.position_snapshot
+        since = before.captured_at if before is not None else request.created_at
+        return (
+            client_order is not None
+            and client_order.request_id == request.request_id
+            and since <= client_order.accepted_at <= snapshot.captured_at
+        )
+
+    @staticmethod
+    def _snapshot_external_order_id(
+        request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
+    ) -> str | None:
+        if snapshot.client_order is not None and LiveExecutionGateway._client_order_matches(
+            request, snapshot
+        ):
+            return snapshot.client_order.external_order_id
+        if len(snapshot.matching_open_orders) == 1:
+            return snapshot.matching_open_orders[0].external_order_id
+        if snapshot.matching_fills:
+            return snapshot.matching_fills[0].exchange_order_id
+        return None
 
     def halt_binding(self, signal_id: str, reason: str, timestamp: datetime) -> PreflightBinding:
         current = self.preflight_binding(signal_id)

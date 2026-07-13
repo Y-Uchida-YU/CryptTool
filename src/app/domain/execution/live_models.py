@@ -154,11 +154,14 @@ class CancelAck(BaseModel):
 class LiveOpenOrder(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    external_order_id: str
-    exchange: str
-    symbol: str
+    client_order_id: str = Field(min_length=1)
+    external_order_id: str = Field(min_length=1)
+    exchange: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
     side: Side
     quantity: Decimal = Field(gt=0)
+    filled_quantity: Decimal = Field(ge=0)
+    price: Decimal = Field(gt=0)
     reduce_only: bool
     created_at: datetime
 
@@ -168,6 +171,42 @@ class LiveOpenOrder(BaseModel):
         if value.tzinfo is None:
             raise ValueError("open-order timestamp must be timezone-aware")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def filled_quantity_cannot_exceed_quantity(self) -> LiveOpenOrder:
+        if self.filled_quantity > self.quantity:
+            raise ValueError("filled quantity cannot exceed order quantity")
+        return self
+
+
+@dataclass(frozen=True)
+class ExecutionFill:
+    fill_id: str
+    exchange_order_id: str
+    client_order_id: str
+    exchange: str
+    symbol: str
+    side: Side
+    price: Decimal
+    quantity: Decimal
+    fee: Decimal
+    executed_at: datetime
+    liquidity_role: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.fill_id
+            or not self.exchange_order_id
+            or not self.client_order_id
+            or not self.exchange
+            or not self.symbol
+        ):
+            raise ValueError("fill and order identities are required")
+        if self.price <= 0 or self.quantity <= 0 or self.fee < 0:
+            raise ValueError("fill price, quantity, and fee are invalid")
+        if self.executed_at.tzinfo is None:
+            raise ValueError("fill timestamp must be timezone-aware")
+        object.__setattr__(self, "executed_at", self.executed_at.astimezone(UTC))
 
 
 class LivePosition(BaseModel):
