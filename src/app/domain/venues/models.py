@@ -203,6 +203,9 @@ CAPABILITY_NAMES = (
     "predicted_funding",
     "open_interest",
     "liquidations",
+    "wallet_liquidation_history",
+    "market_liquidation_stream",
+    "aggregate_liquidation_history",
     "orderbook_snapshot",
     "orderbook_delta",
     "trades",
@@ -245,6 +248,10 @@ class VenueCapabilityMatrix(BaseModel):
             if name not in result:
                 continue
             raw = result.pop(name)
+            if isinstance(raw, bool):
+                raise TypeError(
+                    "Boolean capabilities are prohibited; use an explicit CapabilitySupport value"
+                )
             if isinstance(raw, VenueCapability):
                 capabilities[name] = raw
             elif isinstance(raw, (CapabilitySupport, str)) and not isinstance(raw, bool):
@@ -269,13 +276,7 @@ class VenueCapabilityMatrix(BaseModel):
                     else None,
                 )
             else:
-                support = CapabilitySupport.IMPLEMENTED if raw else CapabilitySupport.UNAVAILABLE
-                capabilities[name] = VenueCapability(
-                    name=name,
-                    support=support,
-                    documented_at=detected_at if raw else None,
-                    implemented_at=detected_at if raw else None,
-                )
+                raise TypeError(f"invalid capability declaration for {name}: {raw!r}")
         for name in CAPABILITY_NAMES:
             capabilities.setdefault(
                 name, VenueCapability(name=name, support=CapabilitySupport.UNAVAILABLE)

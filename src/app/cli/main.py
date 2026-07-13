@@ -16,6 +16,16 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
 
+from app.adapters.exchanges.dex import (
+    DydxMarketDataAdapter,
+    LighterMarketDataAdapter,
+    ParadexMarketDataAdapter,
+)
+from app.adapters.exchanges.domestic import (
+    BitbankMarketDataAdapter,
+    BitflyerMarketDataAdapter,
+    GmoCoinMarketDataAdapter,
+)
 from app.adapters.exchanges.public import (
     AsterMarketDataAdapter,
     BitgetMarketDataAdapter,
@@ -30,6 +40,7 @@ from app.domain.market_data.models import OHLCV, Side
 from app.infrastructure.database.session import build_engine
 from app.services.backtest.engine import BacktestEngine
 from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
+from app.services.capability_audit import CapabilityContractAuditor
 from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 from app.services.paper_trading.broker import PaperBroker
@@ -496,6 +507,41 @@ def venue_capabilities(
     adapter = _priority_adapter(venue)
     typer.echo(adapter.capabilities.model_dump_json(indent=2))
     asyncio.run(adapter.close())
+
+
+@app.command("audit-capabilities")
+def audit_capabilities() -> None:
+    """Fail when an implemented capability lacks checked-in contract evidence."""
+    adapters = [
+        HyperliquidMarketDataAdapter(),
+        AsterMarketDataAdapter(),
+        BitgetMarketDataAdapter(),
+        MexcMarketDataAdapter(),
+        DydxMarketDataAdapter(),
+        ParadexMarketDataAdapter(),
+        LighterMarketDataAdapter(),
+        GmoCoinMarketDataAdapter(),
+        BitbankMarketDataAdapter(),
+        BitflyerMarketDataAdapter(),
+    ]
+    auditor = CapabilityContractAuditor(Path.cwd())
+    failed = False
+    for adapter in adapters:
+        report = auditor.audit(adapter, adapter.capabilities)
+        status = "PASS" if report.passed else ("N/A" if not report.findings else "FAIL")
+        typer.echo(f"{report.venue}: {status} ({len(report.findings)})")
+        for finding in report.findings:
+            if not finding.passed:
+                failed = True
+                typer.echo(f"  {finding.capability}: {'; '.join(finding.reasons)}")
+
+    async def close() -> None:
+        for adapter in adapters:
+            await adapter.close()
+
+    asyncio.run(close())
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command("public-data-smoke")

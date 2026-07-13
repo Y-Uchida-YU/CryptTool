@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from app.adapters.exchanges.base import CapabilityUnavailableError
 from app.adapters.exchanges.public import PublicRestAdapter, _ms
 from app.domain.market_data.models import OHLCV, Market, OrderBook, OrderBookLevel, Side, Trade
-from app.domain.venues.models import VenueCapabilityMatrix
+from app.domain.venues.models import CapabilitySupport, VenueCapabilityMatrix
 
 
 class GmoCoinMarketDataAdapter(PublicRestAdapter):
@@ -16,14 +16,14 @@ class GmoCoinMarketDataAdapter(PublicRestAdapter):
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
         source_version="official v1 checked 2026-07-12",
-        spot=True,
-        perpetual=True,
-        orderbook_snapshot=True,
-        trades=True,
-        private_websocket=True,
-        post_only=True,
-        reduce_only=True,
-        ioc=True,
+        spot=CapabilitySupport.DOCUMENTED,
+        perpetual=CapabilitySupport.DOCUMENTED,
+        orderbook_snapshot=CapabilitySupport.DOCUMENTED,
+        trades=CapabilitySupport.DOCUMENTED,
+        private_websocket=CapabilitySupport.DOCUMENTED,
+        post_only=CapabilitySupport.DOCUMENTED,
+        reduce_only=CapabilitySupport.DOCUMENTED,
+        ioc=CapabilitySupport.DOCUMENTED,
     )
 
     async def fetch_markets(self) -> Sequence[Market]:
@@ -119,11 +119,11 @@ class BitbankMarketDataAdapter(PublicRestAdapter):
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
         source_version="official public API checked 2026-07-12",
-        spot=True,
-        orderbook_snapshot=True,
-        trades=True,
-        private_websocket=True,
-        post_only=True,
+        spot=CapabilitySupport.DOCUMENTED,
+        orderbook_snapshot=CapabilitySupport.DOCUMENTED,
+        trades=CapabilitySupport.DOCUMENTED,
+        private_websocket=CapabilitySupport.DOCUMENTED,
+        post_only=CapabilitySupport.DOCUMENTED,
     )
 
     async def fetch_markets(self) -> Sequence[Market]:
@@ -214,10 +214,10 @@ class BitflyerMarketDataAdapter(PublicRestAdapter):
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
         source_version="official v1 checked 2026-07-12",
-        spot=True,
-        orderbook_snapshot=True,
-        trades=True,
-        private_websocket=True,
+        spot=CapabilitySupport.DOCUMENTED,
+        orderbook_snapshot=CapabilitySupport.DOCUMENTED,
+        trades=CapabilitySupport.DOCUMENTED,
+        private_websocket=CapabilitySupport.DOCUMENTED,
     )
 
     async def fetch_markets(self) -> Sequence[Market]:

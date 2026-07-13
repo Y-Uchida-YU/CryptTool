@@ -35,6 +35,9 @@ jobs:
       - run: uv run --frozen mypy
       - run: uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json:coverage.json
       - run: uv run --frozen python scripts/check_coverage.py coverage.json
+      - run: uv run --frozen app audit-capabilities
       - run: uv run --frozen alembic upgrade head && uv run --frozen alembic check
       - run: uv run --frozen bandit -r src
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
