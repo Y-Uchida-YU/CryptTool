@@ -7,6 +7,15 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
+def junit_totals(path: Path) -> dict[str, int]:
+    root = ElementTree.parse(path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    return {
+        name: sum(int(suite.attrib.get(name, 0)) for suite in suites)
+        for name in ("tests", "failures", "errors", "skipped")
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--coverage", type=Path, required=True)
@@ -16,18 +25,13 @@ def main() -> None:
     parser.add_argument("--ci-run-id", required=True)
     args = parser.parse_args()
     coverage = json.loads(args.coverage.read_text(encoding="utf-8"))
-    suite = ElementTree.parse(args.junit).getroot()
+    pytest_totals = junit_totals(args.junit)
     totals = coverage["totals"]
     payload = {
         "commit_sha": args.commit_sha,
         "ci_run_id": args.ci_run_id,
         "generated_at": datetime.now(UTC).isoformat(),
-        "pytest": {
-            "tests": int(suite.attrib.get("tests", 0)),
-            "failures": int(suite.attrib.get("failures", 0)),
-            "errors": int(suite.attrib.get("errors", 0)),
-            "skipped": int(suite.attrib.get("skipped", 0)),
-        },
+        "pytest": pytest_totals,
         "coverage": {
             "percent_covered": totals["percent_covered"],
             "covered_lines": totals["covered_lines"],
