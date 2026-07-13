@@ -163,6 +163,7 @@ class ResilientWebSocketSession:
             )
             self.connection_context = context
             self._set_reconciliation(context, ReconciliationState.WAITING_FOR_SNAPSHOT)
+            reader_task: asyncio.Task[None] | None = None
             try:
                 async with websockets.connect(
                     self.url, open_timeout=10, ping_interval=20
@@ -233,8 +234,6 @@ class ResilientWebSocketSession:
                         if self.raw_message_sink is not None:
                             await self.raw_message_sink(message)
                         yield message
-                    reader_task.cancel()
-                    await asyncio.gather(reader_task, return_exceptions=True)
             except asyncio.CancelledError:
                 await self.close()
                 raise
@@ -250,6 +249,10 @@ class ResilientWebSocketSession:
                 await asyncio.sleep(
                     secrets.SystemRandom().uniform(0, min(self.backoff_cap, 2 ** min(attempt, 10)))
                 )
+            finally:
+                if reader_task is not None:
+                    reader_task.cancel()
+                    await asyncio.gather(reader_task, return_exceptions=True)
         self._set_state(ConnectionState.CLOSED)
 
     async def _socket_messages(self, socket: Any) -> AsyncIterator[bytes | str]:

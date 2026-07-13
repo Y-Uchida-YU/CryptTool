@@ -19,6 +19,14 @@ class LegExecutionState(StrEnum):
     HALTED = "halted"
 
 
+class PreflightChangeAction(StrEnum):
+    CHASE = "chase"
+    PARTIAL_HEDGE = "partial_hedge"
+    ALTERNATE_HEDGE = "alternate_hedge"
+    UNWIND = "unwind"
+    HALT = "halt"
+
+
 class LegRiskPolicy(BaseModel):
     model_config = ConfigDict(frozen=True)
     first_leg_timeout: timedelta = timedelta(seconds=3)
@@ -138,6 +146,40 @@ class LegExecutionMachine:
         ):
             return self._transition(LegExecutionState.UNWINDING, now, self.policy.unwind_policy)
         return self.snapshot
+
+    def handle_preflight_change(
+        self,
+        now: datetime,
+        *,
+        evidence_valid: bool,
+        execution_health: bool,
+        available_collateral: Decimal,
+        fillable_quantity: Decimal,
+        expected_vwap: Decimal,
+        alternate_hedge_available: bool,
+    ) -> PreflightChangeAction:
+        if not evidence_valid:
+            self._transition(LegExecutionState.HALTED, now, "changed evidence is untrusted")
+            return PreflightChangeAction.HALT
+        if not execution_health and alternate_hedge_available:
+            self._transition(LegExecutionState.SECOND_SUBMITTED, now, "alternate hedge selected")
+            return PreflightChangeAction.ALTERNATE_HEDGE
+        if not execution_health or available_collateral <= 0 or fillable_quantity <= 0:
+            self._transition(LegExecutionState.UNWINDING, now, self.policy.unwind_policy)
+            return PreflightChangeAction.UNWIND
+        if fillable_quantity < self.snapshot.target_quantity:
+            self._transition(LegExecutionState.SECOND_SUBMITTED, now, "partial hedge selected")
+            return PreflightChangeAction.PARTIAL_HEDGE
+        deviation_bps = (
+            abs(expected_vwap - self.snapshot.reference_price)
+            / self.snapshot.reference_price
+            * Decimal("10000")
+        )
+        if deviation_bps <= self.policy.second_leg_chase_limit_bps:
+            self._transition(LegExecutionState.SECOND_SUBMITTED, now, "chase selected")
+            return PreflightChangeAction.CHASE
+        self._transition(LegExecutionState.UNWINDING, now, self.policy.unwind_policy)
+        return PreflightChangeAction.UNWIND
 
     def _transition(
         self, state: LegExecutionState, now: datetime, reason: str

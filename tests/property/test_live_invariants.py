@@ -1,3 +1,4 @@
+import hashlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -7,7 +8,11 @@ from hypothesis import strategies as st
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
-from app.domain.execution.live_models import LiveOrderRequest, LiveOrderState
+from app.domain.execution.live_models import (
+    CrossVenueExecutionPreflight,
+    LiveOrderRequest,
+    LiveOrderState,
+)
 from app.domain.market_data.evidence import (
     CapabilityEvidence,
     CrossVenueSignalEvidence,
@@ -17,6 +22,10 @@ from app.domain.market_data.evidence import (
 from app.domain.market_data.models import Side
 from app.domain.market_data.source_event_repository import StoredSourceEvent
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
+from app.domain.venues.trusted_capabilities import (
+    TrustedCapabilityRecord,
+    TrustedCapabilityRegistry,
+)
 from app.services.live_trading.gateway import LiveExecutionGateway
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 
@@ -79,12 +88,6 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
     configured = settings()
     context = LivePreflightContext(timestamp=NOW)
     repository = EventRepository()
-    gateway = LiveExecutionGateway(
-        configured,
-        DisabledExecutionAdapter(),
-        evaluate_live_preflight(configured, context),
-        repository,
-    )
 
     def leg(role: str, venue: str) -> LegDataEvidence:
         capabilities = []
@@ -113,6 +116,10 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
                     verified_at=NOW,
                     verification_run_id="property-smoke",
                     source_events=(event,),
+                    adapter_version="property-adapter",
+                    source_version="property-source",
+                    contract_fixture_sha256="f" * 64,
+                    audit_run_id="property-audit",
                 )
             )
         return LegDataEvidence.build(role, venue, tuple(capabilities))
@@ -120,6 +127,61 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
     receive_leg = leg("receive_leg", "sandbox")
     pay_leg = leg("pay_leg", "counterparty")
     signal = CrossVenueSignalEvidence.build("signal-property", receive_leg, pay_leg)
+
+    def source_hash(value: LegDataEvidence) -> str:
+        items = sorted(
+            f"{event.event_id}:{event.payload_sha256}"
+            for capability in value.capabilities
+            for event in capability.source_events
+        )
+        return hashlib.sha256("|".join(items).encode()).hexdigest()
+
+    preflight = CrossVenueExecutionPreflight.build(
+        signal_id="signal-property",
+        receive_venue="sandbox",
+        pay_venue="counterparty",
+        canonical_instrument_id="BTC-PERP",
+        receive_capability_hash=receive_leg.evidence_hash,
+        pay_capability_hash=pay_leg.evidence_hash,
+        receive_source_event_hash=source_hash(receive_leg),
+        pay_source_event_hash=source_hash(pay_leg),
+        receive_execution_health=True,
+        pay_execution_health=True,
+        receive_available_collateral=Decimal("1000"),
+        pay_available_collateral=Decimal("1000"),
+        receive_fillable_quantity=Decimal("10"),
+        pay_fillable_quantity=Decimal("10"),
+        receive_expected_vwap=Decimal("100"),
+        pay_expected_vwap=Decimal("101"),
+        maximum_naked_exposure_duration_ms=3000,
+        created_at=NOW,
+        expires_at=NOW + timedelta(seconds=30),
+    )
+    registry = TrustedCapabilityRegistry(
+        tuple(
+            TrustedCapabilityRecord(
+                venue,
+                capability,
+                CapabilitySupport.LIVE_VERIFIED,
+                "property-smoke",
+                NOW,
+                NOW + timedelta(days=1),
+                "property-adapter",
+                "property-source",
+                "f" * 64,
+                "property-audit",
+            )
+            for venue in ("sandbox", "counterparty")
+            for capability in ("orderbook_snapshot", "index_price")
+        )
+    )
+    gateway = LiveExecutionGateway(
+        configured,
+        DisabledExecutionAdapter(),
+        evaluate_live_preflight(configured, context),
+        repository,
+        trusted_capability_registry=registry,
+    )
     request = LiveOrderRequest(
         request_id="request-property",
         idempotency_key="idempotency-property",
@@ -128,6 +190,7 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
         cross_venue_signal_hash=signal.evidence_hash,
         order_leg_role="receive_leg",
         order_leg_evidence=receive_leg,
+        cross_venue_preflight=preflight,
         strategy_id="cross_venue_basis",
         strategy_version="1",
         required_capabilities=("orderbook_snapshot", "index_price"),

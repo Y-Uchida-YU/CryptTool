@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -11,8 +12,10 @@ from app.adapters.exchanges.base import ExecutionAdapter
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter, LiveTradingDisabledError
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
+from app.domain.execution.leg_state import LegExecutionMachine, LegRiskPolicy, PreflightChangeAction
 from app.domain.execution.live_models import (
     CancelAck,
+    CrossVenueExecutionPreflight,
     ExecutionAuditEvent,
     ExecutionOrderAck,
     LiveOpenOrder,
@@ -31,6 +34,10 @@ from app.domain.market_data.models import Side
 from app.domain.market_data.source_event_repository import StoredSourceEvent
 from app.domain.risk.models import PositionSizingResult, RiskDecision
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
+from app.domain.venues.trusted_capabilities import (
+    TrustedCapabilityRecord,
+    TrustedCapabilityRegistry,
+)
 from app.services.live_trading.gateway import ExecutionAdapterError, LiveExecutionGateway
 from app.services.live_trading.preflight import (
     RUNTIME_CONFIRMATION,
@@ -42,6 +49,29 @@ from app.services.live_trading.preflight import (
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
 SOURCE_EVENTS: dict[str, StoredSourceEvent] = {}
+
+
+def trusted_registry(
+    *, verified_at: datetime = NOW, expires_at: datetime = NOW + timedelta(days=1)
+) -> TrustedCapabilityRegistry:
+    return TrustedCapabilityRegistry(
+        tuple(
+            TrustedCapabilityRecord(
+                venue=venue,
+                capability=capability,
+                support=CapabilitySupport.LIVE_VERIFIED,
+                verification_run_id="test-live-smoke",
+                verified_at=verified_at,
+                expires_at=expires_at,
+                adapter_version="test-adapter-1",
+                source_version="test-source-1",
+                contract_fixture_sha256="f" * 64,
+                audit_run_id="test-audit-pass",
+            )
+            for venue in ("sandbox", "counterparty")
+            for capability in ("orderbook_snapshot", "index_price")
+        )
+    )
 
 
 class FakeExecutionAdapter(ExecutionAdapter):
@@ -57,6 +87,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.fail_cancel = False
         self.fail_cancel_all = False
         self.fail_close = False
+        self.trusted_capability_registry = trusted_registry()
 
     @property
     def adapter_name(self) -> str:
@@ -199,7 +230,9 @@ def order(
     exchange = str(overrides.get("exchange", "sandbox"))
     pay_exchange = "counterparty"
     evidence_time = overrides.get("created_at", NOW)
+    capability_verified_at = overrides.get("capability_verified_at", NOW)
     assert isinstance(evidence_time, datetime)
+    assert isinstance(capability_verified_at, datetime)
     if evidence_time.tzinfo is None:
         evidence_time = NOW
 
@@ -232,9 +265,13 @@ def order(
                 if overrides.get("reduce_only")
                 else CapabilityUseCase.NEW_EXPOSURE,
                 support=CapabilitySupport.LIVE_VERIFIED,
-                verified_at=evidence_time,
+                verified_at=capability_verified_at,
                 verification_run_id="test-live-smoke",
                 source_events=(source_event(venue, capability),),
+                adapter_version="test-adapter-1",
+                source_version="test-source-1",
+                contract_fixture_sha256="f" * 64,
+                audit_run_id="test-audit-pass",
             )
             for capability in ("orderbook_snapshot", "index_price")
         )
@@ -243,6 +280,36 @@ def order(
     receive_leg = leg("receive_leg", exchange)
     pay_leg = leg("pay_leg", pay_exchange)
     evidence = CrossVenueSignalEvidence.build(signal_id, receive_leg, pay_leg)
+
+    def source_hash(leg_evidence: LegDataEvidence) -> str:
+        values = sorted(
+            f"{event.event_id}:{event.payload_sha256}"
+            for capability in leg_evidence.capabilities
+            for event in capability.source_events
+        )
+        return hashlib.sha256("|".join(values).encode()).hexdigest()
+
+    preflight = CrossVenueExecutionPreflight.build(
+        signal_id=signal_id,
+        receive_venue=exchange,
+        pay_venue=pay_exchange,
+        canonical_instrument_id="BTC-PERP",
+        receive_capability_hash=receive_leg.evidence_hash,
+        pay_capability_hash=pay_leg.evidence_hash,
+        receive_source_event_hash=source_hash(receive_leg),
+        pay_source_event_hash=source_hash(pay_leg),
+        receive_execution_health=True,
+        pay_execution_health=True,
+        receive_available_collateral=Decimal("1000"),
+        pay_available_collateral=Decimal("1000"),
+        receive_fillable_quantity=Decimal("1"),
+        pay_fillable_quantity=Decimal("1"),
+        receive_expected_vwap=Decimal("100"),
+        pay_expected_vwap=Decimal("101"),
+        maximum_naked_exposure_duration_ms=3000,
+        created_at=evidence_time,
+        expires_at=evidence_time + timedelta(seconds=30),
+    )
     values = {
         "request_id": request_id,
         "idempotency_key": idempotency_key,
@@ -251,6 +318,7 @@ def order(
         "cross_venue_signal_hash": evidence.evidence_hash,
         "order_leg_role": "receive_leg",
         "order_leg_evidence": receive_leg,
+        "cross_venue_preflight": preflight,
         "strategy_id": "cross_venue_basis",
         "strategy_version": "1",
         "required_capabilities": ("orderbook_snapshot", "index_price"),
@@ -312,6 +380,179 @@ def test_unknown_strategy_and_required_capability_mismatch_fail_closed() -> None
     assert unknown.state == LiveOrderState.REJECTED and "unknown strategy" in unknown.reason
     mismatch = gateway.preview_order(order(required_capabilities=("orderbook_snapshot",)), NOW)
     assert mismatch.state == LiveOrderState.REJECTED and "registry" in mismatch.reason
+
+
+@pytest.mark.parametrize(
+    ("capability_change", "reason"),
+    [
+        ({"support": CapabilitySupport.IMPLEMENTED}, "support"),
+        ({"verification_run_id": "forged-run"}, "verification run"),
+        ({"contract_fixture_sha256": "0" * 64}, "fixture sha256"),
+        ({"audit_run_id": "failed-audit"}, "audit run"),
+    ],
+)
+def test_forged_capability_evidence_is_rejected(
+    capability_change: dict[str, object], reason: str
+) -> None:
+    request = order()
+    full = request.cross_venue_signal_evidence
+    capabilities = list(full.receive_leg.capabilities)
+    capabilities[0] = replace(capabilities[0], **capability_change)
+    receive = LegDataEvidence.build("receive_leg", full.receive_leg.venue, tuple(capabilities))
+    signal = CrossVenueSignalEvidence.build(request.signal_id, receive, full.pay_leg)
+    forged = request.model_copy(
+        update={
+            "cross_venue_signal_evidence": signal,
+            "cross_venue_signal_hash": signal.evidence_hash,
+            "order_leg_evidence": receive,
+        }
+    )
+    gateway = LiveExecutionGateway(
+        live_settings(),
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(live_settings(), approved_context()),
+    )
+    receipt = gateway.preview_order(forged, NOW)
+    assert receipt.state == LiveOrderState.REJECTED and reason in receipt.reason
+
+
+def test_expired_trusted_capability_is_rejected() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.trusted_capability_registry = trusted_registry(expires_at=NOW - timedelta(seconds=1))
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    receipt = gateway.preview_order(order(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and "expired" in receipt.reason
+
+
+@pytest.mark.parametrize(
+    ("event_change", "remove_event", "reason"),
+    [
+        ({"available_at": NOW - timedelta(seconds=31)}, False, "stale"),
+        ({"reconciliation_state": ReconciliationState.DEGRADED}, False, "synchronized"),
+        ({}, True, "does not exist"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pay_leg_failure_blocks_first_order(
+    event_change: dict[str, object], remove_event: bool, reason: str
+) -> None:
+    request = order()
+    full = request.cross_venue_signal_evidence
+    capabilities = list(full.pay_leg.capabilities)
+    event = replace(capabilities[0].source_events[0], **event_change)
+    if remove_event:
+        SOURCE_EVENTS.pop(event.event_id)
+    else:
+        SOURCE_EVENTS[event.event_id] = StoredSourceEvent(**event.__dict__)
+    capabilities[0] = replace(capabilities[0], source_events=(event,))
+    pay = LegDataEvidence.build("pay_leg", full.pay_leg.venue, tuple(capabilities))
+    signal = CrossVenueSignalEvidence.build(request.signal_id, full.receive_leg, pay)
+    changed = request.model_copy(
+        update={
+            "cross_venue_signal_evidence": signal,
+            "cross_venue_signal_hash": signal.evidence_hash,
+        }
+    )
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    receipt = await gateway.place_order(changed, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and reason in receipt.reason
+    assert adapter.place_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_receive_leg_stale_blocks_first_order() -> None:
+    request = order()
+    full = request.cross_venue_signal_evidence
+    capabilities = list(full.receive_leg.capabilities)
+    event = replace(capabilities[0].source_events[0], available_at=NOW - timedelta(seconds=31))
+    SOURCE_EVENTS[event.event_id] = StoredSourceEvent(**event.__dict__)
+    capabilities[0] = replace(capabilities[0], source_events=(event,))
+    receive = LegDataEvidence.build("receive_leg", full.receive_leg.venue, tuple(capabilities))
+    signal = CrossVenueSignalEvidence.build(request.signal_id, receive, full.pay_leg)
+    changed = request.model_copy(
+        update={
+            "cross_venue_signal_evidence": signal,
+            "cross_venue_signal_hash": signal.evidence_hash,
+            "order_leg_evidence": receive,
+        }
+    )
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    receipt = await gateway.place_order(changed, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and "stale" in receipt.reason
+    assert adapter.place_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_two_orders_with_different_preflight_hashes_are_rejected() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    machine = LegExecutionMachine(
+        LegRiskPolicy(maximum_naked_exposure=100, emergency_hedge_venue="alternate"),
+        NOW,
+        Decimal("0.1"),
+        Decimal("100"),
+    )
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        leg_execution_machine=machine,
+    )
+    first = order()
+    assert (await gateway.place_order(first, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    values = first.cross_venue_preflight.__dict__.copy()
+    values.pop("preflight_hash")
+    values["pay_expected_vwap"] = Decimal("102")
+    changed_preflight = CrossVenueExecutionPreflight.build(**values)
+    second = first.model_copy(
+        update={
+            "request_id": "request-second",
+            "idempotency_key": "idempotency-key-second",
+            "cross_venue_preflight": changed_preflight,
+        }
+    )
+    receipt = await gateway.place_order(second, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and "different preflight" in receipt.reason
+    assert adapter.place_calls == 1
+    assert gateway.last_preflight_action == PreflightChangeAction.UNWIND
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"pay_execution_health": False}, "health"),
+        ({"pay_available_collateral": Decimal("0")}, "collateral"),
+        ({"pay_fillable_quantity": Decimal("0.01")}, "fillable"),
+    ],
+)
+def test_cross_venue_preflight_safety_values_fail_closed(
+    change: dict[str, object], reason: str
+) -> None:
+    request = order()
+    values = request.cross_venue_preflight.__dict__.copy()
+    values.pop("preflight_hash")
+    values.update(change)
+    preflight = CrossVenueExecutionPreflight.build(**values)
+    changed = request.model_copy(update={"cross_venue_preflight": preflight})
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(settings, approved_context()),
+    )
+    receipt = gateway.preview_order(changed, NOW)
+    assert receipt.state == LiveOrderState.REJECTED and reason in receipt.reason
 
 
 def test_cross_venue_dual_leg_order_binding_fails_closed() -> None:
@@ -516,34 +757,21 @@ def test_capability_and_source_event_ttls_are_independent() -> None:
         capability_verification_max_age_seconds=120,
         source_event_max_age_seconds=10,
     )
+    adapter = FakeExecutionAdapter()
+    adapter.trusted_capability_registry = trusted_registry(verified_at=NOW - timedelta(seconds=60))
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+    )
+    fresh_event_request = order(capability_verified_at=NOW - timedelta(seconds=60))
+    assert gateway.preview_order(fresh_event_request, NOW).state == LiveOrderState.DRY_RUN
+
     gateway = LiveExecutionGateway(
         settings,
         FakeExecutionAdapter(),
         evaluate_live_preflight(settings, approved_context()),
     )
-    old_capability = order(created_at=NOW - timedelta(seconds=60), expires_at=NOW + timedelta(1))
-    full = old_capability.cross_venue_signal_evidence
-    capabilities = []
-    for capability in full.receive_leg.capabilities:
-        event = replace(
-            capability.source_events[0],
-            received_at=NOW,
-            available_at=NOW,
-        )
-        SOURCE_EVENTS[event.event_id] = StoredSourceEvent(**event.__dict__)
-        capabilities.append(replace(capability, source_events=(event,)))
-    receive = LegDataEvidence.build("receive_leg", full.receive_leg.venue, tuple(capabilities))
-    signal = CrossVenueSignalEvidence.build(old_capability.signal_id, receive, full.pay_leg)
-    fresh_event_request = old_capability.model_copy(
-        update={
-            "cross_venue_signal_evidence": signal,
-            "cross_venue_signal_hash": signal.evidence_hash,
-            "order_leg_evidence": receive,
-            "created_at": NOW,
-        }
-    )
-    assert gateway.preview_order(fresh_event_request, NOW).state == LiveOrderState.DRY_RUN
-
     stale_event = order()
     full = stale_event.cross_venue_signal_evidence
     capabilities = list(full.receive_leg.capabilities)
@@ -852,6 +1080,7 @@ async def test_rate_window_expires_and_audit_sink_receives_events() -> None:
     later_request = order(
         "request-later",
         "idempotency-key-later",
+        signal_id="signal-later",
         created_at=NOW + timedelta(minutes=2),
         expires_at=NOW + timedelta(minutes=3),
     )

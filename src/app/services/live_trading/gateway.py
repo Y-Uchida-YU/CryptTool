@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ from uuid import uuid4
 from app.adapters.exchanges.base import ExecutionAdapter
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
+from app.domain.execution.leg_state import LegExecutionMachine, PreflightChangeAction
 from app.domain.execution.live_models import (
     CancelAck,
     ExecutionAuditEvent,
@@ -16,11 +18,12 @@ from app.domain.execution.live_models import (
     LiveOrderRequest,
     LiveOrderState,
 )
-from app.domain.market_data.evidence import CapabilityEvidence
+from app.domain.market_data.evidence import CapabilityEvidence, LegDataEvidence
 from app.domain.market_data.source_event_repository import SourceEventRepository, StoredSourceEvent
 from app.domain.risk.models import RiskDecision
 from app.domain.strategies.capabilities import STRATEGY_CAPABILITY_REGISTRY
-from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
+from app.domain.venues.models import CapabilityUseCase
+from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.services.live_trading.preflight import LivePreflightReport
 from app.services.venue_eligibility import execution_eligibility_reason
 
@@ -38,15 +41,20 @@ class LiveExecutionGateway:
         adapter: ExecutionAdapter,
         preflight: LivePreflightReport,
         source_event_repository: SourceEventRepository | None = None,
+        trusted_capability_registry: TrustedCapabilityRegistry | None = None,
         audit_sink: Callable[[ExecutionAuditEvent], None] | None = None,
         model_version: str = "phase9-interface-1.0",
         config_version: str = "runtime",
+        leg_execution_machine: LegExecutionMachine | None = None,
     ) -> None:
         self.settings = settings
         self.adapter = adapter
         self.preflight = preflight
         self.source_event_repository = source_event_repository or (
             cast(SourceEventRepository, adapter) if hasattr(adapter, "get") else None
+        )
+        self.trusted_capability_registry = trusted_capability_registry or getattr(
+            adapter, "trusted_capability_registry", None
         )
         self._validate_preflight_integrity()
         self.audit_sink = audit_sink
@@ -57,6 +65,9 @@ class LiveExecutionGateway:
         self._idempotent_receipts: dict[str, ExecutionOrderAck] = {}
         self._order_timestamps: deque[datetime] = deque()
         self._placement_lock = asyncio.Lock()
+        self._signal_preflight_hashes: dict[str, str] = {}
+        self.leg_execution_machine = leg_execution_machine
+        self.last_preflight_action: PreflightChangeAction | None = None
 
     def preview_order(self, request: LiveOrderRequest, timestamp: datetime) -> ExecutionOrderAck:
         timestamp = self._utc(timestamp)
@@ -121,6 +132,9 @@ class LiveExecutionGateway:
         )
         if reason is not None:
             return self._reject_and_remember(request, timestamp, reason)
+        self._signal_preflight_hashes.setdefault(
+            request.signal_id, request.cross_venue_preflight.preflight_hash
+        )
         try:
             if not await self.adapter.health_check():
                 return self._reject_and_remember(request, timestamp, "adapter health check failed")
@@ -287,11 +301,6 @@ class LiveExecutionGateway:
         )
         if request.required_capabilities != role_capabilities:
             return "required capabilities do not exactly match strategy registry"
-        required_use_case = (
-            CapabilityUseCase.EMERGENCY_EXIT
-            if request.reduce_only
-            else CapabilityUseCase.NEW_EXPOSURE
-        )
         all_capabilities = evidence.receive_leg.capabilities + evidence.pay_leg.capabilities
         keys = [(item.venue, item.capability) for item in all_capabilities]
         if len(keys) != len(set(keys)):
@@ -309,21 +318,22 @@ class LiveExecutionGateway:
         }
         if missing:
             return "required cross-venue capability evidence is missing"
-        for item in order_leg.capabilities:
-            age = timestamp - item.verified_at
-            if item.venue != request.exchange:
-                return "capability evidence venue does not match order venue"
-            if item.use_case != required_use_case:
-                return "capability evidence use case does not match order intent"
-            if item.support != CapabilitySupport.LIVE_VERIFIED:
-                return "capability evidence is not LIVE_VERIFIED"
-            if age < timedelta(0) or age > timedelta(
-                seconds=self.settings.live.capability_verification_max_age_seconds
-            ):
-                return "capability evidence is stale or future-dated"
-            source_failure = self._validate_source_events(request, item, timestamp)
-            if source_failure is not None:
-                return source_failure
+        legs = (order_leg,) if request.reduce_only else (evidence.receive_leg, evidence.pay_leg)
+        for leg in legs:
+            expected_use_case = (
+                CapabilityUseCase.EMERGENCY_EXIT
+                if request.reduce_only
+                else CapabilityUseCase.NEW_EXPOSURE
+            )
+            for item in leg.capabilities:
+                failure = self._validate_capability(
+                    request, item, leg.venue, expected_use_case, timestamp
+                )
+                if failure is not None:
+                    return failure
+        preflight_failure = self._validate_cross_venue_preflight(request, timestamp)
+        if preflight_failure is not None:
+            return preflight_failure
         enabled_exchanges = {
             exchange.name for exchange in self.settings.exchanges if exchange.execution_enabled
         }
@@ -370,8 +380,59 @@ class LiveExecutionGateway:
             return "live order rate limit reached"
         return None
 
+    def _validate_capability(
+        self,
+        request: LiveOrderRequest,
+        item: CapabilityEvidence,
+        expected_venue: str,
+        expected_use_case: CapabilityUseCase,
+        timestamp: datetime,
+    ) -> str | None:
+        age = timestamp - item.verified_at
+        if item.venue != expected_venue:
+            return "capability evidence venue does not match order venue"
+        if item.use_case != expected_use_case:
+            return "capability evidence use case does not match order intent"
+        if age < timedelta(0) or age > timedelta(
+            seconds=self.settings.live.capability_verification_max_age_seconds
+        ):
+            return "capability evidence is stale or future-dated"
+        try:
+            if self.trusted_capability_registry is None:
+                return "trusted capability registry is unavailable"
+            trusted = self.trusted_capability_registry.require(
+                venue=item.venue,
+                capability=item.capability,
+                verification_run_id=item.verification_run_id,
+                verified_at=item.verified_at,
+                use_case=item.use_case,
+                now=timestamp,
+            )
+        except ValueError as exc:
+            return f"trusted capability rejected evidence: {exc}"
+        if item.support != trusted.support:
+            return "capability support does not match trusted record"
+        trusted_fields = (
+            (item.adapter_version, trusted.adapter_version, "adapter version"),
+            (item.source_version, trusted.source_version, "source version"),
+            (
+                item.contract_fixture_sha256,
+                trusted.contract_fixture_sha256,
+                "fixture sha256",
+            ),
+            (item.audit_run_id, trusted.audit_run_id, "capability audit run"),
+        )
+        for claimed, actual, label in trusted_fields:
+            if claimed != actual:
+                return f"{label} does not match trusted record"
+        return self._validate_source_events(request, item, timestamp, expected_venue)
+
     def _validate_source_events(
-        self, request: LiveOrderRequest, capability: CapabilityEvidence, timestamp: datetime
+        self,
+        request: LiveOrderRequest,
+        capability: CapabilityEvidence,
+        timestamp: datetime,
+        expected_venue: str,
     ) -> str | None:
         import re
 
@@ -395,7 +456,7 @@ class LiveExecutionGateway:
             mismatch = self._stored_event_mismatch(event, stored)
             if mismatch is not None:
                 return mismatch
-            if stored.venue != request.exchange:
+            if stored.venue != expected_venue:
                 return "stored source event venue does not match order venue"
             if stored.symbol != request.symbol:
                 return "stored source event symbol does not match order symbol"
@@ -414,6 +475,64 @@ class LiveExecutionGateway:
             if snapshot_delta and stored.reconciliation_state != ReconciliationState.SYNCHRONIZED:
                 return "source event is not synchronized"
         return None
+
+    def _validate_cross_venue_preflight(
+        self, request: LiveOrderRequest, timestamp: datetime
+    ) -> str | None:
+        evidence = request.cross_venue_signal_evidence
+        if evidence.receive_leg is None or evidence.pay_leg is None:
+            return "cross-venue execution preflight leg evidence is missing"
+        preflight = request.cross_venue_preflight
+        if not preflight.valid_hash() or preflight.signal_id != request.signal_id:
+            return "cross-venue execution preflight hash or signal is invalid"
+        if (
+            preflight.receive_venue != evidence.receive_leg.venue
+            or preflight.pay_venue != evidence.pay_leg.venue
+        ):
+            return "cross-venue execution preflight venues do not match evidence"
+        if not preflight.created_at <= timestamp < preflight.expires_at:
+            return "cross-venue execution preflight is stale or future-dated"
+        if not preflight.receive_execution_health or not preflight.pay_execution_health:
+            return "cross-venue execution preflight health check failed"
+        if min(preflight.receive_available_collateral, preflight.pay_available_collateral) <= 0:
+            return "cross-venue execution preflight collateral is insufficient"
+        if (
+            min(preflight.receive_fillable_quantity, preflight.pay_fillable_quantity)
+            < request.quantity
+        ):
+            return "cross-venue execution preflight fillable quantity is insufficient"
+        expected = self._signal_preflight_hashes.get(request.signal_id)
+        if expected is not None and expected != preflight.preflight_hash:
+            if self.leg_execution_machine is not None:
+                self.last_preflight_action = self.leg_execution_machine.handle_preflight_change(
+                    timestamp,
+                    evidence_valid=True,
+                    execution_health=preflight.pay_execution_health,
+                    available_collateral=preflight.pay_available_collateral,
+                    fillable_quantity=preflight.pay_fillable_quantity,
+                    expected_vwap=preflight.pay_expected_vwap,
+                    alternate_hedge_available=True,
+                )
+            return "cross-venue orders use different preflight hashes"
+        if (
+            preflight.receive_capability_hash != evidence.receive_leg.evidence_hash
+            or preflight.pay_capability_hash != evidence.pay_leg.evidence_hash
+        ):
+            return "cross-venue preflight capability hashes do not match evidence"
+        if preflight.receive_source_event_hash != self._source_event_hash(
+            evidence.receive_leg
+        ) or preflight.pay_source_event_hash != self._source_event_hash(evidence.pay_leg):
+            return "cross-venue preflight source event hashes do not match evidence"
+        return None
+
+    @staticmethod
+    def _source_event_hash(leg: LegDataEvidence) -> str:
+        values = sorted(
+            f"{event.event_id}:{event.payload_sha256}"
+            for capability in leg.capabilities
+            for event in capability.source_events
+        )
+        return hashlib.sha256("|".join(values).encode()).hexdigest()
 
     @staticmethod
     def _stored_event_mismatch(event: object, stored: StoredSourceEvent) -> str | None:
