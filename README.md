@@ -55,7 +55,7 @@ These fixtures verify mechanics only; they are not evidence of profitability.
 
 ```bash
 uv run app run-backtest tests/fixtures/backtest_events.json
-uv run app run-walk-forward \
+uv run app generate-walk-forward-windows \
   --observations 100 --train 40 --validation 10 --test 10 --purge 2 --embargo 2
 uv run app run-monte-carlo tests/fixtures/net_returns.csv --simulations 1000
 uv run app generate-report tests/fixtures/equity.csv \

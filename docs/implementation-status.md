@@ -1,4 +1,4 @@
-# Implementation status after Phase 9
+# Implementation status through Research Pipeline Phase R1
 
 ## Completed
 
@@ -29,36 +29,33 @@ identity/size binding, serialized idempotent submission, adapter protocol checks
 limits, kill-switch cancel-all, position-bounded reduce-only contingency actions and durable
 sanitized audit events. No concrete venue execution adapter is included.
 
+Phase R1 connects immutable raw events and quarantine records to point-in-time datasets, measured
+data quality, causal features, regimes, the three in-scope strategies, portfolio risk, event-driven
+fills, walk-forward OOS, cost stress, overfitting diagnostics, capital feasibility, acceptance and
+hash-verified research artifacts under one run identity. Liquidation, Whale and all other strategy
+hypotheses are explicitly deferred. The primary and challenger venues remain data-only for this
+phase; live execution remains disabled and no concrete execution adapter is introduced.
+
 ## Verification snapshot
 
-- 150 automated tests pass on Python 3.12, including async integration and Hypothesis invariants.
-- Overall line coverage: 89.03% after adding externally smoke-tested venue adapters.
-- Risk coverage: 100.00%.
-- Execution/backtest coverage: 97.67%.
-- Regime coverage: 95.30%.
-- Phase 9 live-interface coverage: 96.23% and enforced at 95% in CI.
-- Venue market-data adapter coverage: 36.62%, enforced at 25% plus explicit public API smoke;
-  external venue availability is not made a CI dependency.
-- Paper execution coverage: 98.57% and enforced at 95% in CI.
-- `ruff check`, `ruff format --check`, strict `mypy`, Alembic upgrade/check and Bandit pass.
-- Mechanical fixture: two causal fills and final equity 1000.166610 from 1000 initial cash.
-- Paper fixture: one later-event fill, final equity 999.991838776, zero live orders.
-- Monte Carlo fixture: 0% ruin and 44.5% terminal-loss frequency at 1,000 simulations.
-- Research fixture verdict: `INSUFFICIENT_EVIDENCE`.
+Test counts and coverage values are intentionally not copied into this document. CI generates
+`artifacts/build-verification/latest.json` from the JUnit and coverage outputs and uploads the whole
+`artifacts/build-verification/` directory as the `build-verification-<commit SHA>` CI artifact.
+That commit-bound artifact is the sole source for current verification counts and percentages.
 
-These values test software behavior only. The tiny fixtures were not sampled from a representative
-market history and must not be cited as a trading edge.
+The checked-in tests and their generated artifacts validate software behavior only. Fixture data is
+not representative market history and must not be cited as evidence of a trading edge.
 
 ## Remaining before an edge can be evaluated
 
 - Select an exchange/data vendor that the operator is currently permitted to use.
-- Compose the implemented public-data adapters with durable raw ingestion, quarantine and
-  checkpoint storage for the selected production feeds.
+- Operate the durable raw ingestion, quarantine and checkpoint stores against licensed production
+  feeds for the selected venues.
 - Acquire licensed, point-in-time OHLCV, funding, OI, liquidation and book data with survivorship
   and outage records.
-- Freeze hypotheses and parameter grids before observing final results.
-- Run the complete OOS, cost-stress, leave-one-period/asset-out, walk-forward and overfitting suite.
-- Verify 100/300/1,000 capital feasibility against actual venue minimums and historical fee tiers.
+- Freeze production hypotheses and parameter grids before observing final results.
+- Run the R1 OOS, stress, leave-one-out and overfitting suite on the licensed snapshot.
+- Verify capital feasibility against actual venue minimums and historical fee tiers.
 - Operate paper trading through multiple market regimes and reconcile every virtual fill.
 
 Until those items are complete, the correct conclusion is **no demonstrated reproducible edge and

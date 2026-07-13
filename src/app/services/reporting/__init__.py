@@ -13,9 +13,10 @@ from app.services.reporting.report import (
     AcceptanceAssessment,
     AcceptanceCheck,
     ReportArtifacts,
-    evaluate_acceptance,
+    evaluate_legacy_acceptance,
     generate_report,
 )
+from app.services.research.pipeline import evaluate_acceptance
 
 __all__ = [
     "AcceptanceAssessment",
@@ -26,6 +27,7 @@ __all__ = [
     "calculate_performance_metrics",
     "drawdown_series",
     "evaluate_acceptance",
+    "evaluate_legacy_acceptance",
     "generate_report",
     "monthly_returns",
     "regime_distribution",

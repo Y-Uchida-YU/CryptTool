@@ -47,7 +47,11 @@ from app.services.paper_trading.broker import PaperBroker
 from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
 from app.services.regime_engine.rules import DeterministicRuleEngine
-from app.services.reporting.report import evaluate_acceptance, generate_report
+from app.services.reporting.report import AcceptanceAssessment, generate_report
+from app.services.research.models import ResearchRunResult
+from app.services.research.pipeline import ResearchPipeline
+from app.services.research.report import ResearchArtifactWriter
+from app.services.research.repository import PostgreSQLResearchRepository
 from app.services.validation.resampling import monte_carlo_paths
 from app.services.validation.splits import anchored_walk_forward, rolling_walk_forward
 from app.services.venue_eligibility import eligibility_from_settings
@@ -316,8 +320,8 @@ def run_backtest(
     )
 
 
-@app.command("run-walk-forward")
-def run_walk_forward(
+@app.command("generate-walk-forward-windows")
+def generate_walk_forward_windows(
     observations: Annotated[int, typer.Option(min=1)],
     train: Annotated[int, typer.Option(min=1)],
     validation: Annotated[int, typer.Option(min=0)],
@@ -399,7 +403,7 @@ def generate_report_command(
     index = pd.to_datetime(equity_frame["timestamp"], utc=True)
     equity = pd.Series(equity_frame["equity"].astype(float).to_numpy(), index=index)
     trades = pd.read_csv(trades_path) if trades_path else None
-    assessment = evaluate_acceptance()
+    assessment = AcceptanceAssessment(overall="INSUFFICIENT_EVIDENCE", checks=())
     artifacts = generate_report(
         output_directory,
         equity_curve=equity,
@@ -408,6 +412,64 @@ def generate_report_command(
         metadata={"live_trading": False, "source": str(equity_path)},
     )
     typer.echo(f"report generated: {artifacts.markdown}; verdict={assessment.overall}")
+
+
+def _run_research(config_path: Path) -> ResearchRunResult:
+    settings = Settings()
+    if settings.live_trading:
+        raise typer.BadParameter("research pipeline requires live execution to remain disabled")
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLResearchRepository(engine)
+        pipeline = ResearchPipeline(repository)
+        return pipeline.run(ResearchPipeline.load_config(config_path))
+    finally:
+        engine.dispose()
+
+
+@app.command("run-research-pipeline")
+def run_research_pipeline(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+) -> None:
+    """Run the immutable raw-data-to-acceptance research pipeline."""
+    result = _run_research(config)
+    typer.echo(
+        f"run_id={result.identity.run_id} snapshot={result.identity.data_snapshot_id} "
+        f"verdict={result.acceptance_result.verdict.value} "
+        f"manifest={result.artifact_manifest_path} live_execution=OFF"
+    )
+
+
+@app.command("run-walk-forward-backtest")
+def run_walk_forward_backtest(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+) -> None:
+    """Execute strategy selection and untouched OOS windows from a research config."""
+    result = _run_research(config)
+    walk_forward = result.walk_forward_result
+    typer.echo(
+        f"run_id={result.identity.run_id} windows={len(walk_forward.windows)} "
+        f"oos_observations={len(walk_forward.combined_oos_returns)} "
+        f"content_sha256={walk_forward.content_sha256}"
+    )
+
+
+@app.command("generate-research-report")
+def generate_research_report(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Verify and expose the reproducible artifact set for an existing run."""
+    manifest_path = Path("artifacts/research") / run_id / "manifest.json"
+    if not manifest_path.is_file():
+        raise typer.BadParameter(f"unknown research run: {run_id}")
+    manifest = ResearchArtifactWriter.verify(manifest_path)
+    files = manifest["files"]
+    if not isinstance(files, dict):
+        raise typer.BadParameter("invalid research manifest files")
+    typer.echo(
+        f"report={manifest_path} snapshot={manifest['data_snapshot_id']} "
+        f"files={len(files)} hashes=verified"
+    )
 
 
 @app.command("paper-trade")

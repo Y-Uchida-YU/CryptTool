@@ -64,7 +64,7 @@ def _check(
     return AcceptanceCheck(name, status, value, criterion, reason)
 
 
-def evaluate_acceptance(
+def evaluate_legacy_acceptance(
     *,
     oos_return: float | None = None,
     walk_forward_returns: Sequence[float] | None = None,

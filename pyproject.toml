@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Auditable crypto market data and regime research platform"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-  "alembic>=1.13", "httpx>=0.27", "numpy>=2.0", "pandas>=2.2",
+  "alembic>=1.13", "httpx>=0.27", "numpy>=2.0", "pandas>=2.2", "pyarrow>=17.0",
   "pydantic>=2.8", "pydantic-settings>=2.4", "scikit-learn>=1.5",
   "pyyaml>=6.0",
   "psycopg[binary]>=3.2", "scipy>=1.14", "sqlalchemy>=2.0", "statsmodels>=0.14",

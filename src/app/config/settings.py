@@ -77,7 +77,7 @@ class VenueRiskSettings(BaseModel):
 
 class BacktestSettings(BaseModel):
     initial_cash: float = Field(1000.0, gt=0)
-    maker_fee_rate: float = Field(0.0002, ge=0, le=0.01)
+    maker_fee_rate: float = Field(0.0002, ge=-0.01, le=0.01)
     taker_fee_rate: float = Field(0.0006, ge=0, le=0.01)
     slippage_bps: float = Field(2.0, ge=0, le=100)
     market_impact_bps: float = Field(1.0, ge=0, le=100)
