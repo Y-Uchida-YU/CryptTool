@@ -8,11 +8,7 @@ from hypothesis import strategies as st
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
-from app.domain.execution.live_models import (
-    CrossVenueExecutionPreflight,
-    LiveOrderRequest,
-    LiveOrderState,
-)
+from app.domain.execution.live_models import LiveOrderRequest, LiveOrderState
 from app.domain.market_data.evidence import (
     CapabilityEvidence,
     CrossVenueSignalEvidence,
@@ -26,10 +22,16 @@ from app.domain.venues.trusted_capabilities import (
     TrustedCapabilityRecord,
     TrustedCapabilityRegistry,
 )
+from app.services.live_trading.cross_venue_preflight import CrossVenuePreflightService
 from app.services.live_trading.gateway import LiveExecutionGateway
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
+PREFLIGHT_SERVICE = CrossVenuePreflightService(
+    issuer_id="property-preflight-issuer",
+    signing_key=b"property-preflight-signing-key-32-bytes",
+    commit_sha="property-commit-sha",
+)
 
 
 class EventRepository:
@@ -136,7 +138,9 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
         )
         return hashlib.sha256("|".join(items).encode()).hexdigest()
 
-    preflight = CrossVenueExecutionPreflight.build(
+    preflight = PREFLIGHT_SERVICE.issue(
+        issued_at=NOW,
+        snapshot_ids=("snapshot-sandbox", "snapshot-counterparty"),
         signal_id="signal-property",
         receive_venue="sandbox",
         pay_venue="counterparty",
@@ -181,6 +185,7 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
         evaluate_live_preflight(configured, context),
         repository,
         trusted_capability_registry=registry,
+        cross_venue_preflight_service=PREFLIGHT_SERVICE,
     )
     request = LiveOrderRequest(
         request_id="request-property",

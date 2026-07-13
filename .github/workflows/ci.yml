@@ -38,6 +38,19 @@ jobs:
       - run: uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json:coverage.json
       - run: uv run --frozen python scripts/check_coverage.py coverage.json
       - run: uv run --frozen app audit-capabilities
+      - name: Package capability audit artifact
+        run: >-
+          uv run --frozen python scripts/package_capability_audit.py
+          --report artifacts/capability-audit/report.json
+          --manifest artifacts/capability-audit/manifest.json
+          --commit-sha "${GITHUB_SHA}"
+      - name: Upload capability audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capability-audit-${{ github.sha }}
+          path: artifacts/capability-audit/
+          if-no-files-found: error
+          retention-days: 30
       - run: uv run --frozen alembic upgrade head && uv run --frozen alembic check
       - run: uv run --frozen bandit -r src
       - uses: gitleaks/gitleaks-action@v2
