@@ -24,6 +24,11 @@ from app.domain.risk.models import RiskDecision
 from app.domain.strategies.capabilities import STRATEGY_CAPABILITY_REGISTRY
 from app.domain.venues.models import CapabilityUseCase
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
+from app.services.live_trading.cross_venue_preflight import (
+    CrossVenuePreflightService,
+    PreflightBinding,
+    PreflightBindingState,
+)
 from app.services.live_trading.preflight import LivePreflightReport
 from app.services.venue_eligibility import execution_eligibility_reason
 
@@ -46,6 +51,7 @@ class LiveExecutionGateway:
         model_version: str = "phase9-interface-1.0",
         config_version: str = "runtime",
         leg_execution_machine: LegExecutionMachine | None = None,
+        cross_venue_preflight_service: CrossVenuePreflightService | None = None,
     ) -> None:
         self.settings = settings
         self.adapter = adapter
@@ -65,7 +71,10 @@ class LiveExecutionGateway:
         self._idempotent_receipts: dict[str, ExecutionOrderAck] = {}
         self._order_timestamps: deque[datetime] = deque()
         self._placement_lock = asyncio.Lock()
-        self._signal_preflight_hashes: dict[str, str] = {}
+        self.cross_venue_preflight_service = cross_venue_preflight_service or getattr(
+            adapter, "cross_venue_preflight_service", None
+        )
+        self._preflight_bindings: dict[str, PreflightBinding] = {}
         self.leg_execution_machine = leg_execution_machine
         self.last_preflight_action: PreflightChangeAction | None = None
 
@@ -132,14 +141,18 @@ class LiveExecutionGateway:
         )
         if reason is not None:
             return self._reject_and_remember(request, timestamp, reason)
-        self._signal_preflight_hashes.setdefault(
-            request.signal_id, request.cross_venue_preflight.preflight_hash
-        )
+        submission_started = False
+        reserved = False
         try:
             if not await self.adapter.health_check():
                 return self._reject_and_remember(request, timestamp, "adapter health check failed")
+            reservation_failure = self._reserve_preflight(request)
+            if reservation_failure is not None:
+                return self._reject_and_remember(request, timestamp, reservation_failure)
+            reserved = True
             open_orders = await self.adapter.fetch_open_orders()
             if len(open_orders) >= self.settings.live.maximum_open_orders:
+                self._abort_preflight(request)
                 return self._reject_and_remember(
                     request, timestamp, "maximum open order count reached"
                 )
@@ -154,21 +167,27 @@ class LiveExecutionGateway:
                     None,
                 )
                 if position is None or position.quantity == 0:
+                    self._abort_preflight(request)
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only order has no open position"
                     )
                 closes_long = position.quantity > 0 and request.side.value == "sell"
                 closes_short = position.quantity < 0 and request.side.value == "buy"
                 if not (closes_long or closes_short):
+                    self._abort_preflight(request)
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only side would increase exposure"
                     )
                 if request.quantity > abs(position.quantity):
+                    self._abort_preflight(request)
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only quantity exceeds open position"
                     )
+            submission_started = True
             receipt = await self.adapter.place_order(request)
         except Exception as exc:
+            if reserved and not submission_started:
+                self._abort_preflight(request)
             self._audit(
                 timestamp,
                 "adapter_error",
@@ -184,6 +203,7 @@ class LiveExecutionGateway:
                 timestamp, "adapter_protocol_error", request.request_id, False, "request mismatch"
             )
             raise ExecutionAdapterError("execution adapter returned a mismatched request id")
+        self._record_preflight_ack(request, receipt)
         self._idempotent_receipts[request.idempotency_key] = receipt
         self._order_timestamps.append(timestamp)
         self._audit(
@@ -483,7 +503,13 @@ class LiveExecutionGateway:
         if evidence.receive_leg is None or evidence.pay_leg is None:
             return "cross-venue execution preflight leg evidence is missing"
         preflight = request.cross_venue_preflight
-        if not preflight.valid_hash() or preflight.signal_id != request.signal_id:
+        if self.cross_venue_preflight_service is None:
+            return "trusted cross-venue preflight service is unavailable"
+        try:
+            self.cross_venue_preflight_service.verify(preflight, timestamp)
+        except ValueError as exc:
+            return f"trusted cross-venue preflight rejected snapshot: {exc}"
+        if preflight.signal_id != request.signal_id:
             return "cross-venue execution preflight hash or signal is invalid"
         if (
             preflight.receive_venue != evidence.receive_leg.venue
@@ -501,8 +527,17 @@ class LiveExecutionGateway:
             < request.quantity
         ):
             return "cross-venue execution preflight fillable quantity is insufficient"
-        expected = self._signal_preflight_hashes.get(request.signal_id)
-        if expected is not None and expected != preflight.preflight_hash:
+        binding = self._preflight_bindings.get(request.signal_id)
+        expected = binding.preflight_hash if binding is not None else None
+        if (
+            binding is not None
+            and binding.state
+            not in {
+                PreflightBindingState.UNBOUND,
+                PreflightBindingState.ABORTED,
+            }
+            and expected != preflight.preflight_hash
+        ):
             if self.leg_execution_machine is not None:
                 self.last_preflight_action = self.leg_execution_machine.handle_preflight_change(
                     timestamp,
@@ -524,6 +559,55 @@ class LiveExecutionGateway:
         ) or preflight.pay_source_event_hash != self._source_event_hash(evidence.pay_leg):
             return "cross-venue preflight source event hashes do not match evidence"
         return None
+
+    def preflight_binding(self, signal_id: str) -> PreflightBinding:
+        return self._preflight_bindings.get(
+            signal_id,
+            PreflightBinding(signal_id, None, PreflightBindingState.UNBOUND),
+        )
+
+    def _reserve_preflight(self, request: LiveOrderRequest) -> str | None:
+        current = self.preflight_binding(request.signal_id)
+        preflight_hash = request.cross_venue_preflight.preflight_hash
+        if current.state in {PreflightBindingState.UNBOUND, PreflightBindingState.ABORTED}:
+            self._preflight_bindings[request.signal_id] = PreflightBinding(
+                request.signal_id, preflight_hash, PreflightBindingState.RESERVED
+            )
+            return None
+        if current.preflight_hash != preflight_hash:
+            return "cross-venue orders use different preflight hashes"
+        if current.state == PreflightBindingState.FIRST_LEG_ACCEPTED:
+            if current.first_leg_role == request.order_leg_role:
+                return "cross-venue second order must use the opposite leg role"
+            return None
+        if current.state == PreflightBindingState.COMPLETED:
+            return "cross-venue preflight binding is already completed"
+        return "cross-venue preflight binding is already reserved"
+
+    def _abort_preflight(self, request: LiveOrderRequest) -> None:
+        self._preflight_bindings[request.signal_id] = PreflightBinding(
+            request.signal_id,
+            request.cross_venue_preflight.preflight_hash,
+            PreflightBindingState.ABORTED,
+        )
+
+    def _record_preflight_ack(self, request: LiveOrderRequest, receipt: ExecutionOrderAck) -> None:
+        current = self.preflight_binding(request.signal_id)
+        if receipt.state != LiveOrderState.ACCEPTED:
+            self._abort_preflight(request)
+            return
+        if current.state == PreflightBindingState.FIRST_LEG_ACCEPTED:
+            state = PreflightBindingState.COMPLETED
+            first_leg_role = current.first_leg_role
+        else:
+            state = PreflightBindingState.FIRST_LEG_ACCEPTED
+            first_leg_role = request.order_leg_role
+        self._preflight_bindings[request.signal_id] = PreflightBinding(
+            request.signal_id,
+            request.cross_venue_preflight.preflight_hash,
+            state,
+            first_leg_role,
+        )
 
     @staticmethod
     def _source_event_hash(leg: LegDataEvidence) -> str:

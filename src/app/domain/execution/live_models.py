@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -23,6 +21,10 @@ class LiveOrderState(StrEnum):
 
 @dataclass(frozen=True)
 class CrossVenueExecutionPreflight:
+    issuer_id: str
+    issued_at: datetime
+    commit_sha: str
+    snapshot_ids: tuple[str, ...]
     signal_id: str
     receive_venue: str
     pay_venue: str
@@ -43,16 +45,7 @@ class CrossVenueExecutionPreflight:
     created_at: datetime
     expires_at: datetime
     preflight_hash: str
-
-    @classmethod
-    def build(cls, **values: object) -> CrossVenueExecutionPreflight:
-        payload = json.dumps(values, sort_keys=True, default=str, separators=(",", ":")).encode()
-        return cls(**values, preflight_hash=hashlib.sha256(payload).hexdigest())  # type: ignore[arg-type]
-
-    def valid_hash(self) -> bool:
-        values = asdict(self)
-        values.pop("preflight_hash")
-        return self == self.build(**values)
+    signature: str
 
 
 class LiveOrderRequest(BaseModel):

@@ -15,7 +15,6 @@ from app.config.settings import Settings
 from app.domain.execution.leg_state import LegExecutionMachine, LegRiskPolicy, PreflightChangeAction
 from app.domain.execution.live_models import (
     CancelAck,
-    CrossVenueExecutionPreflight,
     ExecutionAuditEvent,
     ExecutionOrderAck,
     LiveOpenOrder,
@@ -38,6 +37,10 @@ from app.domain.venues.trusted_capabilities import (
     TrustedCapabilityRecord,
     TrustedCapabilityRegistry,
 )
+from app.services.live_trading.cross_venue_preflight import (
+    CrossVenuePreflightService,
+    PreflightBindingState,
+)
 from app.services.live_trading.gateway import ExecutionAdapterError, LiveExecutionGateway
 from app.services.live_trading.preflight import (
     RUNTIME_CONFIRMATION,
@@ -49,6 +52,11 @@ from app.services.live_trading.preflight import (
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
 SOURCE_EVENTS: dict[str, StoredSourceEvent] = {}
+PREFLIGHT_SERVICE = CrossVenuePreflightService(
+    issuer_id="test-preflight-issuer",
+    signing_key=b"test-preflight-signing-key-32-bytes-minimum",
+    commit_sha="test-commit-sha",
+)
 
 
 def trusted_registry(
@@ -88,6 +96,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.fail_cancel_all = False
         self.fail_close = False
         self.trusted_capability_registry = trusted_registry()
+        self.cross_venue_preflight_service = PREFLIGHT_SERVICE
 
     @property
     def adapter_name(self) -> str:
@@ -182,6 +191,11 @@ def live_settings(**live_overrides: object) -> Settings:
                 "data_enabled": True,
                 "execution_enabled": True,
             },
+            {
+                "name": "counterparty",
+                "data_enabled": True,
+                "execution_enabled": True,
+            },
         ),
         venues={
             "sandbox": {
@@ -198,7 +212,22 @@ def live_settings(**live_overrides: object) -> Settings:
                 "execution_smoke_test_passed": True,
                 "requires_location_evasion": False,
                 "reason": "test fixture",
-            }
+            },
+            "counterparty": {
+                "data_enabled": True,
+                "execution_enabled": True,
+                "eligibility_status": "enabled",
+                "jurisdiction": "JP",
+                "terms_checked_at": NOW,
+                "operator_account_verified": True,
+                "api_market_data_available": True,
+                "api_execution_available": True,
+                "deposits_available": True,
+                "withdrawals_available": True,
+                "execution_smoke_test_passed": True,
+                "requires_location_evasion": False,
+                "reason": "test fixture",
+            },
         },
     )
 
@@ -289,7 +318,9 @@ def order(
         )
         return hashlib.sha256("|".join(values).encode()).hexdigest()
 
-    preflight = CrossVenueExecutionPreflight.build(
+    preflight = PREFLIGHT_SERVICE.issue(
+        issued_at=evidence_time,
+        snapshot_ids=(f"snapshot-{exchange}", f"snapshot-{pay_exchange}"),
         signal_id=signal_id,
         receive_venue=exchange,
         pay_venue=pay_exchange,
@@ -512,9 +543,10 @@ async def test_two_orders_with_different_preflight_hashes_are_rejected() -> None
     first = order()
     assert (await gateway.place_order(first, risk(), NOW)).state == LiveOrderState.ACCEPTED
     values = first.cross_venue_preflight.__dict__.copy()
-    values.pop("preflight_hash")
+    for key in ("issuer_id", "commit_sha", "preflight_hash", "signature"):
+        values.pop(key)
     values["pay_expected_vwap"] = Decimal("102")
-    changed_preflight = CrossVenueExecutionPreflight.build(**values)
+    changed_preflight = PREFLIGHT_SERVICE.issue(**values)
     second = first.model_copy(
         update={
             "request_id": "request-second",
@@ -541,9 +573,10 @@ def test_cross_venue_preflight_safety_values_fail_closed(
 ) -> None:
     request = order()
     values = request.cross_venue_preflight.__dict__.copy()
-    values.pop("preflight_hash")
+    for key in ("issuer_id", "commit_sha", "preflight_hash", "signature"):
+        values.pop(key)
     values.update(change)
-    preflight = CrossVenueExecutionPreflight.build(**values)
+    preflight = PREFLIGHT_SERVICE.issue(**values)
     changed = request.model_copy(update={"cross_venue_preflight": preflight})
     settings = live_settings()
     gateway = LiveExecutionGateway(
@@ -553,6 +586,141 @@ def test_cross_venue_preflight_safety_values_fail_closed(
     )
     receipt = gateway.preview_order(changed, NOW)
     assert receipt.state == LiveOrderState.REJECTED and reason in receipt.reason
+
+
+def test_untrusted_preflight_issuer_and_signature_are_rejected() -> None:
+    request = order()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(settings, approved_context()),
+    )
+    wrong_issuer = replace(request.cross_venue_preflight, issuer_id="order-controlled")
+    receipt = gateway.preview_order(
+        request.model_copy(update={"cross_venue_preflight": wrong_issuer}), NOW
+    )
+    assert receipt.state == LiveOrderState.REJECTED and "issuer" in receipt.reason
+    forged = replace(request.cross_venue_preflight, signature="0" * 64)
+    receipt = gateway.preview_order(
+        request.model_copy(update={"cross_venue_preflight": forged}), NOW
+    )
+    assert receipt.state == LiveOrderState.REJECTED and "signature" in receipt.reason
+
+    adapter = FakeExecutionAdapter()
+    adapter.cross_venue_preflight_service = None
+    unavailable = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    ).preview_order(request, NOW)
+    assert unavailable.state == LiveOrderState.REJECTED and "unavailable" in unavailable.reason
+
+
+def test_preflight_service_rejects_invalid_issuance_and_trust_metadata() -> None:
+    with pytest.raises(ValueError, match="32-byte"):
+        CrossVenuePreflightService(issuer_id="issuer", signing_key=b"short", commit_sha="sha")
+    with pytest.raises(ValueError, match="snapshot ids"):
+        PREFLIGHT_SERVICE.issue(snapshot_ids=())
+
+    preflight = order().cross_venue_preflight
+    with pytest.raises(ValueError, match="commit SHA"):
+        PREFLIGHT_SERVICE.verify(replace(preflight, commit_sha="wrong"), NOW)
+    with pytest.raises(ValueError, match="snapshot ids"):
+        PREFLIGHT_SERVICE.verify(replace(preflight, snapshot_ids=("same", "same")), NOW)
+    with pytest.raises(ValueError, match="future-dated"):
+        PREFLIGHT_SERVICE.verify(replace(preflight, issued_at=NOW + timedelta(seconds=1)), NOW)
+    with pytest.raises(ValueError, match="hash"):
+        PREFLIGHT_SERVICE.verify(replace(preflight, preflight_hash="0" * 64), NOW)
+
+
+@pytest.mark.asyncio
+async def test_adapter_health_failure_does_not_reserve_preflight() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.healthy = False
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert gateway.preflight_binding(request.signal_id).state == PreflightBindingState.UNBOUND
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_failure_releases_preflight_reservation() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.open_orders = [
+        LiveOpenOrder(
+            external_order_id=f"open-{index}",
+            exchange="sandbox",
+            symbol="BTC",
+            side=Side.BUY,
+            quantity=Decimal("0.1"),
+            reduce_only=False,
+            created_at=NOW,
+        )
+        for index in range(3)
+    ]
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert gateway.preflight_binding(request.signal_id).state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_signed_preflight_binding_completes_after_both_legs() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    first = order()
+    assert (await gateway.place_order(first, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    assert (
+        gateway.preflight_binding(first.signal_id).state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    )
+    second = first.model_copy(
+        update={
+            "request_id": "request-pay-leg",
+            "idempotency_key": "x" * 16,
+            "order_leg_role": "pay_leg",
+            "order_leg_evidence": first.cross_venue_signal_evidence.pay_leg,
+            "exchange": "counterparty",
+        }
+    )
+    assert (await gateway.place_order(second, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    assert gateway.preflight_binding(first.signal_id).state == PreflightBindingState.COMPLETED
+    third = second.model_copy(
+        update={
+            "request_id": "request-third-leg",
+            "idempotency_key": "y" * 16,
+        }
+    )
+    receipt = await gateway.place_order(third, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and "completed" in receipt.reason
+
+
+@pytest.mark.asyncio
+async def test_same_leg_cannot_consume_reserved_second_leg() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    first = order()
+    assert (await gateway.place_order(first, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    repeated = first.model_copy(
+        update={
+            "request_id": "request-repeat-leg",
+            "idempotency_key": "z" * 16,
+        }
+    )
+    receipt = await gateway.place_order(repeated, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED and "opposite leg" in receipt.reason
 
 
 def test_cross_venue_dual_leg_order_binding_fails_closed() -> None:
