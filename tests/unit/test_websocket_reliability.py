@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import deque
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -76,8 +77,15 @@ def session(**overrides: object) -> ResilientWebSocketSession:
 
 def context() -> ConnectionReconciliationContext:
     return ConnectionReconciliationContext(
-        uuid4(), ReconciliationState.DISCONNECTED, None, None, [], set()
+        uuid4(), ReconciliationState.DISCONNECTED, None, None, [], set(), deque()
     )
+
+
+def raw_queue(*items: str) -> asyncio.Queue[str | bytes | BaseException]:
+    queue: asyncio.Queue[str | bytes | BaseException] = asyncio.Queue()
+    for item in items:
+        queue.put_nowait(item)
+    return queue
 
 
 @pytest.mark.asyncio
@@ -262,8 +270,7 @@ async def test_initial_rest_snapshot_bootstrap_buffers_first_delta() -> None:
         delta_applier=lambda item: applied.append(("delta", item["seq"])),
     )
     current = context()
-    socket = FakeSocket([json.dumps({"seq": 6, "kind": "delta"})])
-    await value._bootstrap(socket, current)
+    await value._bootstrap(raw_queue(json.dumps({"seq": 6, "kind": "delta"})), current)
     assert applied == [("snapshot", 5), ("delta", 6)]
     assert current.state == ReconciliationState.SYNCHRONIZED
     assert current.previous_sequence == 6
@@ -313,7 +320,7 @@ async def test_initial_rest_snapshot_failure_fails_closed() -> None:
         delta_applier=lambda item: None,
     )
     with pytest.raises(OSError, match="snapshot unavailable"):
-        await value._bootstrap(FakeSocket([]), context())
+        await value._bootstrap(raw_queue(), context())
 
 
 @pytest.mark.asyncio
@@ -364,7 +371,7 @@ async def test_bootstrap_rejects_missing_loader_and_non_delta_message() -> None:
     )
     value.rest_snapshot = None
     with pytest.raises(RuntimeError, match="unavailable"):
-        await value._bootstrap(FakeSocket([]), context())
+        await value._bootstrap(raw_queue(), context())
 
     async def delayed_snapshot() -> object:
         await asyncio.sleep(0.01)
@@ -372,4 +379,36 @@ async def test_bootstrap_rejects_missing_loader_and_non_delta_message() -> None:
 
     value.rest_snapshot = delayed_snapshot
     with pytest.raises(RuntimeError, match="non-delta"):
-        await value._bootstrap(FakeSocket([json.dumps({"kind": "snapshot"})]), context())
+        await value._bootstrap(raw_queue(json.dumps({"kind": "snapshot"})), context())
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_receive_complete_simultaneously_without_message_loss() -> None:
+    applied: list[int] = []
+    queue = raw_queue(
+        json.dumps({"kind": "heartbeat"}),
+        json.dumps({"seq": 6, "kind": "delta"}),
+    )
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=lambda: asyncio.sleep(0, result={"seq": 5}),
+        snapshot_applier=lambda item: item["seq"],
+        delta_applier=lambda item: applied.append(item["seq"]),
+    )
+    await value._bootstrap(queue, context())
+    assert applied == [6]
+    assert queue.empty()
+
+    value.snapshot_applier = None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await value._apply_snapshot_and_replay(context(), {"seq": 5})
+
+
+def test_duplicate_cache_remains_bounded() -> None:
+    value = session(duplicate_cache_size=3)
+    current = context()
+    for digest in ("a", "b", "c", "d"):
+        assert not value._seen_payload(current, digest)
+    assert current.payload_hash_order == deque(("b", "c", "d"))
+    assert current.payload_hashes == {"b", "c", "d"}
+    assert value._seen_payload(current, "d")

@@ -10,15 +10,25 @@ from app.config.settings import Settings
 from app.domain.execution.live_models import LiveOrderRequest, LiveOrderState
 from app.domain.market_data.evidence import (
     CapabilityEvidence,
-    SignalDataEvidence,
+    CrossVenueSignalEvidence,
+    LegDataEvidence,
     SourceEventEvidence,
 )
 from app.domain.market_data.models import Side
+from app.domain.market_data.source_event_repository import StoredSourceEvent
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.gateway import LiveExecutionGateway
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
+
+
+class EventRepository:
+    def __init__(self) -> None:
+        self.events: dict[str, StoredSourceEvent] = {}
+
+    def get(self, event_id: str) -> StoredSourceEvent | None:
+        return self.events.get(event_id)
 
 
 def settings() -> Settings:
@@ -68,47 +78,56 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
 ) -> None:
     configured = settings()
     context = LivePreflightContext(timestamp=NOW)
+    repository = EventRepository()
     gateway = LiveExecutionGateway(
         configured,
         DisabledExecutionAdapter(),
         evaluate_live_preflight(configured, context),
+        repository,
     )
-    request = LiveOrderRequest(
-        request_id="request-property",
-        idempotency_key="idempotency-property",
-        signal_id="signal-property",
-        signal_data_evidence=SignalDataEvidence.build(
-            "signal-property",
-            tuple(
+
+    def leg(role: str, venue: str) -> LegDataEvidence:
+        capabilities = []
+        for capability in ("orderbook_snapshot", "index_price"):
+            event = SourceEventEvidence(
+                f"event-{venue}-{capability}",
+                venue,
+                "BTC",
+                capability,
+                NOW,
+                NOW,
+                NOW,
+                "a" * 64,
+                1,
+                None,
+                ReconciliationState.SYNCHRONIZED if capability == "orderbook_snapshot" else None,
+                1,
+            )
+            repository.events[event.event_id] = StoredSourceEvent(**event.__dict__)
+            capabilities.append(
                 CapabilityEvidence(
-                    venue="sandbox",
+                    venue=venue,
                     capability=capability,
                     use_case=CapabilityUseCase.NEW_EXPOSURE,
                     support=CapabilitySupport.LIVE_VERIFIED,
                     verified_at=NOW,
                     verification_run_id="property-smoke",
-                    source_events=(
-                        SourceEventEvidence(
-                            f"event-{capability}",
-                            "sandbox",
-                            "BTC",
-                            capability,
-                            NOW,
-                            NOW,
-                            NOW,
-                            "a" * 64,
-                            1,
-                            None,
-                            ReconciliationState.SYNCHRONIZED
-                            if capability == "orderbook_snapshot"
-                            else None,
-                            1,
-                        ),
-                    ),
+                    source_events=(event,),
                 )
-                for capability in ("orderbook_snapshot", "index_price")
-            ),
-        ),
+            )
+        return LegDataEvidence.build(role, venue, tuple(capabilities))
+
+    receive_leg = leg("receive_leg", "sandbox")
+    pay_leg = leg("pay_leg", "counterparty")
+    signal = CrossVenueSignalEvidence.build("signal-property", receive_leg, pay_leg)
+    request = LiveOrderRequest(
+        request_id="request-property",
+        idempotency_key="idempotency-property",
+        signal_id="signal-property",
+        cross_venue_signal_evidence=signal,
+        cross_venue_signal_hash=signal.evidence_hash,
+        order_leg_role="receive_leg",
+        order_leg_evidence=receive_leg,
         strategy_id="cross_venue_basis",
         strategy_version="1",
         required_capabilities=("orderbook_snapshot", "index_price"),

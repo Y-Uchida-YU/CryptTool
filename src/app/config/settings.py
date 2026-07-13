@@ -115,6 +115,8 @@ class LiveTradingSettings(BaseModel):
     maximum_orders_per_minute: int = Field(5, ge=1, le=60)
     maximum_clock_skew_seconds: float = Field(2.0, ge=0, le=30)
     preflight_ttl_seconds: int = Field(30, ge=1, le=300)
+    capability_verification_max_age_seconds: int = Field(3600, ge=1, le=86400)
+    source_event_max_age_seconds: int = Field(30, ge=1, le=3600)
     minimum_data_quality: float = Field(0.90, ge=0.8, le=1)
     withdrawal_permission_confirmed_disabled: bool = True
 
