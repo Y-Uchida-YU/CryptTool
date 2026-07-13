@@ -50,6 +50,13 @@ class PreflightBindingRow(Base):
         ),
         CheckConstraint("version >= 1", name="ck_preflight_bindings_version"),
         CheckConstraint("updated_at >= created_at", name="ck_preflight_bindings_timestamp_order"),
+        CheckConstraint(
+            "(position_venue IS NULL AND position_symbol IS NULL "
+            "AND position_quantity_before IS NULL AND position_captured_at IS NULL) OR "
+            "(position_venue IS NOT NULL AND position_symbol IS NOT NULL "
+            "AND position_quantity_before IS NOT NULL AND position_captured_at IS NOT NULL)",
+            name="ck_preflight_bindings_position_snapshot_complete",
+        ),
     )
     signal_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     preflight_hash: Mapped[str | None] = mapped_column(String(64))

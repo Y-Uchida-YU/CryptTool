@@ -22,6 +22,8 @@ from app.domain.execution.live_models import (
     LiveOrderState,
     LivePosition,
     PreflightRecoveryAction,
+    ReconciledOrder,
+    ReconciledOrderStatus,
 )
 from app.domain.market_data.evidence import CapabilityEvidence, LegDataEvidence
 from app.domain.market_data.source_event_repository import SourceEventRepository, StoredSourceEvent
@@ -49,7 +51,7 @@ class ExecutionAdapterError(RuntimeError):
 class ReconciliationExecutionAdapter(Protocol):
     async def fetch_recent_fills(self, symbol: str, since: datetime) -> Sequence[ExecutionFill]: ...
 
-    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
+    async def lookup_order_by_client_id(self, client_order_id: str) -> ReconciledOrder | None: ...
 
 
 RECONCILIATION_CAPABILITIES = {
@@ -63,7 +65,7 @@ RECONCILIATION_CAPABILITIES = {
 @dataclass(frozen=True)
 class ExchangeReconciliationSnapshot:
     binding: PreflightBinding
-    client_order: ExecutionOrderAck | None
+    client_order: ReconciledOrder | None
     matching_fills: tuple[ExecutionFill, ...]
     matching_open_orders: tuple[LiveOpenOrder, ...]
     positions: tuple[LivePosition, ...]
@@ -1021,8 +1023,17 @@ class LiveExecutionGateway:
         self, request: LiveOrderRequest, snapshot: ExchangeReconciliationSnapshot
     ) -> bool:
         client_order = snapshot.client_order
-        if self._client_order_matches(request, snapshot) and (
-            client_order is not None and client_order.state == LiveOrderState.ACCEPTED
+        if (
+            self._client_order_matches(request, snapshot)
+            and client_order is not None
+            and (
+                client_order.status
+                in {
+                    ReconciledOrderStatus.OPEN,
+                    ReconciledOrderStatus.PARTIALLY_FILLED,
+                    ReconciledOrderStatus.FILLED,
+                }
+            )
         ):
             return True
         if len(snapshot.matching_open_orders) == 1:
@@ -1045,6 +1056,8 @@ class LiveExecutionGateway:
     ) -> bool:
         client_order = snapshot.client_order
         if client_order is not None and not self._client_order_matches(request, snapshot):
+            return True
+        if client_order is not None and client_order.status == ReconciledOrderStatus.PENDING:
             return True
         if len(snapshot.matching_open_orders) > 1:
             return True
@@ -1099,8 +1112,14 @@ class LiveExecutionGateway:
         since = before.captured_at if before is not None else request.created_at
         return (
             client_order is not None
-            and client_order.request_id == request.request_id
-            and since <= client_order.accepted_at <= snapshot.captured_at
+            and client_order.client_order_id == request.request_id
+            and client_order.exchange == request.exchange
+            and client_order.symbol == request.symbol
+            and client_order.side == request.side
+            and client_order.original_quantity == request.quantity
+            and client_order.reduce_only == request.reduce_only
+            and since <= client_order.created_at <= snapshot.captured_at
+            and client_order.created_at <= client_order.updated_at <= snapshot.captured_at
         )
 
     @staticmethod

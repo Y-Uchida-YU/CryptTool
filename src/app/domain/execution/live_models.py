@@ -19,6 +19,16 @@ class LiveOrderState(StrEnum):
     CANCELED = "canceled"
 
 
+class ReconciledOrderStatus(StrEnum):
+    PENDING = "pending"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
 class PreflightRecoveryAction(StrEnum):
     ALTERNATE_HEDGE = "alternate_hedge"
     PARTIAL_HEDGE = "partial_hedge"
@@ -181,6 +191,8 @@ class LiveOpenOrder(BaseModel):
 
 @dataclass(frozen=True)
 class ExecutionFill:
+    """Exchange fill with positive fees paid and negative maker rebates received."""
+
     fill_id: str
     exchange_order_id: str
     client_order_id: str
@@ -189,7 +201,7 @@ class ExecutionFill:
     side: Side
     price: Decimal
     quantity: Decimal
-    fee: Decimal
+    signed_fee: Decimal
     executed_at: datetime
     liquidity_role: str | None = None
 
@@ -202,11 +214,49 @@ class ExecutionFill:
             or not self.symbol
         ):
             raise ValueError("fill and order identities are required")
-        if self.price <= 0 or self.quantity <= 0 or self.fee < 0:
-            raise ValueError("fill price, quantity, and fee are invalid")
+        if self.price <= 0 or self.quantity <= 0:
+            raise ValueError("fill price and quantity are invalid")
         if self.executed_at.tzinfo is None:
             raise ValueError("fill timestamp must be timezone-aware")
         object.__setattr__(self, "executed_at", self.executed_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class ReconciledOrder:
+    client_order_id: str
+    external_order_id: str
+    exchange: str
+    symbol: str
+    side: Side
+    original_quantity: Decimal
+    filled_quantity: Decimal
+    average_fill_price: Decimal | None
+    reduce_only: bool
+    status: ReconciledOrderStatus
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if not all((self.client_order_id, self.external_order_id, self.exchange, self.symbol)):
+            raise ValueError("reconciled order identities are required")
+        if (
+            self.original_quantity <= 0
+            or self.filled_quantity < 0
+            or self.filled_quantity > self.original_quantity
+        ):
+            raise ValueError("reconciled order quantities are invalid")
+        if self.average_fill_price is not None and self.average_fill_price <= 0:
+            raise ValueError("average fill price must be positive")
+        if self.filled_quantity > 0 and self.average_fill_price is None:
+            raise ValueError("filled reconciled orders require an average fill price")
+        if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
+            raise ValueError("reconciled order timestamps must be timezone-aware")
+        created_at = self.created_at.astimezone(UTC)
+        updated_at = self.updated_at.astimezone(UTC)
+        if updated_at < created_at:
+            raise ValueError("reconciled order update cannot precede creation")
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "updated_at", updated_at)
 
 
 class LivePosition(BaseModel):
