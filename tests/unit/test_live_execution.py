@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from app.adapters.exchanges.base import ExecutionAdapter
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter, LiveTradingDisabledError
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
 from app.domain.execution.live_models import (
     CancelAck,
@@ -19,7 +21,11 @@ from app.domain.execution.live_models import (
     LivePosition,
 )
 from app.domain.execution.models import OrderType
-from app.domain.market_data.evidence import CapabilityEvidence, SignalDataEvidence
+from app.domain.market_data.evidence import (
+    CapabilityEvidence,
+    SignalDataEvidence,
+    SourceEventEvidence,
+)
 from app.domain.market_data.models import Side
 from app.domain.risk.models import PositionSizingResult, RiskDecision
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
@@ -189,20 +195,40 @@ def order(
     assert isinstance(evidence_time, datetime)
     if evidence_time.tzinfo is None:
         evidence_time = NOW
+
+    def source_event(capability: str) -> SourceEventEvidence:
+        return SourceEventEvidence(
+            event_id=f"event-{capability}",
+            venue=exchange,
+            symbol=str(overrides.get("symbol", "BTC")),
+            event_type=capability,
+            exchange_timestamp=evidence_time,
+            received_at=evidence_time,
+            available_at=evidence_time,
+            payload_sha256="a" * 64,
+            sequence=1,
+            connection_id=None,
+            reconciliation_state=(
+                ReconciliationState.SYNCHRONIZED if capability == "orderbook_snapshot" else None
+            ),
+            data_quality_score=1,
+        )
+
     evidence = SignalDataEvidence.build(
         signal_id,
-        (
+        tuple(
             CapabilityEvidence(
                 venue=exchange,
-                capability="orderbook_snapshot",
+                capability=capability,
                 use_case=CapabilityUseCase.EMERGENCY_EXIT
                 if overrides.get("reduce_only")
                 else CapabilityUseCase.NEW_EXPOSURE,
                 support=CapabilitySupport.LIVE_VERIFIED,
                 verified_at=evidence_time,
                 verification_run_id="test-live-smoke",
-                source_event_ids=("event-1",),
-            ),
+                source_events=(source_event(capability),),
+            )
+            for capability in ("orderbook_snapshot", "index_price")
         ),
     )
     values = {
@@ -210,7 +236,9 @@ def order(
         "idempotency_key": idempotency_key,
         "signal_id": signal_id,
         "signal_data_evidence": evidence,
-        "required_capabilities": ("orderbook_snapshot",),
+        "strategy_id": "cross_venue_basis",
+        "strategy_version": "1",
+        "required_capabilities": ("orderbook_snapshot", "index_price"),
         "risk_decision_id": "risk-decision-0001",
         "model_version": "strategy-1.0",
         "config_version": "config-1.0",
@@ -257,6 +285,54 @@ def test_default_preflight_refuses_every_live_path() -> None:
     assert not report.approved
     assert report.warning.startswith("LIVE EXECUTION REFUSED")
     assert any(not check.passed for check in report.checks)
+
+
+def test_unknown_strategy_and_required_capability_mismatch_fail_closed() -> None:
+    gateway = LiveExecutionGateway(
+        live_settings(),
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(live_settings(), approved_context()),
+    )
+    unknown = gateway.preview_order(order(strategy_id="unknown"), NOW)
+    assert unknown.state == LiveOrderState.REJECTED and "unknown strategy" in unknown.reason
+    mismatch = gateway.preview_order(order(required_capabilities=("orderbook_snapshot",)), NOW)
+    assert mismatch.state == LiveOrderState.REJECTED and "registry" in mismatch.reason
+
+
+@pytest.mark.parametrize(
+    ("event_change", "reason"),
+    [
+        ({"available_at": NOW - timedelta(seconds=31)}, "stale"),
+        ({"venue": "wrong"}, "venue"),
+        ({"symbol": "ETH"}, "symbol"),
+        ({"event_id": ""}, "event id"),
+        ({"event_type": "trade"}, "event type"),
+        ({"data_quality_score": 0.5}, "quality"),
+        ({"reconciliation_state": ReconciliationState.DEGRADED}, "synchronized"),
+        ({"payload_sha256": "invalid"}, "payload hash"),
+    ],
+)
+def test_gateway_validates_source_event_reality(
+    event_change: dict[str, object], reason: str
+) -> None:
+    request = order()
+    capabilities = list(request.signal_data_evidence.capabilities)
+    first = capabilities[0]
+    capabilities[0] = replace(
+        first, source_events=(replace(first.source_events[0], **event_change),)
+    )
+    changed = request.model_copy(
+        update={
+            "signal_data_evidence": SignalDataEvidence.build(request.signal_id, tuple(capabilities))
+        }
+    )
+    gateway = LiveExecutionGateway(
+        live_settings(),
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(live_settings(), approved_context()),
+    )
+    receipt = gateway.preview_order(changed, NOW)
+    assert receipt.state == LiveOrderState.REJECTED and reason in receipt.reason
 
 
 def test_preflight_requires_every_runtime_and_configuration_gate() -> None:

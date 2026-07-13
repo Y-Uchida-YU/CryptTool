@@ -5,9 +5,14 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
 from app.domain.execution.live_models import LiveOrderRequest, LiveOrderState
-from app.domain.market_data.evidence import CapabilityEvidence, SignalDataEvidence
+from app.domain.market_data.evidence import (
+    CapabilityEvidence,
+    SignalDataEvidence,
+    SourceEventEvidence,
+)
 from app.domain.market_data.models import Side
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.gateway import LiveExecutionGateway
@@ -74,19 +79,39 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
         signal_id="signal-property",
         signal_data_evidence=SignalDataEvidence.build(
             "signal-property",
-            (
+            tuple(
                 CapabilityEvidence(
                     venue="sandbox",
-                    capability="orderbook_snapshot",
+                    capability=capability,
                     use_case=CapabilityUseCase.NEW_EXPOSURE,
                     support=CapabilitySupport.LIVE_VERIFIED,
                     verified_at=NOW,
                     verification_run_id="property-smoke",
-                    source_event_ids=("event-property",),
-                ),
+                    source_events=(
+                        SourceEventEvidence(
+                            f"event-{capability}",
+                            "sandbox",
+                            "BTC",
+                            capability,
+                            NOW,
+                            NOW,
+                            NOW,
+                            "a" * 64,
+                            1,
+                            None,
+                            ReconciliationState.SYNCHRONIZED
+                            if capability == "orderbook_snapshot"
+                            else None,
+                            1,
+                        ),
+                    ),
+                )
+                for capability in ("orderbook_snapshot", "index_price")
             ),
         ),
-        required_capabilities=("orderbook_snapshot",),
+        strategy_id="cross_venue_basis",
+        strategy_version="1",
+        required_capabilities=("orderbook_snapshot", "index_price"),
         risk_decision_id="risk-property",
         model_version="test",
         config_version="test",

@@ -21,6 +21,11 @@ from app.adapters.exchanges.staged_execution import (
 from app.config.settings import Settings
 from app.domain.execution.leg_state import LegExecutionMachine, LegExecutionState, LegRiskPolicy
 from app.domain.market_data.clock import VenueClock
+from app.domain.market_data.evidence import (
+    CapabilityEvidence,
+    SignalDataEvidence,
+    SourceEventEvidence,
+)
 from app.domain.strategies.cross_venue import (
     CrossVenueBasisStrategy,
     CrossVenueFundingArbitrageStrategy,
@@ -138,6 +143,38 @@ def test_capability_and_instrument_identity_are_explicit() -> None:
 
 
 def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
+    def signal_evidence(capabilities: tuple[str, ...], venue: str) -> SignalDataEvidence:
+        return SignalDataEvidence.build(
+            "signal-venues",
+            tuple(
+                CapabilityEvidence(
+                    venue,
+                    capability,
+                    CapabilityUseCase.SIGNAL_GENERATION,
+                    CapabilitySupport.LIVE_VERIFIED,
+                    NOW,
+                    "run",
+                    (
+                        SourceEventEvidence(
+                            f"event-{capability}",
+                            venue,
+                            "BTC",
+                            capability,
+                            NOW,
+                            NOW,
+                            NOW,
+                            "a" * 64,
+                            None,
+                            None,
+                            None,
+                            1,
+                        ),
+                    ),
+                )
+                for capability in capabilities
+            ),
+        )
+
     clock = VenueClock(timedelta(seconds=2))
     first_clock = clock.stamp("first", NOW, NOW)
     second_clock = clock.stamp("second", NOW + timedelta(milliseconds=100), NOW)
@@ -159,6 +196,11 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
         buy,
         sell,
         Decimal("2"),
+        signal_id="signal-venues",
+        evidence=signal_evidence(("orderbook_snapshot", "index_price"), "first"),
+        venue="first",
+        now=NOW,
+        maximum_age_seconds=30,
         fees=Decimal("1"),
         expected_exit_cost=Decimal("1"),
         latency_buffer=Decimal("0.5"),
@@ -191,6 +233,11 @@ def test_clock_vwap_funding_and_non_atomic_leg_risk() -> None:
     carry = CrossVenueFundingArbitrageStrategy().evaluate(
         leg,
         other,
+        signal_id="signal-venues",
+        evidence=signal_evidence(("funding_current", "funding_history", "orderbook_snapshot"), "a"),
+        venue="a",
+        now=NOW,
+        maximum_age_seconds=30,
         expected_basis_convergence_loss=Decimal("0.2"),
         transfer_cost=Decimal("0.1"),
         venue_risk_premium=Decimal("0.3"),
