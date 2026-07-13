@@ -19,6 +19,12 @@ class LiveOrderState(StrEnum):
     CANCELED = "canceled"
 
 
+class PreflightRecoveryAction(StrEnum):
+    ALTERNATE_HEDGE = "alternate_hedge"
+    PARTIAL_HEDGE = "partial_hedge"
+    FIRST_LEG_UNWIND = "first_leg_unwind"
+
+
 @dataclass(frozen=True)
 class CrossVenueExecutionPreflight:
     issuer_id: str
@@ -61,6 +67,7 @@ class LiveOrderRequest(BaseModel):
     order_leg_role: str = Field(pattern="^(receive_leg|pay_leg)$")
     order_leg_evidence: LegDataEvidence
     cross_venue_preflight: CrossVenueExecutionPreflight
+    preflight_recovery_action: PreflightRecoveryAction | None = None
     required_capabilities: tuple[str, ...] = Field(min_length=1)
     risk_decision_id: str = Field(min_length=8, max_length=100)
     model_version: str = Field(min_length=1, max_length=100)

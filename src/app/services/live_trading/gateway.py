@@ -1,10 +1,11 @@
 import asyncio
 import hashlib
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from app.adapters.exchanges.base import ExecutionAdapter
@@ -17,6 +18,7 @@ from app.domain.execution.live_models import (
     ExecutionOrderAck,
     LiveOrderRequest,
     LiveOrderState,
+    PreflightRecoveryAction,
 )
 from app.domain.market_data.evidence import CapabilityEvidence, LegDataEvidence
 from app.domain.market_data.source_event_repository import SourceEventRepository, StoredSourceEvent
@@ -26,8 +28,11 @@ from app.domain.venues.models import CapabilityUseCase
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.services.live_trading.cross_venue_preflight import (
     CrossVenuePreflightService,
+    InMemoryPreflightBindingRepository,
     PreflightBinding,
+    PreflightBindingRepository,
     PreflightBindingState,
+    new_binding,
 )
 from app.services.live_trading.preflight import LivePreflightReport
 from app.services.venue_eligibility import execution_eligibility_reason
@@ -35,6 +40,12 @@ from app.services.venue_eligibility import execution_eligibility_reason
 
 class ExecutionAdapterError(RuntimeError):
     pass
+
+
+class ReconciliationExecutionAdapter(Protocol):
+    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]: ...
+
+    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None: ...
 
 
 class LiveExecutionGateway:
@@ -52,6 +63,7 @@ class LiveExecutionGateway:
         config_version: str = "runtime",
         leg_execution_machine: LegExecutionMachine | None = None,
         cross_venue_preflight_service: CrossVenuePreflightService | None = None,
+        preflight_binding_repository: PreflightBindingRepository | None = None,
     ) -> None:
         self.settings = settings
         self.adapter = adapter
@@ -74,7 +86,11 @@ class LiveExecutionGateway:
         self.cross_venue_preflight_service = cross_venue_preflight_service or getattr(
             adapter, "cross_venue_preflight_service", None
         )
-        self._preflight_bindings: dict[str, PreflightBinding] = {}
+        self.preflight_binding_repository = (
+            preflight_binding_repository
+            or getattr(adapter, "preflight_binding_repository", None)
+            or InMemoryPreflightBindingRepository()
+        )
         self.leg_execution_machine = leg_execution_machine
         self.last_preflight_action: PreflightChangeAction | None = None
 
@@ -146,13 +162,13 @@ class LiveExecutionGateway:
         try:
             if not await self.adapter.health_check():
                 return self._reject_and_remember(request, timestamp, "adapter health check failed")
-            reservation_failure = self._reserve_preflight(request)
+            reservation_failure = self._reserve_preflight(request, timestamp)
             if reservation_failure is not None:
                 return self._reject_and_remember(request, timestamp, reservation_failure)
             reserved = True
             open_orders = await self.adapter.fetch_open_orders()
             if len(open_orders) >= self.settings.live.maximum_open_orders:
-                self._abort_preflight(request)
+                self._abort_preflight(request, timestamp, "maximum open order count reached")
                 return self._reject_and_remember(
                     request, timestamp, "maximum open order count reached"
                 )
@@ -167,19 +183,19 @@ class LiveExecutionGateway:
                     None,
                 )
                 if position is None or position.quantity == 0:
-                    self._abort_preflight(request)
+                    self._abort_preflight(request, timestamp, "reduce-only position is absent")
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only order has no open position"
                     )
                 closes_long = position.quantity > 0 and request.side.value == "sell"
                 closes_short = position.quantity < 0 and request.side.value == "buy"
                 if not (closes_long or closes_short):
-                    self._abort_preflight(request)
+                    self._abort_preflight(request, timestamp, "reduce-only side increases exposure")
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only side would increase exposure"
                     )
                 if request.quantity > abs(position.quantity):
-                    self._abort_preflight(request)
+                    self._abort_preflight(request, timestamp, "reduce-only quantity is excessive")
                     return self._reject_and_remember(
                         request, timestamp, "reduce-only quantity exceeds open position"
                     )
@@ -187,7 +203,9 @@ class LiveExecutionGateway:
             receipt = await self.adapter.place_order(request)
         except Exception as exc:
             if reserved and not submission_started:
-                self._abort_preflight(request)
+                self._abort_preflight(request, timestamp, type(exc).__name__)
+            elif submission_started:
+                self._mark_reconciliation_required(request, timestamp, type(exc).__name__)
             self._audit(
                 timestamp,
                 "adapter_error",
@@ -199,11 +217,18 @@ class LiveExecutionGateway:
                 "execution adapter failed; details retained internally"
             ) from exc
         if receipt.request_id != request.request_id:
+            self._mark_reconciliation_required(request, timestamp, "adapter request id mismatch")
             self._audit(
                 timestamp, "adapter_protocol_error", request.request_id, False, "request mismatch"
             )
             raise ExecutionAdapterError("execution adapter returned a mismatched request id")
-        self._record_preflight_ack(request, receipt)
+        try:
+            self._record_preflight_ack(request, receipt, timestamp)
+        except ExecutionAdapterError:
+            self._mark_reconciliation_required(
+                request, timestamp, "binding conflict after adapter acknowledgement"
+            )
+            raise
         self._idempotent_receipts[request.idempotency_key] = receipt
         self._order_timestamps.append(timestamp)
         self._audit(
@@ -527,7 +552,7 @@ class LiveExecutionGateway:
             < request.quantity
         ):
             return "cross-venue execution preflight fillable quantity is insufficient"
-        binding = self._preflight_bindings.get(request.signal_id)
+        binding = self.preflight_binding_repository.get(request.signal_id)
         expected = binding.preflight_hash if binding is not None else None
         if (
             binding is not None
@@ -561,52 +586,238 @@ class LiveExecutionGateway:
         return None
 
     def preflight_binding(self, signal_id: str) -> PreflightBinding:
-        return self._preflight_bindings.get(
-            signal_id,
-            PreflightBinding(signal_id, None, PreflightBindingState.UNBOUND),
+        return self.preflight_binding_repository.get(signal_id) or PreflightBinding(
+            signal_id, None, PreflightBindingState.UNBOUND
         )
 
-    def _reserve_preflight(self, request: LiveOrderRequest) -> str | None:
+    def _reserve_preflight(self, request: LiveOrderRequest, timestamp: datetime) -> str | None:
         current = self.preflight_binding(request.signal_id)
         preflight_hash = request.cross_venue_preflight.preflight_hash
         if current.state in {PreflightBindingState.UNBOUND, PreflightBindingState.ABORTED}:
-            self._preflight_bindings[request.signal_id] = PreflightBinding(
-                request.signal_id, preflight_hash, PreflightBindingState.RESERVED
+            if request.preflight_recovery_action is not None:
+                return "recovery action is invalid without unmatched exposure"
+            binding = new_binding(
+                signal_id=request.signal_id,
+                preflight_hash=preflight_hash,
+                state=PreflightBindingState.RESERVED,
+                now=timestamp,
             )
-            return None
+            if current.state == PreflightBindingState.ABORTED:
+                binding = replace(
+                    binding,
+                    version=current.version + 1,
+                    created_at=current.created_at,
+                )
+            return None if self._cas(current, binding) else "preflight binding CAS conflict"
         if current.preflight_hash != preflight_hash:
             return "cross-venue orders use different preflight hashes"
         if current.state == PreflightBindingState.FIRST_LEG_ACCEPTED:
             if current.first_leg_role == request.order_leg_role:
                 return "cross-venue second order must use the opposite leg role"
-            return None
+            if request.preflight_recovery_action is not None:
+                return "recovery action is invalid before a hedge failure"
+            binding = replace(
+                current,
+                state=PreflightBindingState.SECOND_LEG_SUBMITTED,
+                second_order_request_id=request.request_id,
+                version=current.version + 1,
+                updated_at=timestamp,
+                failure_reason=None,
+            )
+            return None if self._cas(current, binding) else "preflight binding CAS conflict"
+        if current.state == PreflightBindingState.HEDGING_REQUIRED:
+            allowed = self._hedging_operation_allowed(current, request)
+            if not allowed:
+                return "hedging-required binding only permits retry, hedge, unwind, or manual halt"
+            binding = replace(
+                current,
+                state=PreflightBindingState.SECOND_LEG_SUBMITTED,
+                second_order_request_id=request.request_id,
+                version=current.version + 1,
+                updated_at=timestamp,
+                failure_reason=None,
+            )
+            return None if self._cas(current, binding) else "preflight binding CAS conflict"
         if current.state == PreflightBindingState.COMPLETED:
             return "cross-venue preflight binding is already completed"
-        return "cross-venue preflight binding is already reserved"
+        if current.state == PreflightBindingState.RECONCILIATION_REQUIRED:
+            return "cross-venue preflight binding requires reconciliation"
+        if current.state == PreflightBindingState.HALTED:
+            return "cross-venue preflight binding is halted"
+        return f"cross-venue preflight binding is {current.state.value}"
 
-    def _abort_preflight(self, request: LiveOrderRequest) -> None:
-        self._preflight_bindings[request.signal_id] = PreflightBinding(
-            request.signal_id,
-            request.cross_venue_preflight.preflight_hash,
+    def _abort_preflight(
+        self, request: LiveOrderRequest, timestamp: datetime, failure_reason: str
+    ) -> None:
+        current = self.preflight_binding(request.signal_id)
+        self._transition(
+            current,
             PreflightBindingState.ABORTED,
+            timestamp,
+            failure_reason=failure_reason,
         )
 
-    def _record_preflight_ack(self, request: LiveOrderRequest, receipt: ExecutionOrderAck) -> None:
+    def _record_preflight_ack(
+        self, request: LiveOrderRequest, receipt: ExecutionOrderAck, timestamp: datetime
+    ) -> None:
         current = self.preflight_binding(request.signal_id)
         if receipt.state != LiveOrderState.ACCEPTED:
-            self._abort_preflight(request)
+            target = (
+                PreflightBindingState.HEDGING_REQUIRED
+                if current.state == PreflightBindingState.SECOND_LEG_SUBMITTED
+                else PreflightBindingState.ABORTED
+            )
+            self._transition(current, target, timestamp, failure_reason=receipt.reason)
             return
-        if current.state == PreflightBindingState.FIRST_LEG_ACCEPTED:
-            state = PreflightBindingState.COMPLETED
-            first_leg_role = current.first_leg_role
+        if current.state == PreflightBindingState.SECOND_LEG_SUBMITTED:
+            self._transition(
+                current,
+                PreflightBindingState.COMPLETED,
+                timestamp,
+                second_external_order_id=receipt.external_order_id,
+            )
         else:
-            state = PreflightBindingState.FIRST_LEG_ACCEPTED
-            first_leg_role = request.order_leg_role
-        self._preflight_bindings[request.signal_id] = PreflightBinding(
-            request.signal_id,
-            request.cross_venue_preflight.preflight_hash,
-            state,
-            first_leg_role,
+            self._transition(
+                current,
+                PreflightBindingState.FIRST_LEG_ACCEPTED,
+                timestamp,
+                first_leg_role=request.order_leg_role,
+                first_order_request_id=request.request_id,
+                first_external_order_id=receipt.external_order_id,
+            )
+
+    def _mark_reconciliation_required(
+        self, request: LiveOrderRequest, timestamp: datetime, failure_reason: str
+    ) -> None:
+        current = self.preflight_binding(request.signal_id)
+        if current.state == PreflightBindingState.RESERVED:
+            self._transition(
+                current,
+                PreflightBindingState.RECONCILIATION_REQUIRED,
+                timestamp,
+                failure_reason=failure_reason,
+                first_order_request_id=request.request_id,
+            )
+        elif current.state == PreflightBindingState.SECOND_LEG_SUBMITTED:
+            self._transition(
+                current,
+                PreflightBindingState.RECONCILIATION_REQUIRED,
+                timestamp,
+                failure_reason=failure_reason,
+                second_order_request_id=request.request_id,
+            )
+
+    async def reconcile_binding(
+        self, request: LiveOrderRequest, timestamp: datetime
+    ) -> PreflightBinding:
+        timestamp = self._utc(timestamp)
+        current = self.preflight_binding(request.signal_id)
+        if current.state != PreflightBindingState.RECONCILIATION_REQUIRED:
+            raise ValueError("preflight binding does not require reconciliation")
+        try:
+            reconciliation_adapter = cast(ReconciliationExecutionAdapter, self.adapter)
+            recent_fills = await reconciliation_adapter.fetch_recent_fills(request.symbol)
+            client_order = await reconciliation_adapter.lookup_order_by_client_id(
+                request.request_id
+            )
+            open_orders = await self.adapter.fetch_open_orders(request.symbol)
+            positions = await self.adapter.fetch_positions()
+        except Exception as exc:
+            self._transition(
+                current,
+                PreflightBindingState.HALTED,
+                timestamp,
+                failure_reason=f"reconciliation failed: {type(exc).__name__}",
+            )
+            return self.preflight_binding(request.signal_id)
+
+        matched_fill = next(
+            (fill for fill in recent_fills if fill.request_id == request.request_id), None
+        )
+        reconciled_ack = (
+            client_order
+            if client_order is not None and client_order.state == LiveOrderState.ACCEPTED
+            else matched_fill
+        )
+        accepted = reconciled_ack is not None
+        accepted = accepted or any(
+            item.exchange == request.exchange and item.symbol == request.symbol
+            for item in open_orders
+        )
+        exposed = any(
+            item.exchange == request.exchange
+            and item.symbol == request.symbol
+            and item.quantity != 0
+            for item in positions
+        )
+        is_second = current.second_order_request_id == request.request_id
+        if accepted or exposed:
+            target = (
+                PreflightBindingState.COMPLETED
+                if is_second
+                else PreflightBindingState.FIRST_LEG_ACCEPTED
+            )
+        elif is_second and current.first_external_order_id is not None:
+            target = PreflightBindingState.HEDGING_REQUIRED
+        else:
+            target = PreflightBindingState.ABORTED
+        identifiers: dict[str, Any] = {}
+        if reconciled_ack is not None and is_second:
+            identifiers["second_external_order_id"] = reconciled_ack.external_order_id
+        elif reconciled_ack is not None:
+            identifiers["first_external_order_id"] = reconciled_ack.external_order_id
+        self._transition(current, target, timestamp, failure_reason=None, **identifiers)
+        return self.preflight_binding(request.signal_id)
+
+    def halt_binding(self, signal_id: str, reason: str, timestamp: datetime) -> PreflightBinding:
+        current = self.preflight_binding(signal_id)
+        if current.state not in {
+            PreflightBindingState.HEDGING_REQUIRED,
+            PreflightBindingState.RECONCILIATION_REQUIRED,
+        }:
+            raise ValueError("only recovery-required bindings may be halted")
+        self._transition(current, PreflightBindingState.HALTED, self._utc(timestamp), reason)
+        return self.preflight_binding(signal_id)
+
+    @staticmethod
+    def _hedging_operation_allowed(current: PreflightBinding, request: LiveOrderRequest) -> bool:
+        opposite_leg = current.first_leg_role != request.order_leg_role
+        action = request.preflight_recovery_action
+        if action is None:
+            return opposite_leg
+        if action in {
+            PreflightRecoveryAction.ALTERNATE_HEDGE,
+            PreflightRecoveryAction.PARTIAL_HEDGE,
+        }:
+            return opposite_leg
+        return (
+            action == PreflightRecoveryAction.FIRST_LEG_UNWIND
+            and request.reduce_only
+            and current.first_leg_role == request.order_leg_role
+        )
+
+    def _transition(
+        self,
+        current: PreflightBinding,
+        state: PreflightBindingState,
+        timestamp: datetime,
+        failure_reason: str | None = None,
+        **updates: Any,
+    ) -> None:
+        binding = replace(
+            current,
+            state=state,
+            version=current.version + 1,
+            updated_at=timestamp,
+            failure_reason=failure_reason,
+            **updates,
+        )
+        if not self._cas(current, binding):
+            raise ExecutionAdapterError("preflight binding CAS conflict")
+
+    def _cas(self, current: PreflightBinding, binding: PreflightBinding) -> bool:
+        return self.preflight_binding_repository.compare_and_set(
+            binding.signal_id, current.version, binding
         )
 
     @staticmethod

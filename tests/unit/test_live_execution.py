@@ -1,12 +1,14 @@
 import asyncio
 import hashlib
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine
 
 from app.adapters.exchanges.base import ExecutionAdapter
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter, LiveTradingDisabledError
@@ -21,6 +23,7 @@ from app.domain.execution.live_models import (
     LiveOrderRequest,
     LiveOrderState,
     LivePosition,
+    PreflightRecoveryAction,
 )
 from app.domain.execution.models import OrderType
 from app.domain.market_data.evidence import (
@@ -37,9 +40,15 @@ from app.domain.venues.trusted_capabilities import (
     TrustedCapabilityRecord,
     TrustedCapabilityRegistry,
 )
+from app.infrastructure.database.models import Base
+from app.infrastructure.database.preflight_bindings import (
+    PostgreSQLPreflightBindingRepository,
+)
 from app.services.live_trading.cross_venue_preflight import (
     CrossVenuePreflightService,
+    InMemoryPreflightBindingRepository,
     PreflightBindingState,
+    new_binding,
 )
 from app.services.live_trading.gateway import ExecutionAdapterError, LiveExecutionGateway
 from app.services.live_trading.preflight import (
@@ -91,12 +100,18 @@ class FakeExecutionAdapter(ExecutionAdapter):
         self.positions: list[LivePosition] = []
         self.open_orders_symbol: str | None = "not-called"
         self.fail_place = False
+        self.reject_place = False
         self.mismatch_request = False
         self.fail_cancel = False
         self.fail_cancel_all = False
         self.fail_close = False
         self.trusted_capability_registry = trusted_registry()
         self.cross_venue_preflight_service = PREFLIGHT_SERVICE
+        self.recent_fills: list[ExecutionOrderAck] = []
+        self.lookup_result: ExecutionOrderAck | None = None
+        self.recent_fills_calls = 0
+        self.lookup_calls = 0
+        self.positions_calls = 0
 
     @property
     def adapter_name(self) -> str:
@@ -112,10 +127,10 @@ class FakeExecutionAdapter(ExecutionAdapter):
             raise ConnectionError("private adapter detail")
         return ExecutionOrderAck(
             request_id="mismatch" if self.mismatch_request else request.request_id,
-            external_order_id=f"external-{self.place_calls}",
-            state=LiveOrderState.ACCEPTED,
+            external_order_id=None if self.reject_place else f"external-{self.place_calls}",
+            state=LiveOrderState.REJECTED if self.reject_place else LiveOrderState.ACCEPTED,
             accepted_at=NOW,
-            reason="accepted by fake adapter",
+            reason="rejected by fake adapter" if self.reject_place else "accepted by fake adapter",
             adapter_called=True,
         )
 
@@ -141,6 +156,7 @@ class FakeExecutionAdapter(ExecutionAdapter):
         return tuple(self.open_orders)
 
     async def fetch_positions(self) -> Sequence[LivePosition]:
+        self.positions_calls += 1
         return tuple(self.positions)
 
     async def close_position(self, symbol: str) -> ExecutionOrderAck:
@@ -157,6 +173,16 @@ class FakeExecutionAdapter(ExecutionAdapter):
 
     async def health_check(self) -> bool:
         return self.healthy
+
+    async def fetch_recent_fills(self, symbol: str) -> Sequence[ExecutionOrderAck]:
+        del symbol
+        self.recent_fills_calls += 1
+        return tuple(self.recent_fills)
+
+    async def lookup_order_by_client_id(self, request_id: str) -> ExecutionOrderAck | None:
+        del request_id
+        self.lookup_calls += 1
+        return self.lookup_result
 
     def get(self, event_id: str) -> StoredSourceEvent | None:
         return SOURCE_EVENTS.get(event_id)
@@ -721,6 +747,369 @@ async def test_same_leg_cannot_consume_reserved_second_leg() -> None:
     )
     receipt = await gateway.place_order(repeated, risk(), NOW)
     assert receipt.state == LiveOrderState.REJECTED and "opposite leg" in receipt.reason
+
+
+@pytest.mark.asyncio
+async def test_first_leg_rejection_aborts_binding() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.reject_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    receipt = await gateway.place_order(request, risk(), NOW)
+    assert receipt.state == LiveOrderState.REJECTED
+    assert gateway.preflight_binding(request.signal_id).state == PreflightBindingState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_second_leg_rejection_requires_hedging_and_allows_retry() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    repository = InMemoryPreflightBindingRepository()
+    gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    first = order()
+    assert (await gateway.place_order(first, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    second = first.model_copy(
+        update={
+            "request_id": "request-pay-rejected",
+            "idempotency_key": "r" * 16,
+            "order_leg_role": "pay_leg",
+            "order_leg_evidence": first.cross_venue_signal_evidence.pay_leg,
+            "exchange": "counterparty",
+        }
+    )
+    adapter.reject_place = True
+    assert (await gateway.place_order(second, risk(), NOW)).state == LiveOrderState.REJECTED
+    binding = gateway.preflight_binding(first.signal_id)
+    assert binding.state == PreflightBindingState.HEDGING_REQUIRED
+    assert binding.first_external_order_id == "external-1"
+
+    new_first = first.model_copy(
+        update={"request_id": "request-new-first", "idempotency_key": "n" * 16}
+    )
+    blocked = await gateway.place_order(new_first, risk(), NOW)
+    assert blocked.state == LiveOrderState.REJECTED and "hedging-required" in blocked.reason
+
+    adapter.reject_place = False
+    retry = second.model_copy(
+        update={"request_id": "request-pay-retry", "idempotency_key": "t" * 16}
+    )
+    assert (await gateway.place_order(retry, risk(), NOW)).state == LiveOrderState.ACCEPTED
+    assert gateway.preflight_binding(first.signal_id).state == PreflightBindingState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_alternate_hedge_is_allowed_after_second_leg_rejection() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    first = order()
+    await gateway.place_order(first, risk(), NOW)
+    second = first.model_copy(
+        update={
+            "request_id": "request-pay-failure",
+            "idempotency_key": "f" * 16,
+            "order_leg_role": "pay_leg",
+            "order_leg_evidence": first.cross_venue_signal_evidence.pay_leg,
+            "exchange": "counterparty",
+        }
+    )
+    adapter.reject_place = True
+    await gateway.place_order(second, risk(), NOW)
+    adapter.reject_place = False
+    alternate = second.model_copy(
+        update={
+            "request_id": "request-alt-hedge",
+            "idempotency_key": "a" * 16,
+            "preflight_recovery_action": PreflightRecoveryAction.ALTERNATE_HEDGE,
+        }
+    )
+    assert (await gateway.place_order(alternate, risk(), NOW)).state == LiveOrderState.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_place_order_timeout_requires_reconciliation() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.fail_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(request, risk(), NOW)
+    binding = gateway.preflight_binding(request.signal_id)
+    assert binding.state == PreflightBindingState.RECONCILIATION_REQUIRED
+    assert binding.first_order_request_id == request.request_id
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_all_order_sources_and_resolves_first_leg() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.fail_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(request, risk(), NOW)
+    adapter.lookup_result = ExecutionOrderAck(
+        request_id=request.request_id,
+        external_order_id="reconciled-order",
+        state=LiveOrderState.ACCEPTED,
+        accepted_at=NOW,
+        reason="found by client order id",
+        adapter_called=True,
+    )
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert adapter.recent_fills_calls == adapter.lookup_calls == adapter.positions_calls == 1
+    assert adapter.open_orders_symbol == request.symbol
+
+
+@pytest.mark.asyncio
+async def test_unknown_reconciliation_halts_binding() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.fail_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(request, risk(), NOW)
+    adapter.fetch_recent_fills = None  # type: ignore[method-assign,assignment]
+    binding = await gateway.reconcile_binding(request, NOW)
+    assert binding.state == PreflightBindingState.HALTED
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_resolves_missing_and_accepted_second_leg() -> None:
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    first = order()
+    await gateway.place_order(first, risk(), NOW)
+    second = first.model_copy(
+        update={
+            "request_id": "request-second-timeout",
+            "idempotency_key": "q" * 16,
+            "order_leg_role": "pay_leg",
+            "order_leg_evidence": first.cross_venue_signal_evidence.pay_leg,
+            "exchange": "counterparty",
+        }
+    )
+    adapter.fail_place = True
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(second, risk(), NOW)
+    missing = await gateway.reconcile_binding(second, NOW)
+    assert missing.state == PreflightBindingState.HEDGING_REQUIRED
+
+    retry = second.model_copy(
+        update={"request_id": "request-second-retry", "idempotency_key": "w" * 16}
+    )
+    adapter.fail_place = True
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(retry, risk(), NOW)
+    adapter.lookup_result = ExecutionOrderAck(
+        request_id=retry.request_id,
+        external_order_id="second-reconciled",
+        state=LiveOrderState.ACCEPTED,
+        accepted_at=NOW,
+        reason="found",
+        adapter_called=True,
+    )
+    completed = await gateway.reconcile_binding(retry, NOW)
+    assert completed.state == PreflightBindingState.COMPLETED
+    assert completed.second_external_order_id == "second-reconciled"
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_with_no_first_order_aborts_and_manual_halt_is_restricted() -> None:
+    adapter = FakeExecutionAdapter()
+    adapter.fail_place = True
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings, adapter, evaluate_live_preflight(settings, approved_context())
+    )
+    request = order()
+    with pytest.raises(ExecutionAdapterError):
+        await gateway.place_order(request, risk(), NOW)
+    assert (await gateway.reconcile_binding(request, NOW)).state == PreflightBindingState.ABORTED
+    with pytest.raises(ValueError, match="does not require reconciliation"):
+        await gateway.reconcile_binding(request, NOW)
+    with pytest.raises(ValueError, match="recovery-required"):
+        gateway.halt_binding(request.signal_id, "manual review", NOW)
+
+
+def test_manual_halt_transitions_recovery_binding() -> None:
+    repository = InMemoryPreflightBindingRepository()
+    binding = replace(
+        new_binding(
+            signal_id="signal-manual-halt",
+            preflight_hash="c" * 64,
+            state=PreflightBindingState.HEDGING_REQUIRED,
+            now=NOW,
+        ),
+        first_leg_role="receive_leg",
+        first_external_order_id="first-external",
+    )
+    assert repository.compare_and_set(binding.signal_id, 0, binding)
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    halted = gateway.halt_binding(binding.signal_id, "operator halted recovery", NOW)
+    assert halted.state == PreflightBindingState.HALTED
+    assert halted.failure_reason == "operator halted recovery"
+
+
+def test_first_leg_unwind_is_an_allowed_hedging_operation() -> None:
+    request = order(
+        reduce_only=True,
+        preflight_recovery_action=PreflightRecoveryAction.FIRST_LEG_UNWIND,
+    )
+    binding = replace(
+        new_binding(
+            signal_id=request.signal_id,
+            preflight_hash=request.cross_venue_preflight.preflight_hash,
+            state=PreflightBindingState.HEDGING_REQUIRED,
+            now=NOW,
+        ),
+        first_leg_role="receive_leg",
+    )
+    assert LiveExecutionGateway._hedging_operation_allowed(binding, request)
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        (PreflightBindingState.RECONCILIATION_REQUIRED, "requires reconciliation"),
+        (PreflightBindingState.HALTED, "is halted"),
+        (PreflightBindingState.SECOND_LEG_SUBMITTED, "second_leg_submitted"),
+    ],
+)
+def test_non_orderable_binding_states_fail_closed(
+    state: PreflightBindingState, reason: str
+) -> None:
+    request = order()
+    repository = InMemoryPreflightBindingRepository()
+    binding = new_binding(
+        signal_id=request.signal_id,
+        preflight_hash=request.cross_venue_preflight.preflight_hash,
+        state=state,
+        now=NOW,
+    )
+    assert repository.compare_and_set(binding.signal_id, 0, binding)
+    settings = live_settings()
+    gateway = LiveExecutionGateway(
+        settings,
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    assert reason in (gateway._reserve_preflight(request, NOW) or "")
+
+
+@pytest.mark.asyncio
+async def test_binding_is_restored_after_gateway_restart() -> None:
+    repository = InMemoryPreflightBindingRepository()
+    adapter = FakeExecutionAdapter()
+    settings = live_settings()
+    first_gateway = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    request = order()
+    await first_gateway.place_order(request, risk(), NOW)
+
+    restarted = LiveExecutionGateway(
+        settings,
+        adapter,
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    binding = restarted.preflight_binding(request.signal_id)
+    assert binding.state == PreflightBindingState.FIRST_LEG_ACCEPTED
+    assert binding.first_external_order_id == "external-1"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        PreflightBindingState.FIRST_LEG_ACCEPTED,
+        PreflightBindingState.HEDGING_REQUIRED,
+        PreflightBindingState.RECONCILIATION_REQUIRED,
+    ],
+)
+def test_recovery_states_are_restored_after_restart(state: PreflightBindingState) -> None:
+    repository = InMemoryPreflightBindingRepository()
+    binding = replace(
+        new_binding(
+            signal_id=f"signal-{state.value}",
+            preflight_hash="b" * 64,
+            state=state,
+            now=NOW,
+        ),
+        first_leg_role="receive_leg",
+        first_order_request_id="first-request",
+        first_external_order_id="first-external",
+    )
+    assert repository.compare_and_set(binding.signal_id, 0, binding)
+    settings = live_settings()
+    restarted = LiveExecutionGateway(
+        settings,
+        FakeExecutionAdapter(),
+        evaluate_live_preflight(settings, approved_context()),
+        preflight_binding_repository=repository,
+    )
+    assert restarted.preflight_binding(binding.signal_id) == binding
+
+
+def test_postgresql_binding_repository_persists_and_rejects_concurrent_cas(tmp_path) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'bindings.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    repository = PostgreSQLPreflightBindingRepository(engine)
+    initial = new_binding(
+        signal_id="signal-cas",
+        preflight_hash="a" * 64,
+        state=PreflightBindingState.RESERVED,
+        now=NOW,
+    )
+    assert repository.compare_and_set("signal-cas", 0, initial)
+    candidate = replace(
+        initial,
+        state=PreflightBindingState.FIRST_LEG_ACCEPTED,
+        version=2,
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(lambda _: repository.compare_and_set("signal-cas", 1, candidate), range(2))
+        )
+    assert sorted(results) == [False, True]
+    restored = PostgreSQLPreflightBindingRepository(engine).get("signal-cas")
+    assert restored is not None and restored.state == PreflightBindingState.FIRST_LEG_ACCEPTED
 
 
 def test_cross_venue_dual_leg_order_binding_fails_closed() -> None:
