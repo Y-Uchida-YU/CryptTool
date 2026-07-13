@@ -78,12 +78,20 @@ class CrossVenueFundingArbitrageStrategy:
         receive_leg: FundingLeg,
         pay_leg: FundingLeg,
         *,
+        signal_id: str,
+        evidence: SignalDataEvidence,
+        venue: str,
+        now: datetime,
+        maximum_age_seconds: int,
         expected_basis_convergence_loss: Decimal,
         transfer_cost: Decimal,
         venue_risk_premium: Decimal,
         currency_risk_rate: Decimal = Decimal("0.0025"),
         funding_reversal_stress: Decimal = Decimal("1.5"),
-    ) -> CrossVenueFundingOpportunity:
+    ) -> CrossVenueFundingOpportunity | RejectedSignal:
+        rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
+        if rejection is not None:
+            return rejection
         notional = min(receive_leg.notional, pay_leg.notional)
         received = notional * sum(receive_leg.expected_rates, Decimal("0"))
         paid = notional * sum(pay_leg.expected_rates, Decimal("0"))
@@ -178,11 +186,19 @@ class CrossVenueBasisStrategy:
         sell_book: ExecutableBook,
         quantity: Decimal,
         *,
+        signal_id: str,
+        evidence: SignalDataEvidence,
+        venue: str,
+        now: datetime,
+        maximum_age_seconds: int,
         fees: Decimal,
         expected_exit_cost: Decimal,
         latency_buffer: Decimal,
         risk_premium: Decimal,
-    ) -> BasisOpportunity:
+    ) -> BasisOpportunity | RejectedSignal:
+        rejection = self.validate_evidence(signal_id, evidence, venue, now, maximum_age_seconds)
+        if rejection is not None:
+            return rejection
         if not self.clock.comparable(buy_book.clock, sell_book.clock):
             raise ValueError("cross-venue books are not clock-comparable")
         buy = buy_book.ask_vwap(quantity)

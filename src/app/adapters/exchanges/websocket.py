@@ -40,6 +40,16 @@ class ReconciliationState(StrEnum):
     DEGRADED = "degraded"
 
 
+@dataclass
+class ConnectionReconciliationContext:
+    connection_id: UUID
+    state: ReconciliationState
+    previous_sequence: int | None
+    snapshot_sequence: int | None
+    buffered_deltas: list[tuple[int, Any]]
+    payload_hashes: set[str]
+
+
 @dataclass(frozen=True)
 class RawVenueMessage:
     venue: str
@@ -113,11 +123,10 @@ class ResilientWebSocketSession:
         self.state = ConnectionState.CLOSED
         self.state_events: list[ConnectionStateEvent] = []
         self._closing = False
-        self._recent_hashes: deque[str] = deque(maxlen=4096)
         self._reconnects: deque[float] = deque()
         self._local_sequence = 0
         self.reconciliation_state = ReconciliationState.DISCONNECTED
-        self._delta_buffer: list[tuple[int, Any]] = []
+        self.connection_context: ConnectionReconciliationContext | None = None
 
     async def close(self) -> None:
         self._closing = True
@@ -140,8 +149,16 @@ class ResilientWebSocketSession:
             self._reconnects.append(now)
             self._set_state(ConnectionState.CONNECTING)
             connection_id = uuid4()
-            previous_sequence: int | None = None
-            self.reconciliation_state = ReconciliationState.WAITING_FOR_SNAPSHOT
+            context = ConnectionReconciliationContext(
+                connection_id=connection_id,
+                state=ReconciliationState.DISCONNECTED,
+                previous_sequence=None,
+                snapshot_sequence=None,
+                buffered_deltas=[],
+                payload_hashes=set(),
+            )
+            self.connection_context = context
+            self._set_reconciliation(context, ReconciliationState.WAITING_FOR_SNAPSHOT)
             try:
                 async with websockets.connect(
                     self.url, open_timeout=10, ping_interval=20
@@ -155,8 +172,10 @@ class ResilientWebSocketSession:
                         if self.acknowledgement is None or not self.acknowledgement(ack):
                             raise RuntimeError("subscription acknowledgement validation failed")
                     self._set_state(ConnectionState.CONNECTED)
-                    if self.classification != StreamClassification.SNAPSHOT_DELTA:
-                        self.reconciliation_state = ReconciliationState.SYNCHRONIZED
+                    if self.classification == StreamClassification.SNAPSHOT_DELTA:
+                        await self._bootstrap(socket, context)
+                    else:
+                        self._set_reconciliation(context, ReconciliationState.SYNCHRONIZED)
                     attempt = 0
                     async for raw in self._socket_messages(socket):
                         decoded = self._decode(raw)
@@ -164,32 +183,28 @@ class ResilientWebSocketSession:
                             continue
                         payload = raw if isinstance(raw, bytes) else raw.encode()
                         digest = hashlib.sha256(payload).hexdigest()
-                        if digest in self._recent_hashes:
+                        if digest in context.payload_hashes:
                             continue
-                        self._recent_hashes.append(digest)
+                        context.payload_hashes.add(digest)
                         current = self.sequence(decoded)
-                        if current is not None and previous_sequence is not None:
-                            if current <= previous_sequence:
+                        if current is not None and context.previous_sequence is not None:
+                            if current <= context.previous_sequence:
                                 self._set_state(ConnectionState.DEGRADED, "out-of-order sequence")
                                 continue
-                            if current != previous_sequence + 1:
-                                await self._recover(connection_id, current, decoded)
-                                previous_sequence = current
+                            if current != context.previous_sequence + 1:
+                                await self._recover(context, current, decoded)
                                 continue
                         if self.classification == StreamClassification.SNAPSHOT_DELTA:
-                            if self.snapshot(decoded):
-                                if self.snapshot_applier is None:
-                                    raise RuntimeError("snapshot applier unavailable")
-                                previous_sequence = self.snapshot_applier(decoded)
-                                self.reconciliation_state = ReconciliationState.SYNCHRONIZED
-                            elif self.delta(decoded):
-                                if self.reconciliation_state != ReconciliationState.SYNCHRONIZED:
-                                    self._buffer_delta(current, decoded)
+                            if self.delta(decoded):
+                                if context.state != ReconciliationState.SYNCHRONIZED:
+                                    self._buffer_delta(context, current, decoded)
                                     continue
                                 if self.delta_applier is None:
                                     raise RuntimeError("delta applier unavailable")
                                 self.delta_applier(decoded)
-                        previous_sequence = current
+                            elif self.snapshot(decoded):
+                                continue
+                        context.previous_sequence = current
                         self._local_sequence += 1
                         received = datetime.now(UTC)
                         message = RawVenueMessage(
@@ -233,18 +248,59 @@ class ResilientWebSocketSession:
         while not self._closing:
             yield await asyncio.wait_for(socket.recv(), timeout=self.stale_timeout)
 
-    def _buffer_delta(self, sequence: int | None, decoded: Any) -> None:
+    def _set_reconciliation(
+        self, context: ConnectionReconciliationContext, state: ReconciliationState
+    ) -> None:
+        context.state = state
+        self.reconciliation_state = state
+
+    def _buffer_delta(
+        self, context: ConnectionReconciliationContext, sequence: int | None, decoded: Any
+    ) -> None:
         if sequence is None:
             raise RuntimeError("delta sequence is required")
-        if len(self._delta_buffer) >= self.maximum_buffered_deltas:
-            self.reconciliation_state = ReconciliationState.DEGRADED
+        if len(context.buffered_deltas) >= self.maximum_buffered_deltas:
+            self._set_reconciliation(context, ReconciliationState.DEGRADED)
             raise RuntimeError("delta recovery buffer overflow")
-        self.reconciliation_state = ReconciliationState.BUFFERING_DELTAS
-        self._delta_buffer.append((sequence, decoded))
+        self._set_reconciliation(context, ReconciliationState.BUFFERING_DELTAS)
+        context.buffered_deltas.append((sequence, decoded))
 
-    async def _recover(self, connection_id: UUID, sequence: int, decoded: Any) -> None:
+    async def _bootstrap(self, socket: Any, context: ConnectionReconciliationContext) -> None:
+        """Start REST bootstrap after ACK while continuing to buffer socket deltas."""
+        if self.rest_snapshot is None:
+            raise RuntimeError("REST snapshot recovery unavailable")
+        self._set_reconciliation(context, ReconciliationState.BUFFERING_DELTAS)
+        snapshot_task: asyncio.Future[Any] = asyncio.ensure_future(self.rest_snapshot())
+        receive_task: asyncio.Task[bytes | str] = asyncio.create_task(socket.recv())
+        try:
+            while not snapshot_task.done():
+                done, _ = await asyncio.wait(
+                    {snapshot_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if receive_task in done:
+                    raw = receive_task.result()
+                    decoded = self._decode(raw)
+                    if not self.heartbeat(decoded):
+                        if not self.delta(decoded):
+                            raise RuntimeError("non-delta message received during REST bootstrap")
+                        payload = raw if isinstance(raw, bytes) else raw.encode()
+                        digest = hashlib.sha256(payload).hexdigest()
+                        if digest not in context.payload_hashes:
+                            context.payload_hashes.add(digest)
+                            self._buffer_delta(context, self.sequence(decoded), decoded)
+                    receive_task = asyncio.create_task(socket.recv())
+            snapshot = await snapshot_task
+        finally:
+            if not receive_task.done():
+                receive_task.cancel()
+                await asyncio.gather(receive_task, return_exceptions=True)
+        await self._apply_snapshot_and_replay(context, snapshot)
+
+    async def _recover(
+        self, context: ConnectionReconciliationContext, sequence: int, decoded: Any
+    ) -> None:
         self._set_state(ConnectionState.RECOVERING, "sequence gap")
-        self._buffer_delta(sequence, decoded)
+        self._buffer_delta(context, sequence, decoded)
         if (
             self.rest_snapshot is None
             or self.snapshot_applier is None
@@ -252,25 +308,37 @@ class ResilientWebSocketSession:
         ):
             self._set_state(ConnectionState.DEGRADED, "sequence gap without snapshot semantics")
             raise RuntimeError("REST snapshot recovery unavailable")
-        self.reconciliation_state = ReconciliationState.WAITING_FOR_SNAPSHOT
+        self._set_reconciliation(context, ReconciliationState.WAITING_FOR_SNAPSHOT)
         snapshot = await self.rest_snapshot()
-        self.reconciliation_state = ReconciliationState.APPLYING_SNAPSHOT
+        await self._apply_snapshot_and_replay(context, snapshot)
+        self._set_state(
+            ConnectionState.CONNECTED,
+            f"REST snapshot recovered for {context.connection_id}",
+        )
+
+    async def _apply_snapshot_and_replay(
+        self, context: ConnectionReconciliationContext, snapshot: Any
+    ) -> None:
+        if self.snapshot_applier is None or self.delta_applier is None:
+            raise RuntimeError("REST snapshot recovery unavailable")
+        self._set_reconciliation(context, ReconciliationState.APPLYING_SNAPSHOT)
         snapshot_sequence = self.snapshot_applier(snapshot)
+        context.snapshot_sequence = snapshot_sequence
         replay = sorted(
-            (item for item in self._delta_buffer if item[0] > snapshot_sequence),
+            (item for item in context.buffered_deltas if item[0] > snapshot_sequence),
             key=lambda item: item[0],
         )
-        self.reconciliation_state = ReconciliationState.REPLAYING_DELTAS
+        self._set_reconciliation(context, ReconciliationState.REPLAYING_DELTAS)
         expected = snapshot_sequence + 1
         for current, delta in replay:
             if current != expected:
-                self.reconciliation_state = ReconciliationState.DEGRADED
+                self._set_reconciliation(context, ReconciliationState.DEGRADED)
                 raise RuntimeError("replayed delta sequence is not continuous")
             self.delta_applier(delta)
             expected += 1
-        self._delta_buffer.clear()
-        self.reconciliation_state = ReconciliationState.SYNCHRONIZED
-        self._set_state(ConnectionState.CONNECTED, f"REST snapshot recovered for {connection_id}")
+        context.previous_sequence = expected - 1
+        context.buffered_deltas.clear()
+        self._set_reconciliation(context, ReconciliationState.SYNCHRONIZED)
 
     @staticmethod
     def _decode(raw: bytes | str) -> Any:

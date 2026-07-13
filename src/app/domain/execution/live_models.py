@@ -22,6 +22,8 @@ class LiveOrderRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=100)
     idempotency_key: str = Field(min_length=16, max_length=128)
     signal_id: str = Field(min_length=8, max_length=100)
+    strategy_id: str = Field(min_length=1, max_length=100)
+    strategy_version: str = Field(min_length=1, max_length=40)
     signal_data_evidence: SignalDataEvidence
     required_capabilities: tuple[str, ...] = Field(min_length=1)
     risk_decision_id: str = Field(min_length=8, max_length=100)

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from app.adapters.exchanges.websocket import (
+    ConnectionReconciliationContext,
     ConnectionState,
     ReconciliationState,
     ResilientWebSocketSession,
@@ -41,6 +42,15 @@ class FakeConnect:
         return None
 
 
+class QueueSocket(FakeSocket):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.queue: asyncio.Queue[str | bytes] = asyncio.Queue()
+
+    async def recv(self) -> str | bytes:
+        return await self.queue.get()
+
+
 def session(**overrides: object) -> ResilientWebSocketSession:
     values = dict(
         venue="x",
@@ -62,6 +72,12 @@ def session(**overrides: object) -> ResilientWebSocketSession:
     )
     values.update(overrides)
     return ResilientWebSocketSession(**values)  # type: ignore[arg-type]
+
+
+def context() -> ConnectionReconciliationContext:
+    return ConnectionReconciliationContext(
+        uuid4(), ReconciliationState.DISCONNECTED, None, None, [], set()
+    )
 
 
 @pytest.mark.asyncio
@@ -100,13 +116,7 @@ async def test_duplicate_out_of_order_and_snapshot_delta_delivery(
     await stream.aclose()
 
     applied: list[int] = []
-    socket2 = FakeSocket(
-        [
-            json.dumps({"seq": 5, "kind": "snapshot"}),
-            json.dumps({"seq": 6, "kind": "delta"}),
-            json.dumps({"seq": 5, "kind": "delta"}),
-        ]
-    )
+    socket2 = FakeSocket([json.dumps({"seq": 6, "kind": "delta"})])
     monkeypatch.setattr(
         "app.adapters.exchanges.websocket.websockets.connect", lambda *a, **k: FakeConnect(socket2)
     )
@@ -119,11 +129,10 @@ async def test_duplicate_out_of_order_and_snapshot_delta_delivery(
         delta_applier=lambda x: applied.append(int(x["seq"])),
     )
     stream2 = value.messages()
-    assert (await anext(stream2)).is_snapshot
-    assert (await anext(stream2)).is_delta and applied == [6]
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(anext(stream2), 0.02)
-    assert any(event.reason == "out-of-order sequence" for event in value.state_events)
+    assert applied == [6]
+    assert value.reconciliation_state == ReconciliationState.SYNCHRONIZED
 
 
 @pytest.mark.asyncio
@@ -152,9 +161,10 @@ async def test_snapshot_recovery_replays_buffer_and_applies_snapshot() -> None:
         snapshot_applier=lambda x: int(x["seq"]),
         delta_applier=lambda x: applied.append(int(x["seq"])),
     )
-    await value._recover(uuid4(), 6, {"seq": 6, "kind": "delta"})
+    current = context()
+    await value._recover(current, 6, {"seq": 6, "kind": "delta"})
     assert applied == [6] and value.reconciliation_state == ReconciliationState.SYNCHRONIZED
-    assert not value._delta_buffer
+    assert not current.buffered_deltas
 
 
 @pytest.mark.asyncio
@@ -168,12 +178,13 @@ async def test_recovery_gap_snapshot_failure_and_buffer_overflow() -> None:
         delta_applier=lambda x: None,
         maximum_buffered_deltas=1,
     )
-    value._buffer_delta(3, {"seq": 3})
+    current = context()
+    value._buffer_delta(current, 3, {"seq": 3})
     with pytest.raises(RuntimeError, match="overflow"):
-        value._buffer_delta(4, {"seq": 4})
-    value._delta_buffer.clear()
+        value._buffer_delta(current, 4, {"seq": 4})
+    current.buffered_deltas.clear()
     with pytest.raises(RuntimeError, match="continuous"):
-        await value._recover(uuid4(), 3, {"seq": 3})
+        await value._recover(current, 3, {"seq": 3})
     assert value.reconciliation_state == ReconciliationState.DEGRADED
 
     async def failed() -> object:
@@ -188,7 +199,7 @@ async def test_recovery_gap_snapshot_failure_and_buffer_overflow() -> None:
         delta_applier=lambda x: None,
     )
     with pytest.raises(OSError):
-        await broken._recover(uuid4(), 2, {"seq": 2})
+        await broken._recover(context(), 2, {"seq": 2})
 
 
 @pytest.mark.asyncio
@@ -207,7 +218,7 @@ async def test_stale_timeout_close_decode_and_constructor_guards() -> None:
         )
 
     with pytest.raises(RuntimeError, match="sequence"):
-        value._buffer_delta(None, {})
+        value._buffer_delta(context(), None, {})
 
 
 @pytest.mark.asyncio
@@ -222,7 +233,7 @@ async def test_missing_recovery_callbacks_maximum_reconnect_and_loop_close() -> 
     )
     value.rest_snapshot = None
     with pytest.raises(RuntimeError, match="unavailable"):
-        await value._recover(uuid4(), 2, {"seq": 2})
+        await value._recover(context(), 2, {"seq": 2})
 
     limited = session(
         subscribe=None, acknowledgement=None, maximum_reconnects_per_minute=1, stale_timeout=0.001
@@ -234,3 +245,131 @@ async def test_missing_recovery_callbacks_maximum_reconnect_and_loop_close() -> 
     with pytest.raises(StopAsyncIteration):
         await task
     assert any(event.reason == "maximum reconnect rate exceeded" for event in limited.state_events)
+
+
+@pytest.mark.asyncio
+async def test_initial_rest_snapshot_bootstrap_buffers_first_delta() -> None:
+    applied: list[tuple[str, int]] = []
+
+    async def delayed_snapshot() -> object:
+        await asyncio.sleep(0.001)
+        return {"seq": 5}
+
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=delayed_snapshot,
+        snapshot_applier=lambda item: applied.append(("snapshot", item["seq"])) or item["seq"],
+        delta_applier=lambda item: applied.append(("delta", item["seq"])),
+    )
+    current = context()
+    socket = FakeSocket([json.dumps({"seq": 6, "kind": "delta"})])
+    await value._bootstrap(socket, current)
+    assert applied == [("snapshot", 5), ("delta", 6)]
+    assert current.state == ReconciliationState.SYNCHRONIZED
+    assert current.previous_sequence == 6
+
+
+@pytest.mark.asyncio
+async def test_reconnect_discards_buffer_and_duplicate_cache_is_connection_scoped() -> None:
+    old = context()
+    old.buffered_deltas.append((9, {"seq": 9}))
+    old.payload_hashes.add("a" * 64)
+    new = context()
+    assert new.connection_id != old.connection_id
+    assert not new.buffered_deltas
+    assert "a" * 64 not in new.payload_hashes
+
+
+@pytest.mark.asyncio
+async def test_snapshot_sequence_ahead_and_behind_buffer() -> None:
+    applied: list[int] = []
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=lambda: asyncio.sleep(0, result={"seq": 1}),
+        snapshot_applier=lambda item: item["seq"],
+        delta_applier=lambda item: applied.append(item["seq"]),
+    )
+    ahead = context()
+    ahead.buffered_deltas.extend([(4, {"seq": 4}), (5, {"seq": 5})])
+    await value._apply_snapshot_and_replay(ahead, {"seq": 5})
+    assert applied == [] and ahead.previous_sequence == 5
+
+    behind = context()
+    behind.buffered_deltas.extend([(5, {"seq": 5}), (6, {"seq": 6})])
+    with pytest.raises(RuntimeError, match="continuous"):
+        await value._apply_snapshot_and_replay(behind, {"seq": 3})
+    assert behind.state == ReconciliationState.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_initial_rest_snapshot_failure_fails_closed() -> None:
+    async def failed() -> object:
+        raise OSError("snapshot unavailable")
+
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=failed,
+        snapshot_applier=lambda item: item["seq"],
+        delta_applier=lambda item: None,
+    )
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        await value._bootstrap(FakeSocket([]), context())
+
+
+@pytest.mark.asyncio
+async def test_synchronized_delta_is_delivered_only_after_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = QueueSocket()
+    await socket.queue.put(json.dumps({"ok": True}))
+    await socket.queue.put(json.dumps({"seq": 6, "kind": "delta"}))
+
+    async def delayed_snapshot() -> object:
+        await asyncio.sleep(0.001)
+        return {"seq": 5}
+
+    applied: list[int] = []
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=delayed_snapshot,
+        snapshot_applier=lambda item: item["seq"],
+        delta_applier=lambda item: applied.append(item["seq"]),
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect",
+        lambda *args, **kwargs: FakeConnect(socket),
+    )
+
+    async def send_after_bootstrap() -> None:
+        await asyncio.sleep(0.003)
+        await socket.queue.put(json.dumps({"seq": 7, "kind": "delta"}))
+
+    producer = asyncio.create_task(send_after_bootstrap())
+    stream = value.messages()
+    delivered = await asyncio.wait_for(anext(stream), 0.1)
+    await producer
+    assert delivered.venue_sequence == 7
+    assert applied == [6, 7]
+    assert value.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_missing_loader_and_non_delta_message() -> None:
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        rest_snapshot=lambda: asyncio.sleep(0, result={"seq": 1}),
+        snapshot_applier=lambda item: item["seq"],
+        delta_applier=lambda item: None,
+    )
+    value.rest_snapshot = None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await value._bootstrap(FakeSocket([]), context())
+
+    async def delayed_snapshot() -> object:
+        await asyncio.sleep(0.01)
+        return {"seq": 1}
+
+    value.rest_snapshot = delayed_snapshot
+    with pytest.raises(RuntimeError, match="non-delta"):
+        await value._bootstrap(FakeSocket([json.dumps({"kind": "snapshot"})]), context())

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from app.adapters.exchanges.public import PublicRestAdapter
 from app.domain.market_data.evidence import (
     CapabilityEvidence,
     SignalDataEvidence,
+    SourceEventEvidence,
     require_signal_capabilities,
 )
 from app.domain.strategies.cross_venue import CrossVenueFundingArbitrageStrategy
@@ -24,7 +26,10 @@ def evidence(
     support: CapabilitySupport = CapabilitySupport.LIVE_VERIFIED,
     use_case: CapabilityUseCase = CapabilityUseCase.SIGNAL_GENERATION,
 ) -> CapabilityEvidence:
-    return CapabilityEvidence("dydx", capability, use_case, support, NOW, "run", ("event",))
+    event = SourceEventEvidence(
+        "event", "dydx", "BTC", capability, NOW, NOW, NOW, "a" * 64, None, None, None, 1
+    )
+    return CapabilityEvidence("dydx", capability, use_case, support, NOW, "run", (event,))
 
 
 def test_signal_gate_requires_fresh_live_verified_evidence() -> None:
@@ -39,10 +44,19 @@ def test_signal_gate_requires_fresh_live_verified_evidence() -> None:
     assert require_signal_capabilities(
         "signal-1", stale, ("funding_history",), "dydx", NOW + timedelta(seconds=31), 30
     )
+    assert require_signal_capabilities(
+        "signal-1", stale, ("funding_history",), "dydx", NOW - timedelta(seconds=1), 30
+    )
     assert CrossVenueFundingArbitrageStrategy().validate_evidence(
         "signal-1", value, "dydx", NOW, 30
     )
     assert LiquidationStrategyCapabilityGate().validate_evidence("signal-1", value, "dydx", NOW, 30)
+
+
+def test_strategy_evaluate_contract_cannot_bypass_evidence() -> None:
+    parameters = signature(CrossVenueFundingArbitrageStrategy.evaluate).parameters
+    for name in ("signal_id", "evidence", "venue", "now", "maximum_age_seconds"):
+        assert name in parameters and parameters[name].default is parameters[name].empty
 
 
 def test_auditor_manifest_owner_hash_and_empty_report() -> None:

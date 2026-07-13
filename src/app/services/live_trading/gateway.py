@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app.adapters.exchanges.base import ExecutionAdapter
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
 from app.domain.execution.live_models import (
     CancelAck,
@@ -14,7 +15,9 @@ from app.domain.execution.live_models import (
     LiveOrderRequest,
     LiveOrderState,
 )
+from app.domain.market_data.evidence import CapabilityEvidence
 from app.domain.risk.models import RiskDecision
+from app.domain.strategies.capabilities import STRATEGY_CAPABILITY_REGISTRY
 from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.preflight import LivePreflightReport
 from app.services.venue_eligibility import execution_eligibility_reason
@@ -249,6 +252,13 @@ class LiveExecutionGateway:
         evidence = request.signal_data_evidence
         if evidence.signal_id != request.signal_id or not evidence.valid_hash():
             return "signal capability evidence identity or hash is invalid"
+        registered_capabilities = STRATEGY_CAPABILITY_REGISTRY.get(
+            (request.strategy_id, request.strategy_version)
+        )
+        if registered_capabilities is None:
+            return "unknown strategy id or version"
+        if request.required_capabilities != registered_capabilities:
+            return "required capabilities do not exactly match strategy registry"
         required_use_case = (
             CapabilityUseCase.EMERGENCY_EXIT
             if request.reduce_only
@@ -257,7 +267,7 @@ class LiveExecutionGateway:
         if not evidence.capabilities:
             return "signal capability evidence is empty"
         evidence_by_capability = {item.capability: item for item in evidence.capabilities}
-        missing = set(request.required_capabilities) - evidence_by_capability.keys()
+        missing = set(registered_capabilities) - evidence_by_capability.keys()
         if missing:
             return f"required capability evidence is missing: {','.join(sorted(missing))}"
         for item in evidence.capabilities:
@@ -270,6 +280,9 @@ class LiveExecutionGateway:
                 return "capability evidence is not LIVE_VERIFIED"
             if age < timedelta(0) or age > timedelta(seconds=self.settings.risk.stale_data_seconds):
                 return "capability evidence is stale or future-dated"
+            source_failure = self._validate_source_events(request, item, timestamp)
+            if source_failure is not None:
+                return source_failure
         enabled_exchanges = {
             exchange.name for exchange in self.settings.exchanges if exchange.execution_enabled
         }
@@ -314,6 +327,41 @@ class LiveExecutionGateway:
             self._order_timestamps.popleft()
         if len(self._order_timestamps) >= self.settings.live.maximum_orders_per_minute:
             return "live order rate limit reached"
+        return None
+
+    def _validate_source_events(
+        self, request: LiveOrderRequest, capability: CapabilityEvidence, timestamp: datetime
+    ) -> str | None:
+        import re
+
+        event_types = {
+            "funding_current": {"funding_current", "funding"},
+            "funding_history": {"funding_history"},
+            "orderbook_snapshot": {"orderbook_snapshot", "orderbook_delta"},
+            "index_price": {"index_price"},
+            "market_liquidation_stream": {"market_liquidation", "liquidation"},
+            "open_interest": {"open_interest"},
+            "trades": {"trade", "trades"},
+        }
+        for event in capability.source_events:
+            if not event.event_id:
+                return "source event id is empty"
+            if event.venue != request.exchange:
+                return "source event venue does not match order venue"
+            if event.symbol != request.symbol:
+                return "source event symbol does not match order symbol"
+            if event.event_type not in event_types.get(capability.capability, set()):
+                return "source event type does not match capability"
+            age = timestamp - event.available_at
+            if age < timedelta(0) or age > timedelta(seconds=self.settings.risk.stale_data_seconds):
+                return "source event is stale or future-dated"
+            if re.fullmatch(r"[0-9a-f]{64}", event.payload_sha256) is None:
+                return "source event payload hash is invalid"
+            if event.data_quality_score < self.settings.live.minimum_data_quality:
+                return "source event data quality is below threshold"
+            snapshot_delta = event.event_type in {"orderbook_snapshot", "orderbook_delta"}
+            if snapshot_delta and event.reconciliation_state != ReconciliationState.SYNCHRONIZED:
+                return "source event is not synchronized"
         return None
 
     def _reject_and_remember(
