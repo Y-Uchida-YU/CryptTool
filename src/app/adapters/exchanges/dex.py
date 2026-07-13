@@ -67,14 +67,14 @@ class DydxMarketDataAdapter(PublicRestAdapter):
     capabilities = _matrix(
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
-        funding_current=CapabilitySupport.IMPLEMENTED,
+        funding_current=CapabilitySupport.DOCUMENTED,
         funding_history=CapabilitySupport.IMPLEMENTED,
-        open_interest=CapabilitySupport.IMPLEMENTED,
+        open_interest=CapabilitySupport.DOCUMENTED,
         orderbook_snapshot=CapabilitySupport.IMPLEMENTED,
         orderbook_delta=CapabilitySupport.DOCUMENTED,
         trades=CapabilitySupport.IMPLEMENTED,
-        mark_price=CapabilitySupport.IMPLEMENTED,
-        index_price=CapabilitySupport.IMPLEMENTED,
+        mark_price=CapabilitySupport.DOCUMENTED,
+        index_price=CapabilitySupport.DOCUMENTED,
     )
 
     async def _get(self, path: str, **params: object) -> Any:
@@ -213,7 +213,7 @@ class ParadexMarketDataAdapter(PublicRestAdapter):
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
         funding_history=CapabilitySupport.IMPLEMENTED,
-        liquidations=CapabilitySupport.IMPLEMENTED,
+        liquidations=CapabilitySupport.DOCUMENTED,
         orderbook_snapshot=CapabilitySupport.IMPLEMENTED,
         trades=CapabilitySupport.IMPLEMENTED,
     )
@@ -358,12 +358,12 @@ class LighterMarketDataAdapter(PublicRestAdapter):
     capabilities = _matrix(
         venue,
         perpetual=CapabilitySupport.IMPLEMENTED,
-        funding_current=CapabilitySupport.IMPLEMENTED,
+        funding_current=CapabilitySupport.DOCUMENTED,
         orderbook_snapshot=CapabilitySupport.IMPLEMENTED,
         orderbook_delta=CapabilitySupport.DOCUMENTED,
         trades=CapabilitySupport.IMPLEMENTED,
-        mark_price=CapabilitySupport.IMPLEMENTED,
-        index_price=CapabilitySupport.IMPLEMENTED,
+        mark_price=CapabilitySupport.DOCUMENTED,
+        index_price=CapabilitySupport.DOCUMENTED,
     )
 
     async def _get(self, path: str, **params: object) -> Any:
@@ -371,29 +371,51 @@ class LighterMarketDataAdapter(PublicRestAdapter):
         response.raise_for_status()
         return response.json()
 
-    async def fetch_markets(self) -> Sequence[Market]:
+    async def fetch_instrument_mappings(self) -> Sequence[LighterInstrumentMapping]:
         data = await self._get("/orderBooks")
         return tuple(
-            Market(
-                exchange=self.venue,
-                symbol=x["symbol"],
+            LighterInstrumentMapping(
+                venue_symbol=x["symbol"],
+                market_id=int(x.get("market_id", x.get("market_index"))),
                 base=x.get("symbol", "").split("-")[0],
                 quote=x.get("quote_symbol", "USDC"),
-                market_type="perpetual",
-                tick_size=x.get("supported_price_decimals")
-                and Decimal(1).scaleb(-int(x["supported_price_decimals"])),
-                lot_size=x.get("supported_size_decimals")
-                and Decimal(1).scaleb(-int(x["supported_size_decimals"])),
+                tick_size=Decimal(1).scaleb(-int(x["supported_price_decimals"])),
+                lot_size=Decimal(1).scaleb(-int(x["supported_size_decimals"])),
             )
             for x in data.get("order_books", [])
         )
+
+    async def fetch_markets(self) -> Sequence[Market]:
+        return tuple(
+            Market(
+                exchange=self.venue,
+                symbol=item.venue_symbol,
+                base=item.base,
+                quote=item.quote,
+                market_type="perpetual",
+                tick_size=item.tick_size,
+                lot_size=item.lot_size,
+            )
+            for item in await self.fetch_instrument_mappings()
+        )
+
+    async def _mapping(self, symbol: str) -> LighterInstrumentMapping:
+        try:
+            return next(
+                item
+                for item in await self.fetch_instrument_mappings()
+                if item.venue_symbol == symbol
+            )
+        except StopIteration as exc:
+            raise ValueError(f"unknown Lighter venue symbol: {symbol}") from exc
 
     async def fetch_contract_specifications(self) -> SourcedData:
         return SourcedData(DataSourceLayer.INDEXER, await self._get("/orderBooks"))
 
     async def fetch_order_book(self, symbol: str, depth: int = 100) -> OrderBook:
         received = datetime.now(UTC)
-        data = await self._get("/orderBookOrders", market_id=symbol, limit=depth)
+        mapping = await self._mapping(symbol)
+        data = await self._get("/orderBookOrders", market_id=mapping.market_id, limit=depth)
         return OrderBook(
             exchange=self.venue,
             symbol=symbol,
@@ -423,7 +445,8 @@ class LighterMarketDataAdapter(PublicRestAdapter):
         )
 
     async def fetch_recent_trades(self, symbol: str, limit: int = 100) -> Sequence[Trade]:
-        data = await self._get("/recentTrades", market_id=symbol, limit=limit)
+        mapping = await self._mapping(symbol)
+        data = await self._get("/recentTrades", market_id=mapping.market_id, limit=limit)
         return tuple(
             Trade(
                 exchange=self.venue,
@@ -450,6 +473,16 @@ class LighterMarketDataAdapter(PublicRestAdapter):
 
     async def fetch_system_status(self) -> SourcedData:
         return SourcedData(DataSourceLayer.INDEXER, await self._get("/info"))
+
+
+@dataclass(frozen=True)
+class LighterInstrumentMapping:
+    venue_symbol: str
+    market_id: int
+    base: str
+    quote: str
+    tick_size: Decimal
+    lot_size: Decimal
 
 
 @dataclass(frozen=True)

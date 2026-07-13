@@ -19,8 +19,10 @@ from app.domain.execution.live_models import (
     LivePosition,
 )
 from app.domain.execution.models import OrderType
+from app.domain.market_data.evidence import CapabilityEvidence, SignalDataEvidence
 from app.domain.market_data.models import Side
 from app.domain.risk.models import PositionSizingResult, RiskDecision
+from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.gateway import ExecutionAdapterError, LiveExecutionGateway
 from app.services.live_trading.preflight import (
     RUNTIME_CONFIRMATION,
@@ -181,10 +183,34 @@ def order(
     idempotency_key: str = "idempotency-key-0001",
     **overrides: object,
 ) -> LiveOrderRequest:
+    signal_id = str(overrides.get("signal_id", "signal-0001"))
+    exchange = str(overrides.get("exchange", "sandbox"))
+    evidence_time = overrides.get("created_at", NOW)
+    assert isinstance(evidence_time, datetime)
+    if evidence_time.tzinfo is None:
+        evidence_time = NOW
+    evidence = SignalDataEvidence.build(
+        signal_id,
+        (
+            CapabilityEvidence(
+                venue=exchange,
+                capability="orderbook_snapshot",
+                use_case=CapabilityUseCase.EMERGENCY_EXIT
+                if overrides.get("reduce_only")
+                else CapabilityUseCase.NEW_EXPOSURE,
+                support=CapabilitySupport.LIVE_VERIFIED,
+                verified_at=evidence_time,
+                verification_run_id="test-live-smoke",
+                source_event_ids=("event-1",),
+            ),
+        ),
+    )
     values = {
         "request_id": request_id,
         "idempotency_key": idempotency_key,
-        "signal_id": "signal-0001",
+        "signal_id": signal_id,
+        "signal_data_evidence": evidence,
+        "required_capabilities": ("orderbook_snapshot",),
         "risk_decision_id": "risk-decision-0001",
         "model_version": "strategy-1.0",
         "config_version": "config-1.0",

@@ -1,0 +1,485 @@
+entries:
+- venue: hyperliquid
+  capability: spot
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: predicted_funding
+  adapter_method: fetch_predicted_funding
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: open_interest
+  adapter_method: fetch_open_interest
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: wallet_liquidation_history
+  adapter_method: fetch_wallet_liquidation_history
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: hyperliquid
+  capability: wallet_transfers
+  adapter_method: fetch_wallet_transfers
+  contract_fixture:
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: aster
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/aster/public.json
+    sha256: 5387beb698fe88b1f9dcd4036c6e986be3f34ea056e99fc88561d068739bdf55
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: aster
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/aster/public.json
+    sha256: 5387beb698fe88b1f9dcd4036c6e986be3f34ea056e99fc88561d068739bdf55
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: aster
+  capability: open_interest
+  adapter_method: fetch_open_interest
+  contract_fixture:
+    path: tests/contracts/aster/public.json
+    sha256: 5387beb698fe88b1f9dcd4036c6e986be3f34ea056e99fc88561d068739bdf55
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: aster
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/aster/public.json
+    sha256: 5387beb698fe88b1f9dcd4036c6e986be3f34ea056e99fc88561d068739bdf55
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: aster
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/aster/public.json
+    sha256: 5387beb698fe88b1f9dcd4036c6e986be3f34ea056e99fc88561d068739bdf55
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitget
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitget
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitget
+  capability: open_interest
+  adapter_method: fetch_open_interest
+  contract_fixture:
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitget
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitget
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: mexc
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/mexc/public.json
+    sha256: 6d9b903243edbd2f9651e364cc677bdf6b2967c6efc5b9b4f7b3234a410fc7a2
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: mexc
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/mexc/public.json
+    sha256: 6d9b903243edbd2f9651e364cc677bdf6b2967c6efc5b9b4f7b3234a410fc7a2
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: mexc
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/mexc/public.json
+    sha256: 6d9b903243edbd2f9651e364cc677bdf6b2967c6efc5b9b4f7b3234a410fc7a2
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: mexc
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/mexc/public.json
+    sha256: 6d9b903243edbd2f9651e364cc677bdf6b2967c6efc5b9b4f7b3234a410fc7a2
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: dydx
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/dydx/public.json
+    sha256: 725792c64b6fe2f9dc0ec682deb6a2ffc63265a3fce95c765588e0da8f85a4a4
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: dydx
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/dydx/public.json
+    sha256: 725792c64b6fe2f9dc0ec682deb6a2ffc63265a3fce95c765588e0da8f85a4a4
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: dydx
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/dydx/public.json
+    sha256: 725792c64b6fe2f9dc0ec682deb6a2ffc63265a3fce95c765588e0da8f85a4a4
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: dydx
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/dydx/public.json
+    sha256: 725792c64b6fe2f9dc0ec682deb6a2ffc63265a3fce95c765588e0da8f85a4a4
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: paradex
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/paradex/public.json
+    sha256: 6877ec8ad73ac63b1a92f5dd4e19b6d04a44f617d6ebbe682bcc61bd13028dba
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: paradex
+  capability: funding_history
+  adapter_method: fetch_funding_rates
+  contract_fixture:
+    path: tests/contracts/paradex/public.json
+    sha256: 6877ec8ad73ac63b1a92f5dd4e19b6d04a44f617d6ebbe682bcc61bd13028dba
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: paradex
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/paradex/public.json
+    sha256: 6877ec8ad73ac63b1a92f5dd4e19b6d04a44f617d6ebbe682bcc61bd13028dba
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: paradex
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/paradex/public.json
+    sha256: 6877ec8ad73ac63b1a92f5dd4e19b6d04a44f617d6ebbe682bcc61bd13028dba
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: lighter
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/lighter/public.json
+    sha256: 86f610a1352d063c9f75b117ef6a0e3a190187ba800774cbd8ab19bdfb8f1047
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: lighter
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/lighter/public.json
+    sha256: 86f610a1352d063c9f75b117ef6a0e3a190187ba800774cbd8ab19bdfb8f1047
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: lighter
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/lighter/public.json
+    sha256: 86f610a1352d063c9f75b117ef6a0e3a190187ba800774cbd8ab19bdfb8f1047
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: gmo_coin
+  capability: spot
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/gmo_coin/public.json
+    sha256: 1dbe5627345ea88a6448154548bf5c629a5690eb3fc63ac8229c184088491fc9
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: gmo_coin
+  capability: perpetual
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/gmo_coin/public.json
+    sha256: 1dbe5627345ea88a6448154548bf5c629a5690eb3fc63ac8229c184088491fc9
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: gmo_coin
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/gmo_coin/public.json
+    sha256: 1dbe5627345ea88a6448154548bf5c629a5690eb3fc63ac8229c184088491fc9
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: gmo_coin
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/gmo_coin/public.json
+    sha256: 1dbe5627345ea88a6448154548bf5c629a5690eb3fc63ac8229c184088491fc9
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitbank
+  capability: spot
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/bitbank/public.json
+    sha256: f0aacb622c2e83fc69be4151421d083f618483f6ffa7639fa55ac53dd6d08e84
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitbank
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/bitbank/public.json
+    sha256: f0aacb622c2e83fc69be4151421d083f618483f6ffa7639fa55ac53dd6d08e84
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitbank
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/bitbank/public.json
+    sha256: f0aacb622c2e83fc69be4151421d083f618483f6ffa7639fa55ac53dd6d08e84
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitflyer
+  capability: spot
+  adapter_method: fetch_markets
+  contract_fixture:
+    path: tests/contracts/bitflyer/public.json
+    sha256: 5d0823624de75afae81cbb17fcfe1da3773244781147f4fec4cb7800de79280f
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitflyer
+  capability: orderbook_snapshot
+  adapter_method: fetch_order_book
+  contract_fixture:
+    path: tests/contracts/bitflyer/public.json
+    sha256: 5d0823624de75afae81cbb17fcfe1da3773244781147f4fec4cb7800de79280f
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null
+- venue: bitflyer
+  capability: trades
+  adapter_method: fetch_recent_trades
+  contract_fixture:
+    path: tests/contracts/bitflyer/public.json
+    sha256: 5d0823624de75afae81cbb17fcfe1da3773244781147f4fec4cb7800de79280f
+  normalization_test:
+    test_id: tests/unit/test_venues.py::test_priority_one_capability_matrices_exist
+  live_smoke:
+    verification_run_id: null
+    verified_at: null

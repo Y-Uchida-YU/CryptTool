@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.market_data.clock import CrossVenueTimestamp, VenueClock
+from app.domain.market_data.evidence import (
+    RejectedSignal,
+    SignalDataEvidence,
+    require_signal_capabilities,
+)
 
 
 class ExecutableBook(BaseModel):
@@ -53,6 +59,20 @@ class CrossVenueFundingOpportunity(BaseModel):
 
 
 class CrossVenueFundingArbitrageStrategy:
+    required_capabilities = ("funding_current", "funding_history", "orderbook_snapshot")
+
+    def validate_evidence(
+        self,
+        signal_id: str,
+        evidence: SignalDataEvidence,
+        venue: str,
+        now: datetime,
+        maximum_age_seconds: int,
+    ) -> RejectedSignal | None:
+        return require_signal_capabilities(
+            signal_id, evidence, self.required_capabilities, venue, now, maximum_age_seconds
+        )
+
     def evaluate(
         self,
         receive_leg: FundingLeg,
@@ -135,8 +155,22 @@ class BasisOpportunity(BaseModel):
 
 
 class CrossVenueBasisStrategy:
+    required_capabilities = ("orderbook_snapshot", "index_price")
+
     def __init__(self, clock: VenueClock) -> None:
         self.clock = clock
+
+    def validate_evidence(
+        self,
+        signal_id: str,
+        evidence: SignalDataEvidence,
+        venue: str,
+        now: datetime,
+        maximum_age_seconds: int,
+    ) -> RejectedSignal | None:
+        return require_signal_capabilities(
+            signal_id, evidence, self.required_capabilities, venue, now, maximum_age_seconds
+        )
 
     def evaluate(
         self,

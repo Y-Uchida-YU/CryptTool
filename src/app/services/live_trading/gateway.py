@@ -15,6 +15,7 @@ from app.domain.execution.live_models import (
     LiveOrderState,
 )
 from app.domain.risk.models import RiskDecision
+from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.preflight import LivePreflightReport
 from app.services.venue_eligibility import execution_eligibility_reason
 
@@ -245,6 +246,30 @@ class LiveExecutionGateway:
             return "order request is stale"
         if request.expires_at <= timestamp:
             return "order request has expired"
+        evidence = request.signal_data_evidence
+        if evidence.signal_id != request.signal_id or not evidence.valid_hash():
+            return "signal capability evidence identity or hash is invalid"
+        required_use_case = (
+            CapabilityUseCase.EMERGENCY_EXIT
+            if request.reduce_only
+            else CapabilityUseCase.NEW_EXPOSURE
+        )
+        if not evidence.capabilities:
+            return "signal capability evidence is empty"
+        evidence_by_capability = {item.capability: item for item in evidence.capabilities}
+        missing = set(request.required_capabilities) - evidence_by_capability.keys()
+        if missing:
+            return f"required capability evidence is missing: {','.join(sorted(missing))}"
+        for item in evidence.capabilities:
+            age = timestamp - item.verified_at
+            if item.venue != request.exchange:
+                return "capability evidence venue does not match order venue"
+            if item.use_case != required_use_case:
+                return "capability evidence use case does not match order intent"
+            if item.support != CapabilitySupport.LIVE_VERIFIED:
+                return "capability evidence is not LIVE_VERIFIED"
+            if age < timedelta(0) or age > timedelta(seconds=self.settings.risk.stale_data_seconds):
+                return "capability evidence is stale or future-dated"
         enabled_exchanges = {
             exchange.name for exchange in self.settings.exchanges if exchange.execution_enabled
         }

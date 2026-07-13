@@ -7,7 +7,9 @@ from hypothesis import strategies as st
 from app.adapters.exchanges.disabled import DisabledExecutionAdapter
 from app.config.settings import Settings
 from app.domain.execution.live_models import LiveOrderRequest, LiveOrderState
+from app.domain.market_data.evidence import CapabilityEvidence, SignalDataEvidence
 from app.domain.market_data.models import Side
+from app.domain.venues.models import CapabilitySupport, CapabilityUseCase
 from app.services.live_trading.gateway import LiveExecutionGateway
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 
@@ -70,6 +72,21 @@ def test_live_preview_never_calls_adapter_and_respects_notional_cap(
         request_id="request-property",
         idempotency_key="idempotency-property",
         signal_id="signal-property",
+        signal_data_evidence=SignalDataEvidence.build(
+            "signal-property",
+            (
+                CapabilityEvidence(
+                    venue="sandbox",
+                    capability="orderbook_snapshot",
+                    use_case=CapabilityUseCase.NEW_EXPOSURE,
+                    support=CapabilitySupport.LIVE_VERIFIED,
+                    verified_at=NOW,
+                    verification_run_id="property-smoke",
+                    source_event_ids=("event-property",),
+                ),
+            ),
+        ),
+        required_capabilities=("orderbook_snapshot",),
         risk_decision_id="risk-property",
         model_version="test",
         config_version="test",

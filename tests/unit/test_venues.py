@@ -84,7 +84,12 @@ def test_eligibility_fails_closed_and_exit_only_reduces() -> None:
 
 
 def test_capability_and_instrument_identity_are_explicit() -> None:
-    matrix = VenueCapabilityMatrix(venue="x", detected_at=NOW, source_version="test", spot=True)
+    matrix = VenueCapabilityMatrix(
+        venue="x",
+        detected_at=NOW,
+        source_version="test",
+        spot=CapabilitySupport.IMPLEMENTED,
+    )
     matrix.require("spot", CapabilityUseCase.RESEARCH_COLLECTION, NOW, timedelta(days=1))
     with pytest.raises(CapabilityUnavailableError):
         matrix.require(
@@ -274,7 +279,9 @@ async def test_hyperliquid_contract_parsing_and_staged_execution() -> None:
                 },
             )
         if payload["type"] == "userFills":
-            return httpx.Response(200, json=[{"coin": "BTC", "closedPnl": "3"}])
+            return httpx.Response(
+                200, json=[{"coin": "BTC", "closedPnl": "3", "dir": "Liquidated Long"}]
+            )
         if payload["type"] == "userNonFundingLedgerUpdates":
             return httpx.Response(200, json=[{"delta": {"type": "deposit", "usdc": "50"}}])
         if payload["type"] == "allMids":
@@ -286,8 +293,10 @@ async def test_hyperliquid_contract_parsing_and_staged_execution() -> None:
     markets = await adapter.fetch_markets()
     book = await adapter.fetch_order_book("BTC")
     wallet = await adapter.fetch_wallet_snapshot("0xabc", "BTC")
+    liquidations = await adapter.fetch_wallet_liquidation_history("0xabc")
     assert markets[0].quote == "USDC" and book.bids[0].price == 99
     assert wallet.realized_pnl == 3 and wallet.cumulative_deposits == 50
+    assert liquidations[0]["dir"] == "Liquidated Long"
     for execution in (
         HyperliquidExecutionAdapter(),
         AsterExecutionAdapter(),

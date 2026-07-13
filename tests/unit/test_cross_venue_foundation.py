@@ -117,7 +117,17 @@ async def test_dex_public_fixtures_and_execution_disabled() -> None:
                 }
             ]
         },
-        "/orderBooks": {"order_books": [{"symbol": "ETH-USDC", "quote_symbol": "USDC"}]},
+        "/orderBooks": {
+            "order_books": [
+                {
+                    "symbol": "ETH-USDC",
+                    "market_id": 1,
+                    "quote_symbol": "USDC",
+                    "supported_price_decimals": 2,
+                    "supported_size_decimals": 4,
+                }
+            ]
+        },
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:

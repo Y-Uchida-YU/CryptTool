@@ -5,6 +5,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.execution.models import OrderType
+from app.domain.market_data.evidence import SignalDataEvidence
 from app.domain.market_data.models import Side
 
 
@@ -21,6 +22,8 @@ class LiveOrderRequest(BaseModel):
     request_id: str = Field(min_length=8, max_length=100)
     idempotency_key: str = Field(min_length=16, max_length=128)
     signal_id: str = Field(min_length=8, max_length=100)
+    signal_data_evidence: SignalDataEvidence
+    required_capabilities: tuple[str, ...] = Field(min_length=1)
     risk_decision_id: str = Field(min_length=8, max_length=100)
     model_version: str = Field(min_length=1, max_length=100)
     config_version: str = Field(min_length=1, max_length=100)
