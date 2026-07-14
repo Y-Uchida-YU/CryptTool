@@ -1,0 +1,35 @@
+{
+  "commit_sha": "d96567d099b379d9b15a3f7f0bac72dea3f671fe",
+  "created_at": "2026-07-14T05:22:13.395012+00:00",
+  "files": {
+    "fault-results.csv": {
+      "bytes": 1637,
+      "sha256": "f8205bd6092b2e9023f224a9391517cf4936dd6369e8078dc0225dc900ece1d6"
+    },
+    "metrics.json": {
+      "bytes": 1690864,
+      "sha256": "b2d215096b982af7155bf3ee625534823ad0a4ed224e36ec0fec60a0afd05c02"
+    },
+    "research-run-summary.json": {
+      "bytes": 71,
+      "sha256": "69d3b5a8f21f6cc8331e7a05e2dbcfb3f5715b1540bbd26e13b8e0887c075217"
+    },
+    "resource-usage.csv": {
+      "bytes": 1865,
+      "sha256": "f5ba5bca36e6f6c6ef2304cb9a475ff6713fa9dd837d136f905ffd0f266f1cb4"
+    },
+    "restart-results.csv": {
+      "bytes": 281,
+      "sha256": "d4685553ff0bb35b7997f729bbb2bba77fc1a382a8e9ecc27d5e9ef554f0a93d"
+    },
+    "snapshot-verification.json": {
+      "bytes": 161,
+      "sha256": "5c1ce8859349ebf14cc88cd776b8c29c6cc8887787b454f24376b12e3b3325bc"
+    },
+    "summary.md": {
+      "bytes": 366,
+      "sha256": "0f0f64c236df37a0d2b2f615196eafe2e7c6e79a5b049d1bb99577a3ee052990"
+    }
+  },
+  "run_id": "accelerated-20260714T052213Z-d96567d0"
+}

@@ -840,3 +840,7 @@ def test_raw_payload_retention_protects_finalized_snapshot_membership() -> None:
     assert removed == 1
     assert protected_hash in repository.raw_payloads
     assert removable_hash not in repository.raw_payloads
+
+
+def test_collector_health_report_is_available_after_event_loop_shutdown() -> None:
+    assert CollectorHealthMetrics().report()["task_count"] == 0

@@ -768,10 +768,16 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
         end: datetime | None = None,
         limit: int = 1000,
     ) -> Sequence[OHLCV]:
+        granularity = {
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1w": "1W",
+        }.get(timeframe, timeframe)
         params: dict[str, str | int] = {
             "symbol": symbol,
             "productType": "USDT-FUTURES",
-            "granularity": timeframe,
+            "granularity": granularity,
             "limit": limit,
         }
         if start:

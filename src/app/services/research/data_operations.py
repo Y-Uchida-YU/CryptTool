@@ -224,6 +224,41 @@ class PublicAdapterCollectorSource:
     ) -> AsyncIterator[CollectedEnvelope]:
         return self._rest_events(identity, checkpoint)
 
+    async def historical_events(
+        self,
+        identity: ResearchStreamIdentity,
+        *,
+        start: datetime,
+        end: datetime,
+        timeframe: str = "1h",
+    ) -> tuple[CollectedEnvelope, ...]:
+        """Read an explicit historical interval while preserving captured public payloads."""
+        if end <= start:
+            raise ValueError("historical end must be after start")
+        async with self._http_lock:
+            self._raw_responses.clear()
+            if identity.event_type == "ohlcv":
+                values: Sequence[Any] = await self.adapter.fetch_ohlcv(
+                    identity.venue_symbol,
+                    timeframe,
+                    start=start,
+                    end=end,
+                    limit=1000,
+                )
+            elif identity.event_type == "funding_history":
+                values = await self.adapter.fetch_funding_rates(
+                    identity.venue_symbol,
+                    start=start,
+                    end=end,
+                )
+            else:
+                raise CapabilityUnavailableError(
+                    f"historical {identity.event_type} is unavailable through the public adapter"
+                )
+            return tuple(
+                self._envelope(identity, value, use_captured_response=True) for value in values
+            )
+
     async def _rest_events(
         self,
         identity: ResearchStreamIdentity,
@@ -556,6 +591,10 @@ class CollectorHealthMetrics:
 
     def report(self) -> dict[str, object]:
         total = self.production_count + self.experimental_count + self.duplicate_count
+        try:
+            task_count = len(asyncio.all_tasks())
+        except RuntimeError:
+            task_count = 0
         return {
             "events_by_venue_type_instrument": {
                 ":".join(key): value for key, value in sorted(self.events.items())
@@ -571,7 +610,7 @@ class CollectorHealthMetrics:
             "checkpoint_lag_seconds": self.checkpoint_lag_seconds,
             "duplicate_ratio": self.duplicate_count / max(1, total),
             "memory_usage_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-            "task_count": len(asyncio.all_tasks()),
+            "task_count": task_count,
         }
 
 

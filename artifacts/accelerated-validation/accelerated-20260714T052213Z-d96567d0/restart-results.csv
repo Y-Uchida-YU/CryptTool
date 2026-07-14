@@ -1,0 +1,5 @@
+event_index,percentage,checkpoint_regressions,event_loss,duplicate_events,connection_epoch_before,connection_epoch_after,recovery_state_preserved,snapshot_manifest_match
+816,10,0,0,0,0,1,True,True
+4080,50,0,0,0,1,2,True,True
+7344,90,0,0,0,2,3,True,True
+7449,91,0,0,0,3,4,True,True

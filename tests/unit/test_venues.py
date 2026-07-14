@@ -429,3 +429,35 @@ def test_priority_one_capability_matrices_exist() -> None:
         assert adapter.capabilities.perpetual.support != CapabilitySupport.UNAVAILABLE
         assert adapter.capabilities.orderbook_snapshot.support != CapabilitySupport.UNAVAILABLE
     assert MexcMarketDataAdapter.capabilities.open_interest.support == CapabilitySupport.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_bitget_maps_canonical_hour_timeframe_for_historical_candles() -> None:
+    observed: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    [
+                        str(int(NOW.timestamp() * 1000)),
+                        "100",
+                        "102",
+                        "99",
+                        "101",
+                        "12",
+                    ]
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.bitget.com"
+    ) as client:
+        candles = await BitgetMarketDataAdapter(client).fetch_ohlcv(
+            "BTCUSDT", "1h", NOW - timedelta(days=30), NOW
+        )
+    assert observed["granularity"] == "1H"
+    assert candles[0].timeframe == "1h"

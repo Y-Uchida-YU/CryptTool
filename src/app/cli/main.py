@@ -50,6 +50,14 @@ from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
 from app.services.regime_engine.rules import DeterministicRuleEngine
 from app.services.reporting.report import AcceptanceAssessment, generate_report
+from app.services.research.accelerated_validation import (
+    AcceleratedValidationArtifactWriter,
+    FaultKind,
+    FaultSchedule,
+    HistoricalMarketEventReplay,
+    HistoricalPublicDatasetLoader,
+    run_start_stop_resource_test,
+)
 from app.services.research.data_operations import (
     DataSnapshotService,
     PublicAdapterCollectorSource,
@@ -62,7 +70,10 @@ from app.services.research.data_operations import (
 from app.services.research.models import ResearchRunResult
 from app.services.research.pipeline import ResearchPipeline
 from app.services.research.report import ResearchArtifactWriter
-from app.services.research.repository import PostgreSQLResearchRepository
+from app.services.research.repository import (
+    InMemoryResearchRepository,
+    PostgreSQLResearchRepository,
+)
 from app.services.validation.resampling import monte_carlo_paths
 from app.services.validation.splits import anchored_walk_forward, rolling_walk_forward
 from app.services.venue_eligibility import eligibility_from_settings
@@ -504,6 +515,132 @@ def _research_data_adapter(name: str) -> PublicRestAdapter:
         return adapters[name]()
     except KeyError as exc:
         raise typer.BadParameter(f"unsupported R2 research venue: {name}") from exc
+
+
+async def _run_accelerated_validation(
+    *,
+    settings: Settings,
+    days: int,
+    commit_sha: str,
+    seed: int,
+    maximum_queue_depth: int,
+    live_soak_artifact: Path | None,
+    research_config: Path | None,
+) -> Path:
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("accelerated validation requires live execution to remain OFF")
+    requested_venues = tuple(
+        venue for venue in settings.research_collection.venues if venue in {"hyperliquid", "bitget"}
+    ) or ("hyperliquid", "bitget")
+    adapters = tuple(_research_data_adapter(venue) for venue in requested_venues)
+    sources = tuple(PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters)
+    end = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=days)
+    try:
+        dataset = await HistoricalPublicDatasetLoader(sources).load(
+            start=start,
+            end=end,
+            instruments=settings.research_collection.instruments,
+        )
+    finally:
+        await asyncio.gather(*(source.close() for source in sources), return_exceptions=True)
+    if len(dataset.events) <= len(tuple(FaultKind)):
+        raise typer.BadParameter("historical public dataset has too few events for fault coverage")
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLResearchRepository(engine)
+        replay = await HistoricalMarketEventReplay(repository=repository).replay(
+            events=dataset.stream(),
+            speed=None,
+            maximum_queue_depth=maximum_queue_depth,
+            fault_schedule=FaultSchedule.deterministic(event_count=len(dataset.events), seed=seed),
+        )
+        sample_event = dataset.events[0]
+
+        async def lifecycle(_: int) -> None:
+            memory_repository = InMemoryResearchRepository()
+
+            async def one_event() -> Any:
+                yield sample_event
+
+            await HistoricalMarketEventReplay(
+                repository=memory_repository, restart_percentages=()
+            ).replay(
+                events=one_event(),
+                speed=None,
+                maximum_queue_depth=1,
+                fault_schedule=None,
+            )
+
+        pool = getattr(engine, "pool", None)
+        checked_out = getattr(pool, "checkedout", None)
+        resources, leaked = await run_start_stop_resource_test(
+            iterations=100,
+            cycle=lifecycle,
+            database_connections=(checked_out if callable(checked_out) else lambda: 0),
+        )
+    finally:
+        engine.dispose()
+    live_soak_status = "INSUFFICIENT_EVIDENCE"
+    if live_soak_artifact is not None and live_soak_artifact.is_file():
+        soak = json.loads(live_soak_artifact.read_text(encoding="utf-8"))
+        configured = float(soak.get("configured_duration_hours", 0))
+        live_soak_status = "PASS" if configured >= 6 and soak.get("completed_at") else "FAIL"
+    research_verdict = "INSUFFICIENT_EVIDENCE"
+    if research_config is not None:
+        research_verdict = _run_research(research_config).acceptance_result.verdict.value
+    unresolved_values = {
+        detail
+        for item in dataset.coverage
+        if item.status != "AVAILABLE" and (detail := item.detail) is not None
+    }
+    if live_soak_status != "PASS":
+        unresolved_values.add("6-hour live soak is incomplete")
+    if research_verdict != "PASS":
+        unresolved_values.add("research pipeline evidence is incomplete")
+    unresolved = tuple(sorted(unresolved_values))
+    run_id = f"accelerated-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{commit_sha[:8]}"
+    return AcceleratedValidationArtifactWriter.write(
+        root=Path("artifacts/accelerated-validation"),
+        run_id=run_id,
+        commit_sha=commit_sha,
+        replay=replay,
+        resources=resources,
+        resource_leak_detected=leaked,
+        live_soak_status=live_soak_status,
+        research_pipeline_verdict=research_verdict,
+        unresolved_items=unresolved,
+        dataset_coverage=dataset.coverage,
+    )
+
+
+@app.command("run-accelerated-validation")
+def run_accelerated_validation(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    commit_sha: Annotated[str, typer.Option("--commit-sha", min=7)],
+    days: Annotated[int, typer.Option("--days", min=30, max=90)] = 30,
+    seed: Annotated[int, typer.Option("--seed")] = 20260714,
+    maximum_queue_depth: Annotated[int, typer.Option("--maximum-queue-depth", min=1)] = 4096,
+    live_soak_artifact: Annotated[
+        Path | None, typer.Option("--live-soak-artifact", exists=True, readable=True)
+    ] = None,
+    research_config: Annotated[
+        Path | None, typer.Option("--research-config", exists=True, readable=True)
+    ] = None,
+) -> None:
+    """Run historical replay, deterministic faults, restarts and 100 lifecycle cycles."""
+    manifest = asyncio.run(
+        _run_accelerated_validation(
+            settings=_settings_from_yaml(config),
+            days=days,
+            commit_sha=commit_sha,
+            seed=seed,
+            maximum_queue_depth=maximum_queue_depth,
+            live_soak_artifact=live_soak_artifact,
+            research_config=research_config,
+        )
+    )
+    typer.echo(f"manifest={manifest} live_execution=OFF")
 
 
 @app.command("collect-research-data")
