@@ -123,7 +123,13 @@ class OrderBook(TimedModel):
     connection_epoch: int = 0
     snapshot_sequence: int | None = None
     delta_sequence: int | None = None
+    previous_delta_sequence: int | None = None
     reconciliation_state: str | None = None
+    stream_semantics: str | None = None
+    bootstrap_completed: bool = False
+    recovery_started_at: datetime | None = None
+    recovery_completed_at: datetime | None = None
+    last_recovery_failure: str | None = None
 
     @model_validator(mode="after")
     def validate_book(self) -> "OrderBook":

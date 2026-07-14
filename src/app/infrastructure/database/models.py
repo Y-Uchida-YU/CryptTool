@@ -8,6 +8,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     Numeric,
     String,
@@ -151,7 +152,10 @@ class MarketDataQuarantineRow(Base):
 
 class MarketDataCheckpointRow(Base):
     __tablename__ = "market_data_checkpoints"
-    __table_args__ = (UniqueConstraint("venue", "stream_key"),)
+    __table_args__ = (
+        UniqueConstraint("venue", "stream_key"),
+        Index("ix_market_data_checkpoints_namespace", "checkpoint_namespace"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     venue: Mapped[str] = mapped_column(String(40), index=True)
     stream_key: Mapped[str] = mapped_column(String(200), default="default")
@@ -171,7 +175,11 @@ class MarketDataCheckpointRow(Base):
     delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
     connection_epoch: Mapped[int] = mapped_column(Integer, default=0)
     recovery_required: Mapped[bool] = mapped_column(default=False)
-    checkpoint_namespace: Mapped[str] = mapped_column(String(200), default="production", index=True)
+    bootstrap_completed: Mapped[bool] = mapped_column(default=False)
+    recovery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_recovery_failure: Mapped[str | None] = mapped_column(String(500))
+    checkpoint_namespace: Mapped[str] = mapped_column(String(200), default="production")
 
 
 class CollectorLeaseRow(Base):

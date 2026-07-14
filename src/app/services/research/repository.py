@@ -660,6 +660,10 @@ class PostgreSQLResearchRepository:
                 "delta_sequence": checkpoint.delta_sequence,
                 "connection_epoch": checkpoint.connection_epoch,
                 "recovery_required": checkpoint.recovery_required,
+                "bootstrap_completed": checkpoint.bootstrap_completed,
+                "recovery_started_at": checkpoint.recovery_started_at,
+                "recovery_completed_at": checkpoint.recovery_completed_at,
+                "last_recovery_failure": checkpoint.last_recovery_failure,
                 "checkpoint_namespace": checkpoint.checkpoint_namespace,
             }
             if row is None:
@@ -709,6 +713,14 @@ class PostgreSQLResearchRepository:
                 delta_sequence=row.delta_sequence,
                 connection_epoch=row.connection_epoch,
                 recovery_required=row.recovery_required,
+                bootstrap_completed=row.bootstrap_completed,
+                recovery_started_at=(
+                    self._aware(row.recovery_started_at) if row.recovery_started_at else None
+                ),
+                recovery_completed_at=(
+                    self._aware(row.recovery_completed_at) if row.recovery_completed_at else None
+                ),
+                last_recovery_failure=row.last_recovery_failure,
                 checkpoint_namespace=row.checkpoint_namespace,
             )
 

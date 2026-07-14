@@ -18,6 +18,7 @@ from app.adapters.exchanges.staged_execution import (
     HyperliquidExecutionAdapter,
     MexcExecutionAdapter,
 )
+from app.adapters.exchanges.websocket import OrderBookStreamSemantics
 from app.config.settings import Settings
 from app.domain.execution.leg_state import LegExecutionMachine, LegExecutionState, LegRiskPolicy
 from app.domain.market_data.clock import VenueClock
@@ -461,3 +462,18 @@ async def test_bitget_maps_canonical_hour_timeframe_for_historical_candles() -> 
         )
     assert observed["granularity"] == "1H"
     assert candles[0].timeframe == "1h"
+
+
+def test_orderbook_stream_semantics_are_explicit_per_venue() -> None:
+    assert (
+        BitgetMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.SNAPSHOT_AND_DELTA
+    )
+    assert (
+        HyperliquidMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.SNAPSHOT_ONLY
+    )
+    assert (
+        AsterMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT
+    )

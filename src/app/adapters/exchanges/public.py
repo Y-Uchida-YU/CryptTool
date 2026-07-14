@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections import deque
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import aclosing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import httpx
 
 from app.adapters.exchanges.base import CapabilityUnavailableError, MarketDataAdapter
-from app.adapters.exchanges.websocket import ResilientWebSocketSession, StreamClassification
+from app.adapters.exchanges.websocket import (
+    OrderBookStreamSemantics,
+    ResilientWebSocketSession,
+    StreamClassification,
+    WebSocketConnectionLifecycle,
+)
 from app.domain.market_data.models import (
     OHLCV,
     FundingRate,
@@ -36,12 +42,37 @@ def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
 
 
+def _valid_exchange_ms(value: object, *, future_tolerance_seconds: int = 60) -> bool:
+    try:
+        timestamp = _ms(int(str(value)))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    now = datetime.now(UTC)
+    return (
+        datetime(2009, 1, 1, tzinfo=UTC)
+        <= timestamp
+        <= now + timedelta(seconds=future_tolerance_seconds)
+    )
+
+
 async def _websocket_json(
     url: str,
     subscribe: dict[str, object] | None = None,
     *,
     venue: str = "unknown",
     classification: StreamClassification = StreamClassification.EVENTS,
+    order_book_semantics: OrderBookStreamSemantics | None = None,
+    instrument: str = "SYSTEM",
+    sequence: Callable[[Any], int | None] = lambda value: None,
+    sequence_predecessor: Callable[[Any], int | None] = lambda value: None,
+    snapshot: Callable[[Any], bool] = lambda value: False,
+    delta: Callable[[Any], bool] = lambda value: False,
+    validate_snapshot: Callable[[Any], bool] = lambda value: True,
+    snapshot_applier: Callable[[Any], int | None] | None = None,
+    delta_applier: Callable[[Any], None] | None = None,
+    exchange_timestamp: Callable[[Any], datetime | None] = lambda value: None,
+    lifecycle_sink: Callable[[WebSocketConnectionLifecycle], None] | None = None,
+    application_heartbeat: str | dict[str, object] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     def acknowledged(message: Any) -> bool:
         return isinstance(message, dict) and (
@@ -58,27 +89,62 @@ async def _websocket_json(
         subscribe=subscribe,
         acknowledgement=acknowledged if subscribe is not None else None,
         classification=classification,
+        order_book_semantics=order_book_semantics,
+        instrument=instrument,
+        sequence=sequence,
+        sequence_predecessor=sequence_predecessor,
+        snapshot=snapshot,
+        delta=delta,
+        validate_snapshot=validate_snapshot,
+        snapshot_applier=snapshot_applier,
+        delta_applier=delta_applier,
+        exchange_timestamp=exchange_timestamp,
+        connection_lifecycle_sink=lifecycle_sink,
+        application_heartbeat=application_heartbeat,
+        heartbeat=lambda value: (
+            (isinstance(value, str) and value in {"pong", "ping"})
+            or (isinstance(value, dict) and value.get("channel") == "pong")
+        ),
     )
-    async for message in session.messages():
-        if isinstance(message.normalized_payload, dict):
-            payload = dict(message.normalized_payload)
-            raw_payload = message.payload.decode("utf-8", errors="replace")
-            payload["_collector_source"] = {
-                "raw_payload": raw_payload,
-                "payload_sha256": message.payload_sha256,
-            }
-            payload["_collector_reconciliation"] = {
-                "connection_id": str(message.connection_id),
-                "connection_epoch": message.connection_epoch,
-                "snapshot_sequence": message.snapshot_sequence,
-                "delta_sequence": message.venue_sequence,
-                "reconciliation_state": (
-                    message.reconciliation_state.value
-                    if message.reconciliation_state is not None
-                    else None
-                ),
-            }
-            yield payload
+    try:
+        async for message in session.messages():
+            if isinstance(message.normalized_payload, dict):
+                payload = dict(message.normalized_payload)
+                raw_payload = message.payload.decode("utf-8", errors="replace")
+                payload["_collector_source"] = {
+                    "raw_payload": raw_payload,
+                    "payload_sha256": message.payload_sha256,
+                }
+                payload["_collector_reconciliation"] = {
+                    "connection_id": str(message.connection_id),
+                    "connection_epoch": message.connection_epoch,
+                    "snapshot_sequence": message.snapshot_sequence,
+                    "delta_sequence": message.venue_sequence,
+                    "previous_delta_sequence": message.previous_venue_sequence,
+                    "reconciliation_state": (
+                        message.reconciliation_state.value
+                        if message.reconciliation_state is not None
+                        else None
+                    ),
+                    "stream_semantics": (
+                        message.stream_semantics.value if message.stream_semantics else None
+                    ),
+                    "bootstrap_completed": message.bootstrap_completed,
+                    "recovery_started_at": (
+                        message.recovery_started_at.isoformat()
+                        if message.recovery_started_at
+                        else None
+                    ),
+                    "recovery_completed_at": (
+                        message.recovery_completed_at.isoformat()
+                        if message.recovery_completed_at
+                        else None
+                    ),
+                    "last_recovery_failure": message.last_recovery_failure,
+                }
+                yield payload
+    finally:
+        await session.close()
 
 
 def _orderbook_reconciliation(message: dict[str, Any]) -> dict[str, Any]:
@@ -88,7 +154,13 @@ def _orderbook_reconciliation(message: dict[str, Any]) -> dict[str, Any]:
         "connection_epoch": int(metadata.get("connection_epoch", 0)),
         "snapshot_sequence": metadata.get("snapshot_sequence"),
         "delta_sequence": metadata.get("delta_sequence"),
+        "previous_delta_sequence": metadata.get("previous_delta_sequence"),
         "reconciliation_state": metadata.get("reconciliation_state"),
+        "stream_semantics": metadata.get("stream_semantics"),
+        "bootstrap_completed": bool(metadata.get("bootstrap_completed", False)),
+        "recovery_started_at": metadata.get("recovery_started_at"),
+        "recovery_completed_at": metadata.get("recovery_completed_at"),
+        "last_recovery_failure": metadata.get("last_recovery_failure"),
         **_source_provenance(message),
     }
 
@@ -109,6 +181,10 @@ class PublicRestAdapter(MarketDataAdapter):
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._owned_client = client is None
         self.client = client or httpx.AsyncClient(base_url=self.base_url, timeout=10)
+        self.connection_lifecycle_events: deque[WebSocketConnectionLifecycle] = deque()
+
+    def _record_connection_lifecycle(self, event: WebSocketConnectionLifecycle) -> None:
+        self.connection_lifecycle_events.append(event)
 
     async def close(self) -> None:
         if self._owned_client:
@@ -293,6 +369,7 @@ class BinanceCompatiblePerpAdapter(PublicRestAdapter):
 class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
     venue = "aster"
     base_url = "https://fapi.asterdex.com"
+    order_book_stream_semantics = OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT
     capabilities = VenueCapabilityMatrix(
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
@@ -322,6 +399,19 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
                 url,
                 venue=self.venue,
                 classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+                order_book_semantics=self.order_book_stream_semantics,
+                instrument=symbol,
+                snapshot=lambda value: (
+                    isinstance(value, dict) and {"E", "s", "b", "a"}.issubset(value)
+                ),
+                validate_snapshot=lambda value: (
+                    value.get("s") == symbol
+                    and _valid_exchange_ms(value.get("E"))
+                    and bool(value.get("b"))
+                    and bool(value.get("a"))
+                ),
+                exchange_timestamp=lambda value: _ms(value["E"]),
+                lifecycle_sink=self._record_connection_lifecycle,
             )
         ) as messages:
             async for item in messages:
@@ -360,6 +450,7 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
 class HyperliquidMarketDataAdapter(PublicRestAdapter):
     venue = "hyperliquid"
     base_url = "https://api.hyperliquid.xyz"
+    order_book_stream_semantics = OrderBookStreamSemantics.SNAPSHOT_ONLY
     capabilities = VenueCapabilityMatrix(
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
@@ -650,17 +741,54 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
             cumulative_withdrawals=withdrawals,
         )
 
-    async def _stream(self, subscription: dict[str, object]) -> AsyncIterator[dict[str, Any]]:
+    async def _stream(
+        self,
+        subscription: dict[str, object],
+        *,
+        order_book: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
         request: dict[str, object] = {"method": "subscribe", "subscription": subscription}
+        symbol = str(subscription.get("coin", "SYSTEM"))
         async with aclosing(
-            _websocket_json("wss://api.hyperliquid.xyz/ws", request, venue=self.venue)
+            _websocket_json(
+                "wss://api.hyperliquid.xyz/ws",
+                request,
+                venue=self.venue,
+                classification=(
+                    StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM
+                    if order_book
+                    else StreamClassification.EVENTS
+                ),
+                order_book_semantics=(self.order_book_stream_semantics if order_book else None),
+                instrument=symbol,
+                snapshot=lambda value: (
+                    order_book and isinstance(value, dict) and value.get("channel") == "l2Book"
+                ),
+                validate_snapshot=lambda value: (
+                    not order_book
+                    or (
+                        value.get("channel") == "l2Book"
+                        and value.get("data", {}).get("coin") == symbol
+                        and _valid_exchange_ms(value.get("data", {}).get("time"))
+                        and len(value.get("data", {}).get("levels", [])) == 2
+                        and all(value.get("data", {}).get("levels", []))
+                    )
+                ),
+                exchange_timestamp=lambda value: (
+                    _ms(value["data"]["time"])
+                    if order_book and value.get("channel") == "l2Book"
+                    else None
+                ),
+                lifecycle_sink=self._record_connection_lifecycle,
+                application_heartbeat={"method": "ping"},
+            )
         ) as messages:
             async for message in messages:
                 if message.get("channel") != "subscriptionResponse":
                     yield message
 
     async def stream_order_book(self, symbol: str) -> AsyncIterator[OrderBook]:
-        async for message in self._stream({"type": "l2Book", "coin": symbol}):
+        async for message in self._stream({"type": "l2Book", "coin": symbol}, order_book=True):
             data = message["data"]
             yield OrderBook(
                 exchange=self.venue,
@@ -709,6 +837,7 @@ def _timeframe_ms(timeframe: str) -> int:
 class BitgetMarketDataAdapter(PublicRestAdapter):
     venue = "bitget"
     base_url = "https://api.bitget.com"
+    order_book_stream_semantics = OrderBookStreamSemantics.SNAPSHOT_AND_DELTA
     capabilities = VenueCapabilityMatrix(
         venue=venue,
         detected_at=datetime(2026, 7, 12, tzinfo=UTC),
@@ -881,17 +1010,71 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
         channel: str,
         symbol: str,
         classification: StreamClassification = StreamClassification.EVENTS,
+        order_book_state: tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         request: dict[str, object] = {
             "op": "subscribe",
             "args": [{"instType": "USDT-FUTURES", "channel": channel, "instId": symbol}],
         }
+        bids, asks = order_book_state or ({}, {})
+
+        def first(value: Any) -> dict[str, Any]:
+            data = value.get("data", []) if isinstance(value, dict) else []
+            if not data or not isinstance(data[0], dict):
+                raise ValueError("Bitget order-book payload data is missing")
+            return data[0]
+
+        def apply_levels(target: dict[Decimal, Decimal], levels: Any) -> None:
+            for price_raw, quantity_raw, *_ in levels:
+                price, quantity = _decimal(price_raw), _decimal(quantity_raw)
+                if quantity == 0:
+                    target.pop(price, None)
+                else:
+                    target[price] = quantity
+
+        def apply_snapshot(value: Any) -> int | None:
+            item = first(value)
+            bids.clear()
+            asks.clear()
+            apply_levels(bids, item.get("bids", []))
+            apply_levels(asks, item.get("asks", []))
+            return int(item["seq"])
+
+        def apply_delta(value: Any) -> None:
+            item = first(value)
+            apply_levels(bids, item.get("bids", []))
+            apply_levels(asks, item.get("asks", []))
+
+        order_book = classification == StreamClassification.SNAPSHOT_DELTA
         async with aclosing(
             _websocket_json(
                 "wss://ws.bitget.com/v2/ws/public",
                 request,
                 venue=self.venue,
                 classification=classification,
+                order_book_semantics=(self.order_book_stream_semantics if order_book else None),
+                instrument=symbol,
+                sequence=lambda value: int(first(value)["seq"]) if order_book else None,
+                sequence_predecessor=lambda value: (
+                    int(first(value).get("pseq", 0)) or None if order_book else None
+                ),
+                snapshot=lambda value: order_book and value.get("action") == "snapshot",
+                delta=lambda value: order_book and value.get("action") == "update",
+                validate_snapshot=lambda value: (
+                    not order_book
+                    or (
+                        value.get("arg", {}).get("instId") == symbol
+                        and value.get("action") == "snapshot"
+                        and _valid_exchange_ms(first(value).get("ts"))
+                        and bool(first(value).get("bids"))
+                        and bool(first(value).get("asks"))
+                    )
+                ),
+                snapshot_applier=apply_snapshot if order_book else None,
+                delta_applier=apply_delta if order_book else None,
+                exchange_timestamp=lambda value: _ms(first(value)["ts"]) if order_book else None,
+                lifecycle_sink=self._record_connection_lifecycle,
+                application_heartbeat="ping",
             )
         ) as messages:
             async for message in messages:
@@ -899,23 +1082,30 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
                     yield message
 
     async def stream_order_book(self, symbol: str) -> AsyncIterator[OrderBook]:
+        bids: dict[Decimal, Decimal] = {}
+        asks: dict[Decimal, Decimal] = {}
         async for message in self._stream(
-            "books5", symbol, StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM
+            "books",
+            symbol,
+            StreamClassification.SNAPSHOT_DELTA,
+            (bids, asks),
         ):
-            for data in message["data"]:
-                yield OrderBook(
-                    exchange=self.venue,
-                    symbol=symbol,
-                    timestamp=_ms(data["ts"]),
-                    sequence=int(data.get("seq", 0)) or None,
-                    bids=tuple(
-                        OrderBookLevel(price=row[0], quantity=row[1]) for row in data["bids"]
-                    ),
-                    asks=tuple(
-                        OrderBookLevel(price=row[0], quantity=row[1]) for row in data["asks"]
-                    ),
-                    **_orderbook_reconciliation(message),
-                )
+            data = message["data"][0]
+            yield OrderBook(
+                exchange=self.venue,
+                symbol=symbol,
+                timestamp=_ms(data["ts"]),
+                sequence=int(data.get("seq", 0)) or None,
+                bids=tuple(
+                    OrderBookLevel(price=price, quantity=quantity)
+                    for price, quantity in sorted(bids.items(), reverse=True)
+                ),
+                asks=tuple(
+                    OrderBookLevel(price=price, quantity=quantity)
+                    for price, quantity in sorted(asks.items())
+                ),
+                **_orderbook_reconciliation(message),
+            )
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
         async for message in self._stream("trade", symbol):

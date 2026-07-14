@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
-from app.adapters.exchanges.websocket import ReconciliationState
+from app.adapters.exchanges.websocket import OrderBookStreamSemantics, ReconciliationState
 from app.domain.market_data.models import Market, Side, Trade
 from app.domain.venues.models import CapabilitySupport
 from app.infrastructure.database.models import Base, ResearchArtifactRow
@@ -522,6 +522,172 @@ def test_orderbook_gap_requires_snapshot_recovery_before_synchronized() -> None:
     recovered = repository.get_checkpoint("hyperliquid", key)
     assert recovered is not None and not recovered.recovery_required
     assert recovered.reconciliation_state == ReconciliationState.SYNCHRONIZED
+
+
+def test_bitget_gap_without_snapshot_remains_degraded() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    connection_id = uuid4()
+    snapshot = replace(
+        envelope(stable_event_key="bitget-snapshot"),
+        venue="bitget",
+        canonical_instrument_id="BTC",
+        venue_symbol="BTCUSDT",
+        event_type="orderbook_snapshot",
+        channel="orderbook",
+        connection_id=connection_id,
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        snapshot_sequence=100,
+        connection_epoch=1,
+        stream_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+        bootstrap_completed=True,
+        recovery_completed=True,
+    )
+    consumer.persist(snapshot)
+    consumer.persist(
+        replace(
+            snapshot,
+            stable_event_key="bitget-gap",
+            event_type="orderbook_delta",
+            sequence=110,
+            delta_sequence=110,
+            previous_delta_sequence=99,
+        )
+    )
+    checkpoint = repository.get_checkpoint("bitget", "bitget:orderbook:BTCUSDT:orderbook")
+    assert checkpoint is not None
+    assert checkpoint.reconciliation_state == ReconciliationState.DEGRADED
+    assert checkpoint.recovery_required
+
+
+def test_old_epoch_orderbook_delta_is_rejected() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="bitget",
+            stream_key="bitget:orderbook:BTCUSDT:orderbook",
+            connection_id=uuid4(),
+            last_sequence=200,
+            last_event_id="current",
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTCUSDT",
+            event_type="orderbook",
+            channel="orderbook",
+            snapshot_sequence=190,
+            delta_sequence=200,
+            connection_epoch=4,
+            recovery_required=False,
+            bootstrap_completed=True,
+        )
+    )
+    consumer.persist(
+        replace(
+            envelope(stable_event_key="old-epoch"),
+            venue="bitget",
+            canonical_instrument_id="BTC",
+            venue_symbol="BTCUSDT",
+            event_type="orderbook_delta",
+            channel="orderbook",
+            connection_id=uuid4(),
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            sequence=201,
+            delta_sequence=201,
+            previous_delta_sequence=200,
+            connection_epoch=3,
+            stream_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+            bootstrap_completed=True,
+            recovery_completed=True,
+        )
+    )
+    checkpoint = repository.get_checkpoint("bitget", "bitget:orderbook:BTCUSDT:orderbook")
+    assert checkpoint is not None and checkpoint.last_event_id == "current"
+    assert any("old connection epoch" in reason for _, reason, _ in repository.quarantined)
+
+
+def test_hyperliquid_snapshot_recovery_clears_requirement_without_sequence() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="hyperliquid",
+            stream_key="hyperliquid:orderbook:BTC:orderbook",
+            connection_id=uuid4(),
+            last_sequence=None,
+            last_event_id="disconnect",
+            reconciliation_state=ReconciliationState.DISCONNECTED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type="orderbook",
+            channel="orderbook",
+            connection_epoch=2,
+            recovery_required=True,
+            recovery_started_at=BASE,
+        )
+    )
+    completed = BASE + timedelta(seconds=1)
+    consumer.persist(
+        replace(
+            envelope(stable_event_key="hl-new-snapshot"),
+            event_type="orderbook_snapshot",
+            channel="orderbook",
+            connection_id=uuid4(),
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            connection_epoch=3,
+            stream_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+            bootstrap_completed=True,
+            recovery_completed=True,
+            recovery_started_at=BASE,
+            recovery_completed_at=completed,
+        )
+    )
+    checkpoint = repository.get_checkpoint("hyperliquid", "hyperliquid:orderbook:BTC:orderbook")
+    assert checkpoint is not None
+    assert checkpoint.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    assert not checkpoint.recovery_required
+    assert checkpoint.bootstrap_completed
+    assert checkpoint.snapshot_sequence is None
+    assert checkpoint.recovery_completed_at == completed
+
+
+def test_shutdown_disconnect_is_not_a_recovery_failure() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    key = "hyperliquid:orderbook:BTC:orderbook"
+    current = CollectionCheckpoint(
+        venue="hyperliquid",
+        stream_key=key,
+        connection_id=uuid4(),
+        last_sequence=None,
+        last_event_id="book",
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        checkpointed_at=BASE,
+        canonical_instrument_id="BTC",
+        venue_symbol="BTC",
+        event_type="orderbook",
+        channel="orderbook",
+        connection_epoch=1,
+        recovery_required=False,
+        bootstrap_completed=True,
+    )
+    repository.save_checkpoint(current)
+    payload = json.dumps({"client_initiated_close": True, "reason": "client_shutdown"})
+    consumer.persist(
+        replace(
+            envelope(raw_payload=payload, stable_event_key="shutdown"),
+            event_type="websocket_disconnect",
+            channel="control",
+            logical_stream_event_type="orderbook",
+            connection_id=current.connection_id,
+            connection_epoch=1,
+        )
+    )
+    checkpoint = repository.get_checkpoint("hyperliquid", key)
+    assert checkpoint == current
+    assert consumer.metrics.disconnect_count == 0
 
 
 def test_unsynchronized_book_is_excluded_and_control_only_snapshot_is_not_eligible() -> None:

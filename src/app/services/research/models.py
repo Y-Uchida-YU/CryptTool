@@ -228,6 +228,10 @@ class CollectionCheckpoint:
     delta_sequence: int | None = None
     connection_epoch: int = 0
     recovery_required: bool = False
+    bootstrap_completed: bool = False
+    recovery_started_at: datetime | None = None
+    recovery_completed_at: datetime | None = None
+    last_recovery_failure: str | None = None
     checkpoint_namespace: str = "production"
 
     def __post_init__(self) -> None:

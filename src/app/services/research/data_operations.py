@@ -20,7 +20,11 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from app.adapters.exchanges.base import CapabilityUnavailableError, MarketDataAdapter
-from app.adapters.exchanges.websocket import ReconciliationState
+from app.adapters.exchanges.websocket import (
+    OrderBookStreamSemantics,
+    ReconciliationState,
+    WebSocketConnectionLifecycle,
+)
 from app.domain.venues.models import CapabilitySupport
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.services.research.models import (
@@ -148,12 +152,21 @@ class CollectedEnvelope:
     trade_id: str | None = None
     snapshot_sequence: int | None = None
     delta_sequence: int | None = None
+    previous_delta_sequence: int | None = None
     connection_epoch: int = 0
     recovery_completed: bool = False
+    stream_semantics: OrderBookStreamSemantics | None = None
+    bootstrap_completed: bool = False
+    recovery_started_at: datetime | None = None
+    recovery_completed_at: datetime | None = None
+    last_recovery_failure: str | None = None
+    logical_stream_event_type: str | None = None
 
     @property
     def stream_identity(self) -> ResearchStreamIdentity:
-        logical_type = "orderbook" if self.event_type in BOOK_EVENT_TYPES else self.event_type
+        logical_type = self.logical_stream_event_type or (
+            "orderbook" if self.event_type in BOOK_EVENT_TYPES else self.event_type
+        )
         return ResearchStreamIdentity(
             self.venue,
             self.canonical_instrument_id,
@@ -316,16 +329,6 @@ class PublicAdapterCollectorSource:
             iterator: AsyncIterator[Any] = self.adapter.stream_trades(identity.venue_symbol)
             raw_type = "trade"
         elif identity.event_type == "orderbook":
-            async with self._http_lock:
-                snapshot = await self.adapter.fetch_order_book(identity.venue_symbol, depth=50)
-            yield self._envelope(
-                identity,
-                snapshot,
-                event_type="orderbook_snapshot",
-                reconciliation_state=ReconciliationState.SNAPSHOT_LOADING,
-                snapshot_sequence=getattr(snapshot, "sequence", None),
-                connection_epoch=connection_epoch,
-            )
             iterator = self.adapter.stream_order_book(identity.venue_symbol)
             raw_type = "orderbook_delta"
         elif identity.event_type in {"mark_price", "index_price"}:
@@ -337,11 +340,22 @@ class PublicAdapterCollectorSource:
             async for value in iterator:
                 if shutdown.is_set():
                     break
+                for lifecycle_event in self._drain_connection_lifecycle(identity):
+                    yield self._connection_lifecycle_envelope(
+                        identity, lifecycle_event, connection_epoch
+                    )
                 raw_state = getattr(value, "reconciliation_state", None)
                 state = ReconciliationState(raw_state) if raw_state is not None else None
                 venue_sequence = getattr(value, "sequence", None)
                 snapshot_sequence = getattr(value, "snapshot_sequence", None)
-                self_contained_snapshot = snapshot_sequence is None
+                semantics_raw = getattr(value, "stream_semantics", None)
+                semantics = (
+                    OrderBookStreamSemantics(semantics_raw) if semantics_raw is not None else None
+                )
+                self_contained_snapshot = semantics in {
+                    OrderBookStreamSemantics.SNAPSHOT_ONLY,
+                    OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT,
+                }
                 yield self._envelope(
                     identity,
                     value,
@@ -351,18 +365,45 @@ class PublicAdapterCollectorSource:
                         else raw_type
                     ),
                     reconciliation_state=state,
-                    snapshot_sequence=(
-                        venue_sequence if self_contained_snapshot else snapshot_sequence
-                    ),
+                    snapshot_sequence=(None if self_contained_snapshot else snapshot_sequence),
                     delta_sequence=None if self_contained_snapshot else venue_sequence,
+                    previous_delta_sequence=(
+                        None
+                        if self_contained_snapshot
+                        else getattr(value, "previous_delta_sequence", None)
+                    ),
                     connection_id=getattr(value, "connection_id", None),
-                    connection_epoch=max(connection_epoch, getattr(value, "connection_epoch", 0)),
-                    recovery_completed=state == ReconciliationState.SYNCHRONIZED,
+                    connection_epoch=(
+                        connection_epoch - 1 + max(1, getattr(value, "connection_epoch", 0))
+                    ),
+                    recovery_completed=bool(getattr(value, "bootstrap_completed", False))
+                    and state == ReconciliationState.SYNCHRONIZED,
+                    stream_semantics=semantics,
+                    bootstrap_completed=bool(getattr(value, "bootstrap_completed", False)),
+                    recovery_started_at=getattr(value, "recovery_started_at", None),
+                    recovery_completed_at=getattr(value, "recovery_completed_at", None),
+                    last_recovery_failure=getattr(value, "last_recovery_failure", None),
                 )
         finally:
             close = getattr(iterator, "aclose", None)
             if close is not None:
                 await close()
+
+    def _drain_connection_lifecycle(
+        self,
+        identity: ResearchStreamIdentity,
+    ) -> tuple[WebSocketConnectionLifecycle, ...]:
+        queue = getattr(self.adapter, "connection_lifecycle_events", None)
+        if queue is None:
+            return ()
+        matched: list[WebSocketConnectionLifecycle] = []
+        for _ in range(len(queue)):
+            event = queue.popleft()
+            if event.instrument == identity.venue_symbol:
+                matched.append(event)
+            else:
+                queue.append(event)
+        return tuple(matched)
 
     def _envelope(
         self,
@@ -373,9 +414,15 @@ class PublicAdapterCollectorSource:
         reconciliation_state: ReconciliationState | None = None,
         snapshot_sequence: int | None = None,
         delta_sequence: int | None = None,
+        previous_delta_sequence: int | None = None,
         connection_id: UUID | None = None,
         connection_epoch: int = 0,
         recovery_completed: bool = False,
+        stream_semantics: OrderBookStreamSemantics | None = None,
+        bootstrap_completed: bool = False,
+        recovery_started_at: datetime | None = None,
+        recovery_completed_at: datetime | None = None,
+        last_recovery_failure: str | None = None,
         use_captured_response: bool = False,
     ) -> CollectedEnvelope:
         now = datetime.now(UTC)
@@ -413,8 +460,66 @@ class PublicAdapterCollectorSource:
             reconciliation_state=reconciliation_state,
             snapshot_sequence=snapshot_sequence,
             delta_sequence=delta_sequence,
+            previous_delta_sequence=previous_delta_sequence,
             connection_epoch=connection_epoch,
             recovery_completed=recovery_completed,
+            stream_semantics=stream_semantics,
+            bootstrap_completed=bootstrap_completed,
+            recovery_started_at=recovery_started_at,
+            recovery_completed_at=recovery_completed_at,
+            last_recovery_failure=last_recovery_failure,
+        )
+
+    @staticmethod
+    def _connection_lifecycle_envelope(
+        identity: ResearchStreamIdentity,
+        event: WebSocketConnectionLifecycle,
+        base_connection_epoch: int,
+    ) -> CollectedEnvelope:
+        persisted_epoch = base_connection_epoch - 1 + event.connection_epoch
+        payload = json.dumps(
+            {
+                "channel": identity.channel,
+                "close_code": event.close_code,
+                "close_message": event.close_message,
+                "connected_at": event.connected_at.isoformat(),
+                "connection_epoch": persisted_epoch,
+                "connection_id": str(event.connection_id),
+                "disconnected_at": event.disconnected_at.isoformat(),
+                "duration_ms": event.duration_ms,
+                "exception_type": event.exception_type,
+                "heartbeat_received": event.heartbeat_received,
+                "heartbeat_sent": event.heartbeat_sent,
+                "messages_received": event.messages_received,
+                "reason": event.reason,
+                "server_initiated_close": event.server_initiated_close,
+                "client_initiated_close": event.client_initiated_close,
+                "stale_timeout": event.stale_timeout,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return CollectedEnvelope(
+            venue=identity.venue,
+            canonical_instrument_id=identity.canonical_instrument_id,
+            venue_symbol=identity.venue_symbol,
+            event_type="websocket_disconnect",
+            channel="control",
+            source_endpoint=f"websocket:{identity.channel}",
+            raw_payload=payload,
+            normalized_payload=payload,
+            exchange_timestamp=None,
+            received_at=event.disconnected_at,
+            available_at=event.disconnected_at,
+            stable_event_key=(
+                f"disconnect-{event.connection_id}-{event.connection_epoch}-"
+                f"{event.disconnected_at.isoformat()}"
+            ),
+            connection_id=event.connection_id,
+            connection_epoch=persisted_epoch,
+            logical_stream_event_type=identity.event_type,
+            recovery_started_at=event.disconnected_at,
+            last_recovery_failure=event.reason,
         )
 
     async def instrument_rules(
@@ -571,6 +676,36 @@ class CheckpointWriter:
                 previous.connection_epoch if previous else 0,
             ),
             recovery_required=recovery_required,
+            bootstrap_completed=(
+                envelope.bootstrap_completed
+                if envelope.event_type in BOOK_EVENT_TYPES
+                else previous.bootstrap_completed
+                if previous
+                else False
+            ),
+            recovery_started_at=(
+                envelope.recovery_started_at
+                if envelope.recovery_started_at is not None
+                else previous.recovery_started_at
+                if previous
+                else None
+            ),
+            recovery_completed_at=(
+                envelope.recovery_completed_at
+                if envelope.recovery_completed_at is not None
+                else previous.recovery_completed_at
+                if previous
+                else None
+            ),
+            last_recovery_failure=(
+                envelope.last_recovery_failure
+                if envelope.last_recovery_failure is not None
+                else None
+                if envelope.bootstrap_completed
+                else previous.last_recovery_failure
+                if previous
+                else None
+            ),
         )
         self.repository.save_checkpoint(checkpoint)
         return checkpoint
@@ -762,6 +897,20 @@ class RawPersistenceConsumer:
             received_at=event.received_at,
         )
         self.metrics.events[(event.venue, event.event_type, event.canonical_instrument_id)] += 1
+        if (
+            envelope.event_type in BOOK_EVENT_TYPES
+            and checkpoint is not None
+            and (
+                envelope.connection_epoch < checkpoint.connection_epoch
+                or (
+                    envelope.connection_epoch == checkpoint.connection_epoch
+                    and envelope.connection_id is not None
+                    and envelope.connection_id != checkpoint.connection_id
+                )
+            )
+        ):
+            self._quarantine(event, "order-book event belongs to an old connection epoch")
+            return
         invalid = self._invalid_reason(event)
         if not decision.production_eligible:
             if self.repository.add_experimental_event(event, decision.support.value):
@@ -779,18 +928,7 @@ class RawPersistenceConsumer:
                 )
             )
             prior_recovery = bool(checkpoint and checkpoint.recovery_required)
-            recovery_completed = (
-                envelope.recovery_completed
-                and state == ReconciliationState.SYNCHRONIZED
-                and envelope.snapshot_sequence is not None
-                and (
-                    envelope.event_type == "orderbook_snapshot"
-                    or (
-                        envelope.delta_sequence is not None
-                        and envelope.delta_sequence >= envelope.snapshot_sequence
-                    )
-                )
-            )
+            recovery_completed = self._recovery_completed(envelope, state)
             recovery_required = gap or (
                 envelope.event_type in BOOK_EVENT_TYPES
                 and (
@@ -824,6 +962,22 @@ class RawPersistenceConsumer:
         if envelope.event_type in BOOK_EVENT_TYPES:
             self._persist_book(event, envelope, checkpoint)
             return
+        if (
+            envelope.event_type == "websocket_disconnect"
+            and envelope.logical_stream_event_type == "orderbook"
+        ):
+            self._persist_raw(event)
+            payload = event.payload()
+            if not bool(payload.get("client_initiated_close")):
+                self.checkpoint_writer.write(
+                    envelope=envelope,
+                    event_id=event.event_id,
+                    state=ReconciliationState.DISCONNECTED,
+                    recovery_required=True,
+                )
+                self.metrics.disconnect_count += 1
+                self.metrics.reconnect_count += 1
+            return
         if self._sequence_gap(checkpoint, envelope):
             self._persist_raw(event)
             self._quarantine(event, "sequence gap: snapshot recovery required")
@@ -854,18 +1008,8 @@ class RawPersistenceConsumer:
         checkpoint: CollectionCheckpoint | None,
     ) -> None:
         recovery_required = bool(checkpoint and checkpoint.recovery_required)
-        recovered = (
-            recovery_required
-            and envelope.recovery_completed
-            and envelope.reconciliation_state == ReconciliationState.SYNCHRONIZED
-            and envelope.snapshot_sequence is not None
-            and (
-                envelope.event_type == "orderbook_snapshot"
-                or (
-                    envelope.delta_sequence is not None
-                    and envelope.delta_sequence >= envelope.snapshot_sequence
-                )
-            )
+        recovered = recovery_required and self._recovery_completed(
+            envelope, envelope.reconciliation_state
         )
         if (
             envelope.event_type == "orderbook_delta"
@@ -991,14 +1135,50 @@ class RawPersistenceConsumer:
 
     @staticmethod
     def _sequence_gap(checkpoint: CollectionCheckpoint | None, envelope: CollectedEnvelope) -> bool:
+        if envelope.event_type != "orderbook_delta" and envelope.stream_semantics is not None:
+            return False
+        if envelope.stream_semantics in {
+            OrderBookStreamSemantics.SNAPSHOT_ONLY,
+            OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT,
+        }:
+            return False
         current = (
             envelope.delta_sequence if envelope.delta_sequence is not None else envelope.sequence
         )
+        if envelope.previous_delta_sequence is not None:
+            previous = checkpoint.delta_sequence if checkpoint else None
+            if previous is None and checkpoint is not None:
+                previous = checkpoint.snapshot_sequence
+            return previous is not None and envelope.previous_delta_sequence != previous
         return (
             checkpoint is not None
             and checkpoint.last_sequence is not None
             and current is not None
             and current != checkpoint.last_sequence + 1
+        )
+
+    @staticmethod
+    def _recovery_completed(
+        envelope: CollectedEnvelope,
+        state: ReconciliationState | None,
+    ) -> bool:
+        if (
+            not envelope.recovery_completed
+            or state != ReconciliationState.SYNCHRONIZED
+            or (envelope.stream_semantics is not None and not envelope.bootstrap_completed)
+        ):
+            return False
+        if envelope.stream_semantics in {
+            OrderBookStreamSemantics.SNAPSHOT_ONLY,
+            OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT,
+        }:
+            return envelope.event_type == "orderbook_snapshot"
+        return envelope.snapshot_sequence is not None and (
+            envelope.event_type == "orderbook_snapshot"
+            or (
+                envelope.delta_sequence is not None
+                and envelope.delta_sequence >= envelope.snapshot_sequence
+            )
         )
 
     def _persist_raw(self, event: RawMarketEvent) -> None:

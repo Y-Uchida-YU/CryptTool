@@ -9,6 +9,7 @@ import pytest
 from app.adapters.exchanges.websocket import (
     ConnectionReconciliationContext,
     ConnectionState,
+    OrderBookStreamSemantics,
     ReconciliationState,
     ResilientWebSocketSession,
     StreamClassification,
@@ -418,6 +419,130 @@ def test_default_heartbeat_accepts_mapping_messages_without_hashing_them() -> No
     value = session()
     assert not value.heartbeat({"channel": "trades", "data": []})
     assert value.heartbeat("ping")
+
+
+@pytest.mark.asyncio
+async def test_bitget_initial_snapshot_and_delta_synchronize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = FakeSocket(
+        [
+            json.dumps({"ok": True}),
+            json.dumps({"kind": "snapshot", "seq": 100, "pseq": 0, "ts": 1}),
+            json.dumps({"kind": "delta", "seq": 105, "pseq": 100, "ts": 2}),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect", lambda *a, **k: FakeConnect(socket)
+    )
+    applied: list[tuple[str, int]] = []
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+        sequence_predecessor=lambda item: int(item.get("pseq", 0)) or None,
+        validate_snapshot=lambda item: item.get("kind") == "snapshot" and item.get("ts", 0) > 0,
+        snapshot_applier=lambda item: applied.append(("snapshot", item["seq"])) or item["seq"],
+        delta_applier=lambda item: applied.append(("delta", item["seq"])),
+    )
+    stream = value.messages()
+    snapshot = await anext(stream)
+    delta = await anext(stream)
+    assert snapshot.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    assert delta.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    assert applied == [("snapshot", 100), ("delta", 105)]
+    assert value.connection_context is not None and value.connection_context.bootstrap_completed
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_snapshot_only_synchronizes_without_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = FakeSocket(
+        [
+            json.dumps({"ok": True}),
+            json.dumps({"kind": "snapshot", "ts": 1, "levels": [[1], [2]]}),
+            json.dumps({"kind": "snapshot", "ts": 2, "levels": [[1], [2]]}),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect", lambda *a, **k: FakeConnect(socket)
+    )
+    value = session(
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+        classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+        validate_snapshot=lambda item: len(item.get("levels", [])) == 2,
+    )
+    stream = value.messages()
+    first = await anext(stream)
+    second = await anext(stream)
+    assert first.venue_sequence is None and second.venue_sequence is None
+    assert first.bootstrap_completed and second.bootstrap_completed
+    assert value.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    await stream.aclose()
+
+
+def test_hyperliquid_invalid_snapshot_remains_degraded() -> None:
+    value = session(
+        subscribe=None,
+        acknowledgement=None,
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+        classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+        validate_snapshot=lambda item: bool(item.get("levels")),
+    )
+    current = context()
+    with pytest.raises(RuntimeError, match="contract validation"):
+        value._apply_stream_snapshot(current, {"kind": "snapshot", "levels": []}, None)
+    assert current.state == ReconciliationState.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_forced_disconnect_recovers_three_times_and_keeps_iterator_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sockets = iter(
+        [
+            FakeSocket(
+                [
+                    json.dumps({"ok": True}),
+                    json.dumps({"kind": "snapshot", "ts": number}),
+                    OSError(f"forced-{number}"),
+                ]
+            )
+            for number in (1, 2, 3)
+        ]
+        + [
+            FakeSocket(
+                [
+                    json.dumps({"ok": True}),
+                    json.dumps({"kind": "snapshot", "ts": 4}),
+                    json.dumps({"kind": "snapshot", "ts": 5}),
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect",
+        lambda *a, **k: FakeConnect(next(sockets)),
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.secrets.SystemRandom.uniform", lambda *args: 0
+    )
+    lifecycle: list[object] = []
+    value = session(
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+        classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+        validate_snapshot=lambda item: item.get("ts", 0) > 0,
+        connection_lifecycle_sink=lifecycle.append,
+        maximum_reconnects_per_minute=10,
+    )
+    stream = value.messages()
+    received = [await anext(stream) for _ in range(5)]
+    assert [item.connection_epoch for item in received] == [1, 2, 3, 4, 4]
+    assert len(lifecycle) == 3
+    assert value.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    assert value.connection_context is not None and value.connection_context.bootstrap_completed
+    await stream.aclose()
 
 
 def active_reader_tasks() -> list[asyncio.Task[object]]:
