@@ -368,6 +368,7 @@ class RestartResult:
 class ResourceUsageSample:
     iteration: int
     memory_bytes: int
+    memory_peak_bytes: int
     task_count: int
     open_db_connections: int
     queue_depth: int
@@ -869,22 +870,19 @@ async def run_start_stop_resource_test(
         value = cycle(iteration)
         if hasattr(value, "__await__"):
             await value
-        current, _ = tracemalloc.get_traced_memory()
+        current, peak = tracemalloc.get_traced_memory()
         samples.append(
             ResourceUsageSample(
                 iteration + 1,
                 current,
+                peak,
                 len([task for task in asyncio.all_tasks() if not task.done()]),
                 database_connections() if database_connections else 0,
                 0,
                 _file_descriptor_count(),
             )
         )
-    _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    if samples:
-        last = samples[-1]
-        samples[-1] = replace(last, memory_bytes=max(last.memory_bytes, peak))
     leak = _unbounded_growth(samples)
     return tuple(samples), leak
 

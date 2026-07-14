@@ -1,6 +1,6 @@
 {
   "commit_sha": "d96567d099b379d9b15a3f7f0bac72dea3f671fe",
-  "created_at": "2026-07-14T05:22:13.395012+00:00",
+  "created_at": "2026-07-14T05:25:25.816182+00:00",
   "files": {
     "fault-results.csv": {
       "bytes": 1637,
@@ -8,15 +8,15 @@
     },
     "metrics.json": {
       "bytes": 1690864,
-      "sha256": "b2d215096b982af7155bf3ee625534823ad0a4ed224e36ec0fec60a0afd05c02"
+      "sha256": "8d23add4453342f0a6766a2cb4cec9f09aba09c56be6d04253dd08b4c0899602"
     },
     "research-run-summary.json": {
       "bytes": 71,
       "sha256": "69d3b5a8f21f6cc8331e7a05e2dbcfb3f5715b1540bbd26e13b8e0887c075217"
     },
     "resource-usage.csv": {
-      "bytes": 1865,
-      "sha256": "f5ba5bca36e6f6c6ef2304cb9a475ff6713fa9dd837d136f905ffd0f266f1cb4"
+      "bytes": 2582,
+      "sha256": "904790bda581e6cae4935a37bae7f52b8aefb3db3243a022497fe9cca441a7e6"
     },
     "restart-results.csv": {
       "bytes": 281,
@@ -24,12 +24,12 @@
     },
     "snapshot-verification.json": {
       "bytes": 161,
-      "sha256": "5c1ce8859349ebf14cc88cd776b8c29c6cc8887787b454f24376b12e3b3325bc"
+      "sha256": "d9791c4ffa440c6c6040221455d4ed23e007e2adab52b01e9d34b2d2f318639e"
     },
     "summary.md": {
       "bytes": 366,
-      "sha256": "0f0f64c236df37a0d2b2f615196eafe2e7c6e79a5b049d1bb99577a3ee052990"
+      "sha256": "44494cfea57ba40564f036be6acf4c7c68ef3ce21c68d27662d42230cd2b2508"
     }
   },
-  "run_id": "accelerated-20260714T052213Z-d96567d0"
+  "run_id": "accelerated-20260714T052525Z-d96567d0"
 }
