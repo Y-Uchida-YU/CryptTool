@@ -1,6 +1,6 @@
 """Persist order-book bootstrap and recovery evidence.
 
-Revision ID: 0012_orderbook_recovery_checkpoint
+Revision ID: 0012_orderbook_recovery
 Revises: 0011_collector_pid_identity
 """
 
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0012_orderbook_recovery_checkpoint"
+revision: str = "0012_orderbook_recovery"
 down_revision: str | None = "0011_collector_pid_identity"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

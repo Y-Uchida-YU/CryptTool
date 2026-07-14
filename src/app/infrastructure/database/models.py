@@ -154,7 +154,10 @@ class MarketDataCheckpointRow(Base):
     __tablename__ = "market_data_checkpoints"
     __table_args__ = (
         UniqueConstraint("venue", "stream_key"),
-        Index("ix_market_data_checkpoints_namespace", "checkpoint_namespace"),
+        Index(
+            "ix_market_data_checkpoints_checkpoint_namespace",
+            "checkpoint_namespace",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     venue: Mapped[str] = mapped_column(String(40), index=True)

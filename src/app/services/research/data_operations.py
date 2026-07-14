@@ -355,7 +355,7 @@ class PublicAdapterCollectorSource:
                 self_contained_snapshot = semantics in {
                     OrderBookStreamSemantics.SNAPSHOT_ONLY,
                     OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT,
-                }
+                } or (semantics is None and snapshot_sequence is None)
                 yield self._envelope(
                     identity,
                     value,
