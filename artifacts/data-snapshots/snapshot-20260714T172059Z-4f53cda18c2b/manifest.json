@@ -1,0 +1,18 @@
+{
+  "content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "cutoff_at": "2026-07-14 17:20:59.485507+00:00",
+  "degraded_event_ids": [],
+  "eligibility_reasons": [
+    "production market event count below threshold",
+    "missing required event types: funding_current,funding_history,index_price,mark_price,ohlcv,open_interest,orderbook_delta,orderbook_snapshot,trade",
+    "missing required venues: bitget,hyperliquid"
+  ],
+  "eligibility_status": "FINALIZED_NOT_ELIGIBLE",
+  "events": [],
+  "finalized_at": "2026-07-14 17:20:59.485561+00:00",
+  "manifest_sha256": "14b0526bb6f1d88e945c475ec88ec594e2f15dbb2ca659f55b78bca610205968",
+  "outage_event_ids": [],
+  "quarantine_count": 0,
+  "quarantine_reasons": [],
+  "snapshot_id": "snapshot-20260714T172059Z-4f53cda18c2b"
+}
