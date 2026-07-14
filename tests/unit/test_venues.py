@@ -10,6 +10,7 @@ from app.adapters.exchanges.public import (
     BitgetMarketDataAdapter,
     HyperliquidMarketDataAdapter,
     MexcMarketDataAdapter,
+    _valid_exchange_ms,
 )
 from app.adapters.exchanges.staged_execution import (
     AsterExecutionAdapter,
@@ -477,3 +478,11 @@ def test_orderbook_stream_semantics_are_explicit_per_venue() -> None:
         AsterMarketDataAdapter.order_book_stream_semantics
         == OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT
     )
+
+
+def test_orderbook_snapshot_timestamp_validation_rejects_invalid_and_future_values() -> None:
+    assert _valid_exchange_ms(int(NOW.timestamp() * 1000))
+    assert not _valid_exchange_ms("not-a-timestamp")
+    future = datetime.now(UTC) + timedelta(days=1)
+    assert not _valid_exchange_ms(int(future.timestamp() * 1000))
+    assert not _valid_exchange_ms(0)

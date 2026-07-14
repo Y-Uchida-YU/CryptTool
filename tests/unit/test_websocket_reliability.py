@@ -545,6 +545,97 @@ async def test_forced_disconnect_recovers_three_times_and_keeps_iterator_open(
     await stream.aclose()
 
 
+@pytest.mark.asyncio
+async def test_delta_before_stream_snapshot_is_buffered_and_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = FakeSocket(
+        [
+            json.dumps({"ok": True}),
+            json.dumps({"kind": "delta", "seq": 105, "pseq": 100}),
+            json.dumps({"kind": "snapshot", "seq": 100}),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect", lambda *a, **k: FakeConnect(socket)
+    )
+    applied: list[tuple[str, int]] = []
+    value = session(
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+        sequence_predecessor=lambda item: item.get("pseq"),
+        snapshot_applier=lambda item: applied.append(("snapshot", item["seq"])) or item["seq"],
+        delta_applier=lambda item: applied.append(("delta", item["seq"])),
+    )
+    stream = value.messages()
+    item = await anext(stream)
+    assert item.venue_sequence == 100
+    assert applied == [("snapshot", 100), ("delta", 105)]
+    assert value.connection_context is not None and not value.connection_context.buffered_deltas
+    await stream.aclose()
+
+
+def test_snapshot_delta_requires_sequence_and_continuity_helpers() -> None:
+    value = session(
+        subscribe=None,
+        acknowledgement=None,
+        classification=StreamClassification.SNAPSHOT_DELTA,
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+        snapshot_applier=lambda item: None,
+        delta_applier=lambda item: None,
+    )
+    current = context()
+    with pytest.raises(RuntimeError, match="snapshot sequence"):
+        value._apply_stream_snapshot(current, {"kind": "snapshot"}, None)
+    assert current.state == ReconciliationState.DEGRADED
+    assert not value._is_contiguous(context(), None, {})
+    current.previous_sequence = 10
+    assert value._is_contiguous(current, 11, {"seq": 11})
+    assert not value._is_contiguous(current, 12, {"seq": 12})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", ["ping", {"method": "ping"}])
+async def test_application_heartbeat_sender_records_each_send(payload: object) -> None:
+    socket = FakeSocket([])
+    sent = [0]
+    value = session(
+        subscribe=None,
+        acknowledgement=None,
+        application_heartbeat=payload,
+        heartbeat_interval=0.001,
+    )
+    task = asyncio.create_task(value._heartbeat_sender(socket, sent))
+    await asyncio.sleep(0.004)
+    await value.close()
+    await task
+    assert sent[0] >= 1
+    assert len(socket.sent) == sent[0]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_task_is_reaped_on_snapshot_stream_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = FakeSocket([json.dumps({"ok": True}), json.dumps({"kind": "snapshot", "ts": 1})])
+    monkeypatch.setattr(
+        "app.adapters.exchanges.websocket.websockets.connect", lambda *a, **k: FakeConnect(socket)
+    )
+    lifecycle: list[object] = []
+    value = session(
+        order_book_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+        classification=StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM,
+        application_heartbeat="ping",
+        heartbeat_interval=10,
+        connection_lifecycle_sink=lifecycle.append,
+    )
+    stream = value.messages()
+    assert (await anext(stream)).bootstrap_completed
+    await stream.aclose()
+    assert len(lifecycle) == 1
+    assert lifecycle[0].client_initiated_close  # type: ignore[union-attr]
+
+
 def active_reader_tasks() -> list[asyncio.Task[object]]:
     return [
         task

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
-from app.adapters.exchanges.websocket import OrderBookStreamSemantics, ReconciliationState
+from app.adapters.exchanges.websocket import (
+    OrderBookStreamSemantics,
+    ReconciliationState,
+    WebSocketConnectionLifecycle,
+)
 from app.domain.market_data.models import Market, Side, Trade
 from app.domain.venues.models import CapabilitySupport
 from app.infrastructure.database.models import Base, ResearchArtifactRow
@@ -747,6 +752,52 @@ def test_websocket_raw_frame_is_preserved_separately_from_normalized_event() -> 
     assert collected.raw_payload == raw_frame
     assert collected.normalized_payload is not None
     assert "source_raw_payload" not in collected.normalized_payload
+
+
+def test_connection_lifecycle_is_filtered_and_persisted_with_recovery_identity() -> None:
+    matching = WebSocketConnectionLifecycle(
+        venue="hyperliquid",
+        instrument="BTC",
+        connection_id=uuid4(),
+        connection_epoch=2,
+        connected_at=BASE,
+        disconnected_at=BASE + timedelta(seconds=3),
+        duration_ms=3000,
+        reason="forced_disconnect",
+        close_code=1001,
+        close_message="validation",
+        exception_type="ConnectionClosed",
+        messages_received=42,
+        heartbeat_sent=1,
+        heartbeat_received=1,
+        stale_timeout=False,
+        server_initiated_close=True,
+        client_initiated_close=False,
+    )
+    other = replace(matching, instrument="ETH", connection_id=uuid4())
+
+    class LifecycleAdapter:
+        client = None
+
+        def __init__(self) -> None:
+            self.connection_lifecycle_events = deque((other, matching))
+
+    source = PublicAdapterCollectorSource(
+        LifecycleAdapter(),
+        "hyperliquid",  # type: ignore[arg-type]
+    )
+    identity = ResearchStreamIdentity("hyperliquid", "BTC", "BTC", "orderbook", "orderbook")
+    assert source._drain_connection_lifecycle(identity) == (matching,)
+    assert tuple(source.adapter.connection_lifecycle_events) == (other,)  # type: ignore[attr-defined]
+    collected = source._connection_lifecycle_envelope(identity, matching, 8)
+    payload = json.loads(collected.raw_payload)
+    assert collected.event_type == "websocket_disconnect"
+    assert collected.logical_stream_event_type == "orderbook"
+    assert collected.connection_epoch == 9
+    assert collected.recovery_started_at == matching.disconnected_at
+    assert payload["reason"] == "forced_disconnect"
+    assert payload["messages_received"] == 42
+    assert payload["heartbeat_sent"] == payload["heartbeat_received"] == 1
 
 
 @pytest.mark.asyncio
