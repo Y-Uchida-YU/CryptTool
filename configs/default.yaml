@@ -1,4 +1,6 @@
 # YAML reference configuration. Runtime environment variables use the APP_ prefix.
+database_url: sqlite+pysqlite:///cryptbot.db
+production_database_url: null
 symbols: [BTC, ETH, SOL]
 timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
 paper_trading: true

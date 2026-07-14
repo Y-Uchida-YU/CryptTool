@@ -1,4 +1,5 @@
 database_url: sqlite+pysqlite:///accelerated-validation.db
+production_database_url: sqlite+pysqlite:///cryptbot.db
 paper_trading: true
 live_trading: false
 dry_run: true

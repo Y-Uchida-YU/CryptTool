@@ -4,8 +4,11 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import signal
 import socket
+import subprocess  # nosec B404
+import tempfile
 import time
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
@@ -542,6 +545,7 @@ async def _run_accelerated_validation(
 ) -> Path:
     if settings.live_trading or settings.live.enabled:
         raise typer.BadParameter("accelerated validation requires live execution to remain OFF")
+    _require_nonproduction_database_isolation(settings, run_mode="accelerated_validation")
     requested_venues = tuple(
         venue for venue in settings.research_collection.venues if venue in {"hyperliquid", "bitget"}
     ) or ("hyperliquid", "bitget")
@@ -662,6 +666,7 @@ async def _run_clean_historical_replay(
 ) -> Path:
     if settings.live_trading or settings.live.enabled:
         raise typer.BadParameter("clean replay requires live execution to remain OFF")
+    _require_nonproduction_database_isolation(settings, run_mode="clean_replay")
     venues = tuple(
         venue for venue in settings.research_collection.venues if venue in {"hyperliquid", "bitget"}
     ) or ("hyperliquid", "bitget")
@@ -785,8 +790,10 @@ def collect_research_data(
     )
     engine = build_engine(settings.database_url)
     started_at = datetime.now(UTC)
-    run_id = f"collector-production-{started_at.strftime('%Y%m%dT%H%M%SZ')}"
+    run_id = f"collector-production-{started_at.strftime('%Y%m%dT%H%M%S%fZ')}"
     owner_id = f"{socket.gethostname()}:{os.getpid()}"
+    process_started_at, command_sha256 = _process_identity(os.getpid())
+    token_path, run_token_sha256 = _create_collector_run_token(run_id)
     database_identity, schema_name = _database_identity(engine)
     groups = _collector_groups(
         database_identity=database_identity,
@@ -812,11 +819,16 @@ def collect_research_data(
         event_types=collection.event_types,
         duration_seconds=None,
         pid=os.getpid(),
+        process_started_at=process_started_at,
+        hostname=socket.gethostname(),
+        command_sha256=command_sha256,
+        run_token_sha256=run_token_sha256,
         status=CollectorRunStatus.RUNNING,
         started_at=started_at,
         heartbeat_at=started_at,
     )
     acquired: list[str] = []
+    supervisor_started = False
     try:
         lease_repository.save_run(run)
         for group in groups:
@@ -836,23 +848,16 @@ def collect_research_data(
             stale_after_seconds=collection.stale_after_seconds,
         )
 
-        async def managed_run() -> None:
-            renewal_shutdown = asyncio.Event()
-            renewal = asyncio.create_task(
-                _renew_collector_leases(
-                    repository=lease_repository,
-                    groups=groups,
-                    run=run,
-                    shutdown=renewal_shutdown,
-                )
+        supervisor_started = True
+        asyncio.run(
+            _run_collector_with_lease(
+                collector=collector,
+                duration_seconds=10 * 365 * 24 * 3600,
+                lease_repository=lease_repository,
+                groups=groups,
+                run=run,
             )
-            try:
-                await _run_collector_for_duration(collector, 10 * 365 * 24 * 3600)
-            finally:
-                renewal_shutdown.set()
-                await asyncio.gather(renewal, return_exceptions=False)
-
-        asyncio.run(managed_run())
+        )
         result = collector.result
         completed_at = datetime.now(UTC)
         write_collector_health_report(
@@ -907,36 +912,155 @@ def collect_research_data(
         )
         raise
     finally:
-        for group in acquired:
-            lease_repository.release(group, run_id, owner_id)
+        release_failures: list[str] = []
+        if not supervisor_started:
+            for group in acquired:
+                try:
+                    lease_repository.release(group, run_id, owner_id)
+                except Exception as exc:
+                    release_failures.append(f"{group}:{type(exc).__name__}")
+        if release_failures:
+            typer.echo(f"collector lease release failures={release_failures}", err=True)
+        token_path.unlink(missing_ok=True)
         engine.dispose()
 
 
-async def _run_collector_for_duration(
-    collector: ResearchMarketDataCollector, duration_seconds: float
+async def _run_collector_with_lease(
+    *,
+    collector: ResearchMarketDataCollector,
+    duration_seconds: float,
+    lease_repository: SQLCollectorLeaseRepository,
+    groups: tuple[str, ...],
+    run: CollectorRunRecord,
+    stop_request: asyncio.Event | None = None,
+    lease_ttl_seconds: float = 90,
+    renewal_timeout_seconds: float = 10,
 ) -> None:
+    """Supervise collection and fail closed whenever lease ownership is uncertain."""
     loop = asyncio.get_running_loop()
+    requested_stop = stop_request or asyncio.Event()
+    renewal_shutdown = asyncio.Event()
     installed: list[signal.Signals] = []
     for item in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(item, collector.shutdown)
+            loop.add_signal_handler(item, requested_stop.set)
             installed.append(item)
         except (NotImplementedError, RuntimeError):
             pass
     collector_task = asyncio.create_task(collector.run(), name="research-collector-soak")
     timer = asyncio.create_task(asyncio.sleep(duration_seconds), name="collector-soak-timer")
+    renewal = asyncio.create_task(
+        _renew_collector_leases(
+            repository=lease_repository,
+            groups=groups,
+            run=run,
+            shutdown=renewal_shutdown,
+            ttl_seconds=lease_ttl_seconds,
+            renewal_timeout_seconds=renewal_timeout_seconds,
+        ),
+        name="collector-lease-renewal",
+    )
+    stop_task = asyncio.create_task(requested_stop.wait(), name="collector-stop-request")
+    failure: BaseException | None = None
     try:
-        done, _ = await asyncio.wait({collector_task, timer}, return_when=asyncio.FIRST_COMPLETED)
-        if collector_task in done:
-            timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
-            await collector_task
-            return
+        done, _ = await asyncio.wait(
+            {collector_task, timer, renewal, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if renewal in done:
+            try:
+                renewal.result()
+            except BaseException as exc:
+                failure = RuntimeError(
+                    f"collector lease renewal failed: {type(exc).__name__}: {exc}"
+                )
+                failure.__cause__ = exc
+            else:
+                failure = RuntimeError("collector lease renewal stopped unexpectedly")
+        elif collector_task in done:
+            failure = collector_task.exception()
         collector.shutdown()
-        await collector_task
+        results = await asyncio.gather(collector_task, return_exceptions=True)
+        if failure is None and isinstance(results[0], BaseException):
+            failure = results[0]
+        if failure is not None:
+            failed_at = datetime.now(UTC)
+            try:
+                current = await asyncio.wait_for(
+                    asyncio.to_thread(lease_repository.get_run, run.run_id),
+                    timeout=renewal_timeout_seconds,
+                )
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lease_repository.save_run,
+                        replace(
+                            current or run,
+                            status=CollectorRunStatus.FAILED,
+                            heartbeat_at=failed_at,
+                            stopped_at=failed_at,
+                            failure_reason=f"{type(failure).__name__}: {failure}",
+                        ),
+                    ),
+                    timeout=renewal_timeout_seconds,
+                )
+            except Exception as status_exc:
+                failure.add_note(
+                    f"failed to persist terminal run status: "
+                    f"{type(status_exc).__name__}: {status_exc}"
+                )
+            raise failure
     finally:
+        collector.shutdown()
+        await asyncio.gather(collector_task, return_exceptions=True)
+        renewal_shutdown.set()
         timer.cancel()
-        await asyncio.gather(timer, return_exceptions=True)
+        stop_task.cancel()
+        await asyncio.gather(timer, stop_task, renewal, return_exceptions=True)
+        release_failures: list[str] = []
+        for group in groups:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lease_repository.release,
+                        group,
+                        run.run_id,
+                        run.owner_id,
+                    ),
+                    timeout=renewal_timeout_seconds,
+                )
+            except Exception as exc:
+                release_failures.append(f"{group}:{type(exc).__name__}")
+        if release_failures:
+            release_failure = RuntimeError(
+                f"collector lease release failed for {len(release_failures)} group(s)"
+            )
+            if failure is not None:
+                failure.add_note(str(release_failure))
+            else:
+                failed_at = datetime.now(UTC)
+                try:
+                    current = await asyncio.wait_for(
+                        asyncio.to_thread(lease_repository.get_run, run.run_id),
+                        timeout=renewal_timeout_seconds,
+                    )
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lease_repository.save_run,
+                            replace(
+                                current or run,
+                                status=CollectorRunStatus.FAILED,
+                                heartbeat_at=failed_at,
+                                stopped_at=failed_at,
+                                failure_reason=str(release_failure),
+                            ),
+                        ),
+                        timeout=renewal_timeout_seconds,
+                    )
+                except Exception as status_exc:
+                    release_failure.add_note(
+                        f"failed to persist terminal run status: {type(status_exc).__name__}"
+                    )
+                raise release_failure
         for item in installed:
             loop.remove_signal_handler(item)
 
@@ -953,6 +1077,61 @@ def _current_commit_sha() -> str:
     return value
 
 
+def _process_identity(pid: int) -> tuple[datetime, str]:
+    completed = subprocess.run(  # nosec B603
+        ("/bin/ps", "-p", str(pid), "-o", "lstart=", "-o", "command="),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    output = completed.stdout.strip()
+    if len(output) < 25:
+        raise RuntimeError("collector process identity is unavailable")
+    started_text = output[:24]
+    command = output[24:].strip()
+    local_zone = datetime.now().astimezone().tzinfo
+    started_at = datetime.strptime(started_text, "%a %b %d %H:%M:%S %Y").replace(tzinfo=local_zone)
+    if not command:
+        raise RuntimeError("collector process command is unavailable")
+    return started_at.astimezone(UTC), hashlib.sha256(command.encode()).hexdigest()
+
+
+def _collector_token_path(run_id: str) -> Path:
+    token_directory = Path(tempfile.gettempdir()) / "crypttool-collector-run-tokens"
+    token_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return token_directory / f"{hashlib.sha256(run_id.encode()).hexdigest()}.token"
+
+
+def _create_collector_run_token(run_id: str) -> tuple[Path, str]:
+    token = secrets.token_urlsafe(32)
+    path = _collector_token_path(run_id)
+    with path.open("x", encoding="utf-8") as token_file:
+        token_file.write(token)
+    path.chmod(0o600)
+    return path, hashlib.sha256(token.encode()).hexdigest()
+
+
+def _verify_collector_process_identity(run: CollectorRunRecord) -> None:
+    if socket.gethostname() != run.hostname:
+        raise typer.BadParameter("collector hostname identity mismatch")
+    try:
+        started_at, command_sha256 = _process_identity(run.pid)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        raise typer.BadParameter("collector process identity is unavailable") from exc
+    if abs((started_at - run.process_started_at).total_seconds()) > 1:
+        raise typer.BadParameter("collector process start time mismatch")
+    if not secrets.compare_digest(command_sha256, run.command_sha256):
+        raise typer.BadParameter("collector process command hash mismatch")
+    token_path = _collector_token_path(run.run_id)
+    try:
+        token = token_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise typer.BadParameter("collector run token is unavailable") from exc
+    if not secrets.compare_digest(hashlib.sha256(token.encode()).hexdigest(), run.run_token_sha256):
+        raise typer.BadParameter("collector run token mismatch")
+
+
 def _database_identity(engine: Any) -> tuple[str, str]:
     url = engine.url
     if url.get_backend_name() == "sqlite":
@@ -962,6 +1141,27 @@ def _database_identity(engine: Any) -> tuple[str, str]:
     with engine.connect() as connection:
         schema = str(connection.scalar(text("SELECT current_schema()")) or "public")
     return identity, schema
+
+
+def _require_nonproduction_database_isolation(settings: Settings, *, run_mode: str) -> None:
+    if run_mode == "production":
+        return
+    if settings.production_database_url is None:
+        raise typer.BadParameter(
+            f"{run_mode} requires an explicit production_database_url for isolation"
+        )
+    run_engine = build_engine(settings.database_url)
+    production_engine = build_engine(settings.production_database_url)
+    try:
+        run_identity = _database_identity(run_engine)
+        production_identity = _database_identity(production_engine)
+    finally:
+        run_engine.dispose()
+        production_engine.dispose()
+    if run_identity == production_identity:
+        raise typer.BadParameter(
+            f"{run_mode} database/schema must be isolated from the production database"
+        )
 
 
 def _collector_groups(
@@ -1003,7 +1203,8 @@ async def _renew_collector_leases(
     groups: tuple[str, ...],
     run: CollectorRunRecord,
     shutdown: asyncio.Event,
-    ttl_seconds: int = 90,
+    ttl_seconds: float = 90,
+    renewal_timeout_seconds: float = 10,
 ) -> None:
     while not shutdown.is_set():
         try:
@@ -1012,16 +1213,26 @@ async def _renew_collector_leases(
         except TimeoutError:
             now = datetime.now(UTC)
             for group in groups:
-                repository.renew(
-                    group,
-                    run.run_id,
-                    run.owner_id,
-                    now + timedelta(seconds=ttl_seconds),
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        repository.renew,
+                        group,
+                        run.run_id,
+                        run.owner_id,
+                        now + timedelta(seconds=ttl_seconds),
+                    ),
+                    timeout=renewal_timeout_seconds,
                 )
-            current = repository.get_run(run.run_id)
+            current = await asyncio.wait_for(
+                asyncio.to_thread(repository.get_run, run.run_id),
+                timeout=renewal_timeout_seconds,
+            )
             if current is None:
                 raise RuntimeError("collector run registry entry disappeared") from None
-            repository.save_run(replace(current, heartbeat_at=now))
+            await asyncio.wait_for(
+                asyncio.to_thread(repository.save_run, replace(current, heartbeat_at=now)),
+                timeout=renewal_timeout_seconds,
+            )
 
 
 @app.command("run-collector-soak")
@@ -1038,14 +1249,17 @@ def run_collector_soak(
         raise typer.BadParameter("collection_enabled=true is required")
     if not collection.venues:
         raise typer.BadParameter("at least one research collection venue is required")
+    _require_nonproduction_database_isolation(settings, run_mode="soak")
     adapters = tuple(_research_data_adapter(name) for name in collection.venues)
     registry = TrustedCapabilityRegistry.from_artifacts(
         Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
     )
     engine = build_engine(settings.database_url)
     started_at = datetime.now(UTC)
-    run_id = f"collector-soak-{started_at.strftime('%Y%m%dT%H%M%SZ')}"
+    run_id = f"collector-soak-{started_at.strftime('%Y%m%dT%H%M%S%fZ')}"
     owner_id = f"{socket.gethostname()}:{os.getpid()}"
+    process_started_at, command_sha256 = _process_identity(os.getpid())
+    token_path, run_token_sha256 = _create_collector_run_token(run_id)
     checkpoint_namespace = f"soak:{run_id}"
     artifact_directory = Path("artifacts/collector-soak") / run_id
     lease_repository = SQLCollectorLeaseRepository(engine)
@@ -1072,11 +1286,16 @@ def run_collector_soak(
         event_types=collection.event_types,
         duration_seconds=duration_hours * 3600,
         pid=os.getpid(),
+        process_started_at=process_started_at,
+        hostname=socket.gethostname(),
+        command_sha256=command_sha256,
+        run_token_sha256=run_token_sha256,
         status=CollectorRunStatus.RUNNING,
         started_at=started_at,
         heartbeat_at=started_at,
     )
     acquired: list[str] = []
+    supervisor_started = False
     try:
         lease_repository.save_run(run)
         expires_at = started_at + timedelta(seconds=90)
@@ -1101,24 +1320,16 @@ def run_collector_soak(
             stale_after_seconds=collection.stale_after_seconds,
         )
 
-        async def managed_run() -> None:
-            renewal_shutdown = asyncio.Event()
-            renewal = asyncio.create_task(
-                _renew_collector_leases(
-                    repository=lease_repository,
-                    groups=groups,
-                    run=run,
-                    shutdown=renewal_shutdown,
-                ),
-                name="collector-lease-renewal",
+        supervisor_started = True
+        asyncio.run(
+            _run_collector_with_lease(
+                collector=collector,
+                duration_seconds=duration_hours * 3600,
+                lease_repository=lease_repository,
+                groups=groups,
+                run=run,
             )
-            try:
-                await _run_collector_for_duration(collector, duration_hours * 3600)
-            finally:
-                renewal_shutdown.set()
-                await asyncio.gather(renewal, return_exceptions=False)
-
-        asyncio.run(managed_run())
+        )
         completed_at = datetime.now(UTC)
         result = collector.result
         payload: dict[str, object] = {
@@ -1187,8 +1398,16 @@ def run_collector_soak(
         )
         raise
     finally:
-        for group in acquired:
-            lease_repository.release(group, run_id, owner_id)
+        release_failures: list[str] = []
+        if not supervisor_started:
+            for group in acquired:
+                try:
+                    lease_repository.release(group, run_id, owner_id)
+                except Exception as exc:
+                    release_failures.append(f"{group}:{type(exc).__name__}")
+        if release_failures:
+            typer.echo(f"collector lease release failures={release_failures}", err=True)
+        token_path.unlink(missing_ok=True)
         engine.dispose()
 
 
@@ -1290,6 +1509,7 @@ def stop_collector_run(
             raise typer.BadParameter(
                 "collector heartbeat is stale; refusing to signal a reused PID"
             )
+        _verify_collector_process_identity(run)
         repository.save_run(
             replace(
                 run,

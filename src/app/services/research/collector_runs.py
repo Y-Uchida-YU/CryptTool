@@ -53,6 +53,10 @@ class CollectorRunRecord:
     event_types: tuple[str, ...]
     duration_seconds: float | None
     pid: int
+    process_started_at: datetime
+    hostname: str
+    command_sha256: str
+    run_token_sha256: str
     status: CollectorRunStatus
     started_at: datetime
     heartbeat_at: datetime
@@ -147,6 +151,8 @@ class InMemoryCollectorLeaseRepository(CollectorLeaseRepository):
             current = self.leases.get(collector_group)
             if current is None or current.run_id != run_id or current.owner_id != owner_id:
                 raise CollectorLeaseConflict("collector lease ownership changed")
+            if current.expires_at <= now:
+                raise CollectorLeaseConflict("collector lease expired before renewal")
             lease = replace(current, expires_at=expires_at, renewed_at=now)
             self.leases[collector_group] = lease
             return lease
@@ -220,6 +226,8 @@ class SQLCollectorLeaseRepository(CollectorLeaseRepository):
             row = session.get(CollectorLeaseRow, collector_group, with_for_update=True)
             if row is None or row.run_id != run_id or row.owner_id != owner_id:
                 raise CollectorLeaseConflict("collector lease ownership changed")
+            if self._aware(row.expires_at) <= now:
+                raise CollectorLeaseConflict("collector lease expired before renewal")
             acquired_at = self._aware(row.acquired_at)
             row.renewed_at = now
             row.expires_at = expires_at
@@ -278,6 +286,10 @@ class SQLCollectorLeaseRepository(CollectorLeaseRepository):
             "event_types_json": json.dumps(run.event_types),
             "duration_seconds": run.duration_seconds,
             "pid": run.pid,
+            "process_started_at": run.process_started_at,
+            "hostname": run.hostname,
+            "command_sha256": run.command_sha256,
+            "run_token_sha256": run.run_token_sha256,
             "status": run.status.value,
             "started_at": run.started_at,
             "heartbeat_at": run.heartbeat_at,
@@ -304,6 +316,10 @@ class SQLCollectorLeaseRepository(CollectorLeaseRepository):
             event_types=tuple(json.loads(row.event_types_json)),
             duration_seconds=row.duration_seconds,
             pid=row.pid,
+            process_started_at=cls._aware(row.process_started_at),
+            hostname=row.hostname,
+            command_sha256=row.command_sha256,
+            run_token_sha256=row.run_token_sha256,
             status=CollectorRunStatus(row.status),
             started_at=cls._aware(row.started_at),
             heartbeat_at=cls._aware(row.heartbeat_at),

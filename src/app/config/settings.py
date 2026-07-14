@@ -157,6 +157,7 @@ class Settings(BaseSettings):
 
     environment: Literal["development", "test", "production"] = "development"
     database_url: str = "sqlite+pysqlite:///cryptbot.db"
+    production_database_url: str | None = None
     symbols: tuple[str, ...] = ("BTC", "ETH", "SOL")
     timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
     paper_trading: bool = True

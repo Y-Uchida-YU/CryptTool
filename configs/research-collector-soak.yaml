@@ -1,3 +1,5 @@
+database_url: sqlite+pysqlite:///collector-soak.db
+production_database_url: sqlite+pysqlite:///cryptbot.db
 live_trading: false
 live:
   enabled: false
