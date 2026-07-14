@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -341,4 +342,209 @@ class ResearchArtifactRow(Base):
     artifact_type: Mapped[str] = mapped_column(String(80))
     path: Mapped[str] = mapped_column(String(500))
     content_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class OperationalRunRow(Base):
+    __tablename__ = "operational_runs"
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(100), default="SYSTEM")
+    strategy_version: Mapped[str] = mapped_column(String(40), default="0")
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), default="UNASSIGNED")
+    research_run_id: Mapped[str] = mapped_column(String(160), default="UNASSIGNED")
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    collector_healthy: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_snapshot_id: Mapped[str | None] = mapped_column(String(160))
+    last_research_run_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    signals_paused_reason: Mapped[str | None] = mapped_column(String(500))
+    failure_reason: Mapped[str | None] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class StrategyEligibilityRow(Base):
+    __tablename__ = "strategy_eligibility"
+    __table_args__ = (UniqueConstraint("run_id", "strategy_id", "strategy_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    research_run_id: Mapped[str] = mapped_column(String(160), index=True)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reasons_json: Mapped[str] = mapped_column(Text)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperSignalRow(Base):
+    __tablename__ = "paper_signals"
+    signal_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    research_run_id: Mapped[str] = mapped_column(String(160), index=True)
+    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    instrument: Mapped[str] = mapped_column(String(100), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    rejection_reason: Mapped[str | None] = mapped_column(String(1000))
+    signal_hash: Mapped[str] = mapped_column(String(64))
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperOrderRow(Base):
+    __tablename__ = "paper_orders"
+    order_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    signal_id: Mapped[str] = mapped_column(String(160), ForeignKey("paper_signals.signal_id"))
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    research_run_id: Mapped[str] = mapped_column(String(160), index=True)
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    venue: Mapped[str] = mapped_column(String(40))
+    instrument: Mapped[str] = mapped_column(String(100))
+    payload_json: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperFillRow(Base):
+    __tablename__ = "paper_fills"
+    fill_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(160), ForeignKey("paper_orders.order_id"))
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    research_run_id: Mapped[str] = mapped_column(String(160), index=True)
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    venue: Mapped[str] = mapped_column(String(40))
+    instrument: Mapped[str] = mapped_column(String(100))
+    payload_json: Mapped[str] = mapped_column(Text)
+    executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperPositionRow(Base):
+    __tablename__ = "paper_positions"
+    __table_args__ = (UniqueConstraint("run_id", "portfolio_id", "venue", "instrument"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    research_run_id: Mapped[str] = mapped_column(String(160), index=True)
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    venue: Mapped[str] = mapped_column(String(40))
+    instrument: Mapped[str] = mapped_column(String(100))
+    payload_json: Mapped[str] = mapped_column(Text)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperCashLedgerRow(Base):
+    __tablename__ = "paper_cash_ledger"
+    entry_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160))
+    research_run_id: Mapped[str] = mapped_column(String(160))
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    balance_after: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    entry_type: Mapped[str] = mapped_column(String(80))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reference_id: Mapped[str | None] = mapped_column(String(160))
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperFundingLedgerRow(Base):
+    __tablename__ = "paper_funding_ledger"
+    entry_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160))
+    research_run_id: Mapped[str] = mapped_column(String(160))
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    venue: Mapped[str] = mapped_column(String(40))
+    instrument: Mapped[str] = mapped_column(String(100))
+    rate: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    amount: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperRiskEventRow(Base):
+    __tablename__ = "paper_risk_events"
+    event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160))
+    research_run_id: Mapped[str] = mapped_column(String(160))
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    reason: Mapped[str] = mapped_column(String(1000))
+    blocks_new_signals: Mapped[bool] = mapped_column(Boolean)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperDailyMetricRow(Base):
+    __tablename__ = "paper_daily_metrics"
+    __table_args__ = (UniqueConstraint("run_id", "portfolio_id", "metric_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160))
+    research_run_id: Mapped[str] = mapped_column(String(160))
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    metric_date: Mapped[str] = mapped_column(String(10), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PaperAttributionRow(Base):
+    __tablename__ = "paper_attribution"
+    __table_args__ = (UniqueConstraint("run_id", "portfolio_id", "attribution_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), ForeignKey("operational_runs.run_id"))
+    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_version: Mapped[str] = mapped_column(String(40))
+    data_snapshot_id: Mapped[str] = mapped_column(String(160))
+    research_run_id: Mapped[str] = mapped_column(String(160))
+    portfolio_id: Mapped[str] = mapped_column(String(80), index=True)
+    attribution_date: Mapped[str] = mapped_column(String(10), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    commit_sha: Mapped[str] = mapped_column(String(80))
+    config_sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

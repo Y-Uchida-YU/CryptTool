@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import tempfile
 import time
 from dataclasses import asdict, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -53,6 +53,12 @@ from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
 from app.services.capability_audit import CapabilityContractAuditor
 from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
+from app.services.operations.models import LiveSignalInput, OperationalRunStatus
+from app.services.operations.repository import PostgreSQLOperationalRepository
+from app.services.operations.service import (
+    ContinuousResearchPaperService,
+    ScheduledResearchOutcome,
+)
 from app.services.paper_trading.broker import PaperBroker
 from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
@@ -834,8 +840,9 @@ def collect_research_data(
         for group in groups:
             lease_repository.acquire(group, run_id, owner_id, started_at + timedelta(seconds=90))
             acquired.append(group)
+        research_repository = PostgreSQLResearchRepository(engine)
         collector = ResearchMarketDataCollector(
-            repository=PostgreSQLResearchRepository(engine),
+            repository=research_repository,
             sources=tuple(
                 PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
             ),
@@ -1641,6 +1648,427 @@ def paper_trade(
     typer.echo(
         f"paper replay complete: fills={len(broker.fills)}, equity={snapshot.equity}, live_orders=0"
     )
+
+
+@app.command("start-paper-operation")
+def start_paper_operation(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+) -> None:
+    """Start durable R3 observation/paper workers; never contacts an execution API."""
+    settings = _settings_from_yaml(config)
+    if not settings.continuous_paper.enabled:
+        raise typer.BadParameter("continuous_paper.enabled must be explicitly true")
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("live execution must remain disabled")
+    if settings.database_url.startswith("sqlite"):
+        raise typer.BadParameter("continuous paper operation requires PostgreSQL")
+    resolved_run_id = run_id or f"paper-operation-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    config_sha = hashlib.sha256(config.read_bytes()).hexdigest()
+    engine = build_engine(settings.database_url)
+    token_path: Path | None = None
+    try:
+        collection = settings.research_collection
+        if not collection.collection_enabled:
+            raise typer.BadParameter(
+                "continuous paper operation requires research collection enabled"
+            )
+        adapters = tuple(_research_data_adapter(name) for name in collection.venues)
+        registry = TrustedCapabilityRegistry.from_artifacts(
+            Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
+        )
+        lease_repository = SQLCollectorLeaseRepository(engine)
+        database_identity, schema_name = _database_identity(engine)
+        groups = _collector_groups(
+            database_identity=database_identity,
+            schema_name=schema_name,
+            venues=collection.venues,
+            instruments=collection.instruments,
+            event_types=collection.event_types,
+        )
+        owner_id = f"{socket.gethostname()}:{os.getpid()}"
+        process_started_at, command_sha256 = _process_identity(os.getpid())
+        token_path, run_token_sha256 = _create_collector_run_token(resolved_run_id)
+        started_at = datetime.now(UTC)
+        collector_run = CollectorRunRecord(
+            run_id=resolved_run_id,
+            collector_group=f"collector-set-{canonical_sha256(groups)[:24]}",
+            owner_id=owner_id,
+            commit_sha=_current_commit_sha(),
+            config_path=str(config.resolve()),
+            database_identity=database_identity,
+            schema_name=schema_name,
+            checkpoint_namespace="production",
+            artifact_namespace=str(Path("artifacts/operations") / resolved_run_id),
+            venues=collection.venues,
+            instruments=collection.instruments,
+            event_types=collection.event_types,
+            duration_seconds=None,
+            pid=os.getpid(),
+            process_started_at=process_started_at,
+            hostname=socket.gethostname(),
+            command_sha256=command_sha256,
+            run_token_sha256=run_token_sha256,
+            status=CollectorRunStatus.RUNNING,
+            started_at=started_at,
+            heartbeat_at=started_at,
+        )
+        lease_repository.save_run(collector_run)
+        acquired: list[str] = []
+        try:
+            for group in groups:
+                lease_repository.acquire(
+                    group, resolved_run_id, owner_id, started_at + timedelta(seconds=90)
+                )
+                acquired.append(group)
+        except Exception:
+            for group in acquired:
+                lease_repository.release(group, resolved_run_id, owner_id)
+            raise
+        research_repository = PostgreSQLResearchRepository(engine)
+        collector = ResearchMarketDataCollector(
+            repository=research_repository,
+            sources=tuple(
+                PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
+            ),
+            capability_gate=TrustedResearchCapabilityGate(registry),
+            instruments=collection.instruments,
+            event_types=collection.event_types,
+            collection_enabled=True,
+            poll_interval_seconds=collection.poll_interval_seconds,
+            maximum_cycles=None,
+            stale_after_seconds=collection.stale_after_seconds,
+        )
+
+        def finalize_snapshot(cutoff_at: datetime) -> str:
+            manifest = DataSnapshotService(research_repository).finalize(
+                cutoff_at=cutoff_at,
+                eligibility_policy=SnapshotEligibilityPolicy(
+                    required_event_types=collection.event_types,
+                    required_venues=collection.venues,
+                    minimum_production_events=collection.minimum_production_events,
+                    maximum_gap_ratio=Decimal(str(collection.maximum_gap_ratio)),
+                    maximum_stale_ratio=Decimal(str(collection.maximum_stale_ratio)),
+                    require_complete_instrument_rules=collection.require_complete_instrument_rules,
+                ),
+            )
+            write_snapshot_manifest(
+                Path("artifacts/data-snapshots") / manifest.snapshot_id / "manifest.json",
+                manifest,
+            )
+            return manifest.snapshot_id
+
+        def run_research(snapshot_id: str) -> tuple[ScheduledResearchOutcome, ...]:
+            manifest = research_repository.snapshot_manifest(snapshot_id)
+            if manifest is None:
+                raise RuntimeError("scheduled snapshot is missing")
+            rules = research_repository.instrument_rules_at(manifest.cutoff_at)
+            outcomes: list[ScheduledResearchOutcome] = []
+            for strategy_id in settings.continuous_paper.strategies:
+                result = ResearchPipeline(research_repository).run(
+                    {
+                        "commit_sha": _current_commit_sha(),
+                        "data_snapshot_id": snapshot_id,
+                        "hypothesis_version": (
+                            f"r3-{strategy_id}-{manifest.cutoff_at.strftime('%Y%m%dT%H')}"
+                        ),
+                        "strategy_id": strategy_id,
+                        "strategy_version": "1",
+                        "created_at": manifest.finalized_at.isoformat(),
+                        "cutoff_at": manifest.cutoff_at.isoformat(),
+                        "venues": list(collection.venues),
+                        "instruments": list(collection.instruments),
+                        "event_types": list(collection.event_types),
+                        "live_execution": False,
+                        "hypothesis": {
+                            "parameter_grid": {"threshold": ["0", "0.0001", "0.0005"]},
+                            "primary_metric": "net_pnl",
+                            "secondary_metrics": ["sharpe", "drawdown"],
+                            "acceptance_thresholds": {},
+                            "frozen_at": manifest.cutoff_at.isoformat(),
+                        },
+                        "walk_forward": {
+                            "mode": "rolling",
+                            "train_size": 720,
+                            "validation_size": 168,
+                            "oos_size": 168,
+                            "purge": 24,
+                            "embargo": 24,
+                        },
+                        "minimum_coverage": "0.9",
+                        "maximum_stale_ratio": str(collection.maximum_stale_ratio),
+                        "order_quantity": "0.001",
+                        "initial_cash": "1000",
+                        "use_maker_orders": False,
+                        "rule_snapshot_ids": [item.rule_snapshot_id for item in rules],
+                        "bootstrap_trials": 20,
+                        "monte_carlo_trials": 100,
+                        "random_seed": 17,
+                    }
+                )
+                capital = result.acceptance_result.capital_feasibility
+                outcomes.append(
+                    ScheduledResearchOutcome(
+                        strategy_id=strategy_id,
+                        strategy_version="1",
+                        research_run_id=result.identity.run_id,
+                        research_verdict=result.acceptance_result.verdict.value,
+                        data_quality_passed=result.data_quality.passed,
+                        capital_feasible=(
+                            capital.evidence_complete
+                            and all(
+                                capital.feasible_at(amount)
+                                for amount in (Decimal("100"), Decimal("300"), Decimal("1000"))
+                            )
+                        ),
+                        evidence_complete=(
+                            result.cost_stress_result.evidence_complete
+                            and result.overfitting_result.evidence_complete
+                            and capital.evidence_complete
+                        ),
+                    )
+                )
+            return tuple(outcomes)
+
+        def live_market_events() -> tuple[LiveSignalInput, ...]:
+            cutoff_at = datetime.now(UTC)
+            quarantined, _ = research_repository.quarantine_summary(cutoff_at)
+            excluded = set(quarantined)
+            events: list[LiveSignalInput] = []
+            for raw in sorted(research_repository.raw_events(), key=lambda item: item.available_at)[
+                -2000:
+            ]:
+                if raw.event_id in excluded or not raw.event_type.startswith("orderbook"):
+                    continue
+                payload = raw.payload()
+                bids = payload.get("bids") or payload.get("levels", [[], []])[0]
+                asks = payload.get("asks") or payload.get("levels", [[], []])[1]
+                bid = payload.get("bid") or payload.get("best_bid")
+                ask = payload.get("ask") or payload.get("best_ask")
+                bid_size = payload.get("bid_depth")
+                ask_size = payload.get("ask_depth")
+                if isinstance(bids, list) and bids:
+                    level = bids[0]
+                    if isinstance(level, dict):
+                        bid = bid or level.get("px") or level.get("price")
+                        bid_size = bid_size or level.get("sz") or level.get("quantity")
+                    elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                        bid, bid_size = bid or level[0], bid_size or level[1]
+                if isinstance(asks, list) and asks:
+                    level = asks[0]
+                    if isinstance(level, dict):
+                        ask = ask or level.get("px") or level.get("price")
+                        ask_size = ask_size or level.get("sz") or level.get("quantity")
+                    elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                        ask, ask_size = ask or level[0], ask_size or level[1]
+                if any(item is None for item in (bid, ask, bid_size, ask_size)):
+                    continue
+                events.append(
+                    LiveSignalInput(
+                        event_id=raw.event_id,
+                        venue=raw.venue,
+                        instrument=raw.canonical_instrument_id,
+                        event_type=raw.event_type,
+                        available_at=raw.available_at,
+                        data_quality_score=1.0,
+                        capability_support="live_verified",
+                        reconciliation_state=(
+                            raw.reconciliation_state.value if raw.reconciliation_state else None
+                        ),
+                        bid=Decimal(str(bid)),
+                        ask=Decimal(str(ask)),
+                        bid_size=Decimal(str(bid_size)),
+                        ask_size=Decimal(str(ask_size)),
+                    )
+                )
+            return tuple(events)
+
+        service = ContinuousResearchPaperService(
+            repository=PostgreSQLOperationalRepository(engine),
+            settings=settings,
+            run_id=resolved_run_id,
+            commit_sha=_current_commit_sha(),
+            config_sha256=config_sha,
+            snapshot_action=finalize_snapshot,
+            research_action=run_research,
+            market_event_action=live_market_events,
+        )
+        service.set_collector_health(True)
+        typer.echo(f"run_id={resolved_run_id} mode={service.mode.value} live_execution=false")
+        asyncio.run(
+            _run_continuous_operation(
+                service=service,
+                collector=collector,
+                lease_repository=lease_repository,
+                groups=groups,
+                collector_run=collector_run,
+            )
+        )
+    finally:
+        if token_path is not None:
+            token_path.unlink(missing_ok=True)
+        engine.dispose()
+
+
+async def _run_continuous_operation(
+    *,
+    service: ContinuousResearchPaperService,
+    collector: ResearchMarketDataCollector,
+    lease_repository: SQLCollectorLeaseRepository,
+    groups: tuple[str, ...],
+    collector_run: CollectorRunRecord,
+) -> None:
+    """Bind the R2 collector lifecycle to R3; either side stopping stops both."""
+    collector_task = asyncio.create_task(
+        _run_collector_with_lease(
+            collector=collector,
+            duration_seconds=10 * 365 * 24 * 3600,
+            lease_repository=lease_repository,
+            groups=groups,
+            run=collector_run,
+            stop_request=service.stop_event,
+        ),
+        name="continuous-r2-collector",
+    )
+    service_task = asyncio.create_task(service.run(), name="continuous-paper-service")
+    done, _ = await asyncio.wait(
+        {collector_task, service_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if collector_task in done and not service.stop_event.is_set():
+        service.set_collector_health(False, "collector_stopped")
+        service.request_stop()
+    if service_task in done:
+        service.stop_event.set()
+        collector.shutdown()
+    results = await asyncio.gather(collector_task, service_task, return_exceptions=True)
+    failures = [item for item in results if isinstance(item, BaseException)]
+    if failures:
+        raise failures[0]
+    completed_at = datetime.now(UTC)
+    current = lease_repository.get_run(collector_run.run_id) or collector_run
+    lease_repository.save_run(
+        replace(
+            current,
+            status=CollectorRunStatus.COMPLETED,
+            heartbeat_at=completed_at,
+            stopped_at=completed_at,
+        )
+    )
+
+
+@app.command("stop-paper-operation")
+def stop_paper_operation(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Request a graceful durable worker shutdown."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLOperationalRepository(engine)
+        run = repository.get_run(run_id)
+        if run is None:
+            raise typer.BadParameter("operational run not found")
+        if run.status not in {OperationalRunStatus.RUNNING, OperationalRunStatus.STARTING}:
+            typer.echo(f"run_id={run_id} status={run.status.value}")
+            return
+        repository.save_run(
+            replace(run, status=OperationalRunStatus.STOP_REQUESTED, updated_at=datetime.now(UTC))
+        )
+        typer.echo(f"run_id={run_id} status=stop_requested graceful=true")
+    finally:
+        engine.dispose()
+
+
+@app.command("paper-operation-status")
+def paper_operation_status(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Show durable R3 run state."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLOperationalRepository(engine)
+        run = repository.get_run(run_id)
+        if run is None:
+            raise typer.BadParameter("operational run not found")
+        typer.echo(
+            f"run_id={run.run_id} status={run.status.value} mode={run.mode.value} "
+            f"snapshot_id={run.last_snapshot_id or 'none'} "
+            f"collector_healthy={run.collector_healthy} "
+            "live_execution=false"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("strategy-eligibility-status")
+def strategy_eligibility_status(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """List durable strategy eligibility records."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        records = PostgreSQLOperationalRepository(engine).eligibility(run_id)
+        for record in records:
+            typer.echo(
+                f"{record.strategy_id}:{record.strategy_version} status={record.status.value} "
+                f"expires_at={record.expires_at.isoformat()} snapshot_id={record.data_snapshot_id}"
+            )
+    finally:
+        engine.dispose()
+
+
+@app.command("paper-portfolio-status")
+def paper_portfolio_status(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Show cash and position state restored from durable ledgers."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLOperationalRepository(engine)
+        cash = repository.cash_entries(run_id)
+        positions = repository.positions(run_id)
+        latest: dict[str, Decimal] = {}
+        for entry in cash:
+            latest[entry.portfolio_id] = entry.balance_after
+        for portfolio_id in sorted(latest):
+            count = sum(
+                item.portfolio_id == portfolio_id and item.quantity != 0 for item in positions
+            )
+            typer.echo(f"portfolio={portfolio_id} cash={latest[portfolio_id]} positions={count}")
+    finally:
+        engine.dispose()
+
+
+@app.command("generate-daily-operation-report")
+def generate_daily_operation_report(
+    report_date: Annotated[str, typer.Option("--date")],
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Regenerate a deterministic daily operation report."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLOperationalRepository(engine)
+        run = repository.get_run(run_id)
+        if run is None:
+            raise typer.BadParameter("operational run not found")
+        service = ContinuousResearchPaperService(
+            repository=repository,
+            settings=settings,
+            run_id=run_id,
+            commit_sha=run.commit_sha,
+            config_sha256=run.config_sha256,
+        )
+        report = service.generate_daily_report(date.fromisoformat(report_date))
+        typer.echo(
+            f"run_id={run_id} date={report.report_date} "
+            f"promotion={report.promotion_verdict.value} live_execution=false"
+        )
+    finally:
+        engine.dispose()
 
 
 @app.command("health-check")

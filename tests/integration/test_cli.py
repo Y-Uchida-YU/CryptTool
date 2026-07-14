@@ -1,11 +1,22 @@
+import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine
 from typer.testing import CliRunner
 
+import app.cli.main as cli
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.cli.main import app
+from app.config.settings import Settings
+from app.infrastructure.database.models import Base
+from app.services.research.models import RawMarketEvent
+from app.services.research.repository import PostgreSQLResearchRepository
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 runner = CliRunner()
@@ -166,3 +177,124 @@ def test_collector_health_report_cli(tmp_path: Path, monkeypatch: pytest.MonkeyP
     summary = (directory / "summary.md").read_text(encoding="utf-8")
     assert "Live execution: OFF" in summary
     assert "Checkpoint lag seconds: 0.1" in summary
+
+
+def test_start_paper_operation_binds_r2_collector_and_r3_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'operation.db'}")
+    Base.metadata.create_all(engine)
+    research_repository = PostgreSQLResearchRepository(engine)
+    for venue, payload in (
+        (
+            "hyperliquid",
+            {"bids": [{"px": "99", "sz": "2"}], "asks": [{"px": "100", "sz": "3"}]},
+        ),
+        ("bitget", {"levels": [[["99", "2"]], [["100", "3"]]]}),
+    ):
+        raw_payload = json.dumps(payload)
+        now = datetime.now(UTC)
+        research_repository.add_raw_event(
+            RawMarketEvent(
+                event_id=f"{venue}-book",
+                venue=venue,
+                canonical_instrument_id="BTC",
+                venue_symbol="BTC",
+                event_type="orderbook_snapshot",
+                exchange_timestamp=now,
+                received_at=now,
+                available_at=now,
+                sequence=1,
+                connection_id=uuid4(),
+                reconciliation_state=ReconciliationState.SYNCHRONIZED,
+                payload_sha256=hashlib.sha256(raw_payload.encode()).hexdigest(),
+                raw_payload=raw_payload,
+                normalizer_version="test",
+                capability_verification_run_id="verified",
+                created_at=now,
+            )
+        )
+    config = tmp_path / "operation.yaml"
+    config.write_text("continuous_paper: {enabled: true}\n", encoding="utf-8")
+    token = tmp_path / "run.token"
+    token.write_text("opaque", encoding="utf-8")
+    configured = Settings(
+        database_url="postgresql+psycopg://localhost/cryptbot",
+        paper_trading=True,
+        live_trading=False,
+        paper={"enabled": True},
+        live={"enabled": False},
+        continuous_paper={"enabled": True, "observation_only": True},
+        research_collection={
+            "collection_enabled": True,
+            "venues": ("hyperliquid", "bitget"),
+            "instruments": ("BTC", "ETH", "SOL", "HYPE"),
+            "event_types": ("orderbook_snapshot",),
+            "require_complete_instrument_rules": False,
+        },
+    )
+
+    class Adapter:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+            self.capabilities = ()
+
+    captured: dict[str, object] = {}
+
+    async def run_once(**kwargs: object) -> None:
+        service = kwargs["service"]
+        captured["service"] = service
+        snapshot_id = service.snapshot_action(datetime.now(UTC))
+        assert snapshot_id.startswith("snapshot-")
+        captured["snapshot_id"] = snapshot_id
+
+    class Capital:
+        evidence_complete = True
+
+        @staticmethod
+        def feasible_at(_amount: object) -> bool:
+            return True
+
+    class Pipeline:
+        def __init__(self, _repository: object) -> None:
+            pass
+
+        @staticmethod
+        def run(config: dict[str, object]) -> SimpleNamespace:
+            return SimpleNamespace(
+                identity=SimpleNamespace(run_id=f"research-{config['strategy_id']}"),
+                acceptance_result=SimpleNamespace(
+                    verdict=SimpleNamespace(value="PASS"), capital_feasibility=Capital()
+                ),
+                data_quality=SimpleNamespace(passed=True),
+                cost_stress_result=SimpleNamespace(evidence_complete=True),
+                overfitting_result=SimpleNamespace(evidence_complete=True),
+            )
+
+    monkeypatch.setattr(cli, "_settings_from_yaml", lambda _: configured)
+    monkeypatch.setattr(cli, "build_engine", lambda _: engine)
+    monkeypatch.setattr(cli, "_research_data_adapter", lambda venue: Adapter(venue))
+    monkeypatch.setattr(
+        cli.TrustedCapabilityRegistry, "from_artifacts", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(cli, "_database_identity", lambda _: ("db", "main"))
+    monkeypatch.setattr(cli, "_process_identity", lambda _: (datetime.now(UTC), "c" * 64))
+    monkeypatch.setattr(cli, "_create_collector_run_token", lambda _: (token, "d" * 64))
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(cli, "_run_continuous_operation", run_once)
+    monkeypatch.setattr(cli, "ResearchPipeline", Pipeline)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["start-paper-operation", "--config", str(config), "--run-id", "operation-r3"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "live_execution=false" in result.output
+    live_events = captured["service"].market_event_action()
+    assert len(live_events) == 2
+    assert all(item.reconciliation_state == "synchronized" for item in live_events)
+    outcomes = captured["service"].research_action(captured["snapshot_id"])
+    assert len(outcomes) == 3 and all(item.research_verdict == "PASS" for item in outcomes)
+    assert not token.exists()

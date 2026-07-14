@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yuchida.crypttool.paper-operation</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/CryptTool/.venv/bin/app</string>
+    <string>start-paper-operation</string>
+    <string>--config</string>
+    <string>/ABSOLUTE/PATH/TO/CryptTool/configs/paper-operation.yaml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/CryptTool</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>APP_DATABASE_URL</key>
+    <string>postgresql+psycopg://cryptbot@localhost:5432/cryptbot</string>
+    <key>APP_LIVE_TRADING</key>
+    <string>false</string>
+    <key>APP_LIVE__ENABLED</key>
+    <string>false</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/crypttool-paper-operation.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/crypttool-paper-operation.stderr.log</string>
+</dict>
+</plist>

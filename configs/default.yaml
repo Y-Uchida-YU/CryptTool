@@ -16,6 +16,28 @@ research_collection:
   maximum_gap_ratio: 0.01
   maximum_stale_ratio: 0.05
   require_complete_instrument_rules: true
+continuous_paper:
+  enabled: false
+  observation_only: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC, ETH, SOL, HYPE]
+  strategies: [funding_carry, cross_venue_basis, btc_sol_relative_strength]
+  operational_snapshot_interval_seconds: 3600
+  daily_snapshot_hour_utc: 0
+  daily_snapshot_minute_utc: 5
+  daily_report_hour_utc: 0
+  daily_report_minute_utc: 30
+  signal_interval_seconds: 30
+  risk_interval_seconds: 10
+  eligibility_ttl_seconds: 90000
+  source_event_max_age_seconds: 30
+  minimum_data_quality: 0.90
+  initial_capitals: [100, 300, 1000]
+  maximum_single_trade_risk: 0.0025
+  maximum_venue_exposure: 0.50
+  maximum_instrument_exposure: 0.40
+  maximum_daily_loss: 0.02
+  maximum_drawdown: 0.05
 risk:
   leverage: 1.0
   max_risk_per_trade: 0.0025

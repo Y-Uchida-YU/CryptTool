@@ -10,6 +10,21 @@ services:
     environment:
       APP_DATABASE_URL: postgresql+psycopg://cryptbot:${CRYPTBOT_DB_PASSWORD:-change-me}@db:5432/cryptbot
     command: ["health-check"]
+  paper-operation:
+    profiles: ["paper"]
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://cryptbot:${CRYPTBOT_DB_PASSWORD:-change-me}@db:5432/cryptbot
+      APP_PRODUCTION_DATABASE_URL: postgresql+psycopg://cryptbot:${CRYPTBOT_DB_PASSWORD:-change-me}@db:5432/cryptbot
+      APP_LIVE_TRADING: "false"
+      APP_LIVE__ENABLED: "false"
+      APP_CONTINUOUS_PAPER__ENABLED: "true"
+      APP_CONTINUOUS_PAPER__OBSERVATION_ONLY: "true"
+    command: ["start-paper-operation", "--config", "configs/paper-operation.yaml"]
   db:
     image: postgres:16-alpine
     environment:
