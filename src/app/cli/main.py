@@ -135,6 +135,14 @@ def _settings_from_yaml(path: Path) -> Settings:
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         raise typer.BadParameter("settings config must be a YAML mapping")
+    if database_url := os.environ.get("APP_DATABASE_URL"):
+        payload["database_url"] = database_url
+    if live_trading := os.environ.get("APP_LIVE_TRADING"):
+        payload["live_trading"] = live_trading.lower() in {"1", "true", "yes", "on"}
+    if live_enabled := os.environ.get("APP_LIVE__ENABLED"):
+        live = dict(payload.get("live") or {})
+        live["enabled"] = live_enabled.lower() in {"1", "true", "yes", "on"}
+        payload["live"] = live
     return Settings(**payload)
 
 

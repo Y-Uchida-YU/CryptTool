@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from typer.testing import CliRunner
 
@@ -298,3 +299,19 @@ def test_start_paper_operation_binds_r2_collector_and_r3_service(
     outcomes = captured["service"].research_action(captured["snapshot_id"])
     assert len(outcomes) == 3 and all(item.research_verdict == "PASS" for item in outcomes)
     assert not token.exists()
+
+
+def test_yaml_settings_honor_runtime_database_and_live_safety_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "settings.yaml"
+    config.write_text(
+        "database_url: sqlite:///ignored.db\nlive_trading: false\nlive: {enabled: false}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APP_DATABASE_URL", "postgresql+psycopg://runtime/cryptbot")
+    monkeypatch.setenv("APP_LIVE_TRADING", "true")
+    monkeypatch.setenv("APP_LIVE__ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="live mode requires"):
+        cli._settings_from_yaml(config)

@@ -1089,13 +1089,14 @@ class ContinuousResearchPaperService:
             await self.notifier.send("Collector stopped", self.run_id, "error")
             return
         if self.market_event_action is not None:
-            for event in self.market_event_action():
+            for event in await asyncio.to_thread(self.market_event_action):
                 self.record_market_event(event)
 
     async def _snapshot_tick(self) -> None:
         if self.snapshot_action is not None:
             try:
-                self.bind_snapshot(self.snapshot_action(self.now()))
+                snapshot_id = await asyncio.to_thread(self.snapshot_action, self.now())
+                self.bind_snapshot(snapshot_id)
             except Exception as exc:
                 self.snapshot_failed(f"{type(exc).__name__}: {exc}")
                 await self.notifier.send(
@@ -1120,7 +1121,7 @@ class ContinuousResearchPaperService:
             ):
                 return
             try:
-                outcomes = self.research_action(run.last_snapshot_id)
+                outcomes = await asyncio.to_thread(self.research_action, run.last_snapshot_id)
                 for outcome in outcomes:
                     self.refresh_eligibility(
                         strategy_id=outcome.strategy_id,
