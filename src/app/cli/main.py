@@ -1221,33 +1221,34 @@ async def _renew_collector_leases(
     ttl_seconds: float = 90,
     renewal_timeout_seconds: float = 10,
 ) -> None:
-    while not shutdown.is_set():
-        try:
-            await asyncio.wait_for(shutdown.wait(), timeout=ttl_seconds / 3)
-            return
-        except TimeoutError:
+    def renew_until_stopped() -> None:
+        next_renewal = time.monotonic() + ttl_seconds / 3
+        while not shutdown.is_set():
+            remaining = next_renewal - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+                continue
             now = datetime.now(UTC)
             for group in groups:
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        repository.renew,
-                        group,
-                        run.run_id,
-                        run.owner_id,
-                        now + timedelta(seconds=ttl_seconds),
-                    ),
-                    timeout=renewal_timeout_seconds,
+                started = time.monotonic()
+                repository.renew(
+                    group,
+                    run.run_id,
+                    run.owner_id,
+                    now + timedelta(seconds=ttl_seconds),
                 )
-            current = await asyncio.wait_for(
-                asyncio.to_thread(repository.get_run, run.run_id),
-                timeout=renewal_timeout_seconds,
-            )
+                if time.monotonic() - started > renewal_timeout_seconds:
+                    raise TimeoutError("collector lease renewal timed out")
+            current = repository.get_run(run.run_id)
             if current is None:
                 raise RuntimeError("collector run registry entry disappeared") from None
-            await asyncio.wait_for(
-                asyncio.to_thread(repository.save_run, replace(current, heartbeat_at=now)),
-                timeout=renewal_timeout_seconds,
-            )
+            started = time.monotonic()
+            repository.save_run(replace(current, heartbeat_at=now))
+            if time.monotonic() - started > renewal_timeout_seconds:
+                raise TimeoutError("collector run heartbeat update timed out")
+            next_renewal = time.monotonic() + ttl_seconds / 3
+
+    await asyncio.to_thread(renew_until_stopped)
 
 
 @app.command("run-collector-soak")
