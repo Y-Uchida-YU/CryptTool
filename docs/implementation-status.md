@@ -1,4 +1,4 @@
-# Implementation status through Research Pipeline Phase R1
+# Implementation status through Research Data Operations Phase R2
 
 ## Completed
 
@@ -36,6 +36,15 @@ hash-verified research artifacts under one run identity. Liquidation, Whale and 
 hypotheses are explicitly deferred. The primary and challenger venues remain data-only for this
 phase; live execution remains disabled and no concrete execution adapter is introduced.
 
+Phase R2 connects the existing public REST and WebSocket adapter contracts to explicit production
+and experimental recording stores. Production membership requires a current LIVE_VERIFIED
+capability; other implemented feeds are retained only as experimental observations. Raw responses,
+normalized events, quarantine records, restart checkpoints, point-in-time instrument rules and
+ordered daily snapshot membership have separate durable identities. Finalized membership is
+immutable, hash-verifiable and reproducible, and database foreign keys bind research runs and
+artifacts to the exact data snapshot and strategy-scoped frozen hypothesis. Collection remains
+opt-in (`collection_enabled: false` by default), and live execution remains off.
+
 ## Verification snapshot
 
 Test counts and coverage values are intentionally not copied into this document. CI generates
@@ -49,8 +58,8 @@ not representative market history and must not be cited as evidence of a trading
 ## Remaining before an edge can be evaluated
 
 - Select an exchange/data vendor that the operator is currently permitted to use.
-- Operate the durable raw ingestion, quarantine and checkpoint stores against licensed production
-  feeds for the selected venues.
+- Operate the opt-in R2 collector against licensed production feeds and retain its daily verified
+  snapshot manifests.
 - Acquire licensed, point-in-time OHLCV, funding, OI, liquidation and book data with survivorship
   and outage records.
 - Freeze production hypotheses and parameter grids before observing final results.

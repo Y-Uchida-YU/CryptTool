@@ -37,6 +37,7 @@ from app.config.settings import Settings
 from app.domain.execution.models import InstrumentRules, MarketSnapshot, OrderType, TimeInForce
 from app.domain.features.engine import FeatureEngine
 from app.domain.market_data.models import OHLCV, Side
+from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.infrastructure.database.session import build_engine
 from app.services.backtest.engine import BacktestEngine
 from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
@@ -48,6 +49,13 @@ from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
 from app.services.regime_engine.rules import DeterministicRuleEngine
 from app.services.reporting.report import AcceptanceAssessment, generate_report
+from app.services.research.data_operations import (
+    DataSnapshotService,
+    PublicAdapterCollectorSource,
+    ResearchMarketDataCollector,
+    TrustedResearchCapabilityGate,
+    write_snapshot_manifest,
+)
 from app.services.research.models import ResearchRunResult
 from app.services.research.pipeline import ResearchPipeline
 from app.services.research.report import ResearchArtifactWriter
@@ -470,6 +478,100 @@ def generate_research_report(
         f"report={manifest_path} snapshot={manifest['data_snapshot_id']} "
         f"files={len(files)} hashes=verified"
     )
+
+
+def _research_data_adapter(name: str) -> PublicRestAdapter:
+    adapters: dict[str, type[PublicRestAdapter]] = {
+        "hyperliquid": HyperliquidMarketDataAdapter,
+        "bitget": BitgetMarketDataAdapter,
+        "aster": AsterMarketDataAdapter,
+        "mexc": MexcMarketDataAdapter,
+        "dydx": DydxMarketDataAdapter,
+        "paradex": ParadexMarketDataAdapter,
+        "lighter": LighterMarketDataAdapter,
+    }
+    try:
+        return adapters[name]()
+    except KeyError as exc:
+        raise typer.BadParameter(f"unsupported R2 research venue: {name}") from exc
+
+
+@app.command("collect-research-data")
+def collect_research_data(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+) -> None:
+    """Collect public market data; unverified capabilities remain experimental."""
+    settings = Settings(_yaml_file=config)  # type: ignore[call-arg]
+    collection = settings.research_collection
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("research collection requires live execution to remain OFF")
+    if not collection.collection_enabled:
+        raise typer.BadParameter("collection_enabled=true is required")
+    adapters = tuple(_research_data_adapter(name) for name in collection.venues)
+    registry = TrustedCapabilityRegistry.from_artifacts(
+        Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
+    )
+    engine = build_engine(settings.database_url)
+    try:
+        collector = ResearchMarketDataCollector(
+            repository=PostgreSQLResearchRepository(engine),
+            sources=tuple(
+                PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
+            ),
+            capability_gate=TrustedResearchCapabilityGate(registry),
+            instruments=collection.instruments,
+            event_types=collection.event_types,
+            collection_enabled=True,
+            poll_interval_seconds=collection.poll_interval_seconds,
+            maximum_cycles=collection.maximum_cycles,
+            stale_after_seconds=collection.stale_after_seconds,
+        )
+        asyncio.run(collector.run())
+        result = collector.result
+        typer.echo(
+            f"production={result.production_counts} experimental={result.experimental_counts} "
+            f"quarantine={result.quarantine_count} live_execution=OFF"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("finalize-data-snapshot")
+def finalize_data_snapshot(
+    cutoff: Annotated[str, typer.Option("--cutoff")],
+) -> None:
+    """Finalize immutable daily point-in-time membership and canonical manifest."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        manifest = DataSnapshotService(PostgreSQLResearchRepository(engine)).finalize(
+            cutoff_at=_timestamp(cutoff)
+        )
+        path = Path("artifacts/data-snapshots") / manifest.snapshot_id / "manifest.json"
+        write_snapshot_manifest(path, manifest)
+        typer.echo(
+            f"snapshot_id={manifest.snapshot_id} events={len(manifest.events)} "
+            f"manifest_sha256={manifest.manifest_sha256} quarantine={manifest.quarantine_count}"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("verify-data-snapshot")
+def verify_data_snapshot(
+    snapshot_id: Annotated[str, typer.Option("--snapshot-id", min=1)],
+) -> None:
+    """Reproduce ordered membership and verify every payload and manifest hash."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        manifest = DataSnapshotService(PostgreSQLResearchRepository(engine)).verify(snapshot_id)
+        typer.echo(
+            f"snapshot_id={snapshot_id} events={len(manifest.events)} "
+            f"manifest_sha256={manifest.manifest_sha256} verified=true"
+        )
+    finally:
+        engine.dispose()
 
 
 @app.command("paper-trade")

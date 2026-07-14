@@ -33,6 +33,7 @@ from app.services.research.models import (
     DataQualityResult,
     FeatureArtifact,
     FrozenHypothesis,
+    InstrumentRuleSnapshot,
     OverfittingResult,
     PerformanceSummary,
     PointInTimeDataset,
@@ -87,14 +88,15 @@ STRESS_SCENARIOS = (
 
 class FrozenHypothesisRegistry:
     def __init__(self) -> None:
-        self._items: dict[str, FrozenHypothesis] = {}
+        self._items: dict[tuple[str, str], FrozenHypothesis] = {}
 
     def freeze(self, hypothesis: FrozenHypothesis) -> FrozenHypothesis:
         hypothesis.verify()
-        current = self._items.get(hypothesis.hypothesis_version)
+        key = (hypothesis.strategy_id, hypothesis.hypothesis_version)
+        current = self._items.get(key)
         if current is not None and current.content_sha256 != hypothesis.content_sha256:
             raise ValueError("parameter changes require a new hypothesis_version")
-        self._items[hypothesis.hypothesis_version] = hypothesis
+        self._items[key] = hypothesis
         return hypothesis
 
 
@@ -311,7 +313,6 @@ class ResearchPipeline:
             ),
             **identity_payload,
         )
-        self.repository.save_run(identity, "running", None)
         configured_event_ids: set[str] = set()
         for raw in config.get("raw_events", []):
             if not isinstance(raw, dict):
@@ -355,6 +356,7 @@ class ResearchPipeline:
             venues=venues,
             event_types=tuple(str(item) for item in config["event_types"]),
         )
+        self.repository.save_run(identity, "running", None)
         relevant_event_ids = tuple(
             item.event_id
             for item in self.repository.raw_events()
@@ -529,7 +531,13 @@ class ResearchPipeline:
         latest_oi: dict[tuple[str, str], Decimal] = {}
         rows: list[dict[str, Any]] = []
         previous_mid: dict[tuple[str, str], Decimal] = {}
-        event_priority = {"funding_rate": 0, "open_interest": 1, "orderbook_snapshot": 2}
+        event_priority = {
+            "funding_rate": 0,
+            "funding_current": 0,
+            "funding_history": 0,
+            "open_interest": 1,
+            "orderbook_snapshot": 2,
+        }
         for value in sorted(
             dataset.values,
             key=lambda item: (
@@ -540,7 +548,7 @@ class ResearchPipeline:
         ):
             value.require_available(value.available_at)
             key = (value.venue, value.canonical_instrument_id)
-            if value.event_type == "funding_rate":
+            if value.event_type in {"funding_rate", "funding_current", "funding_history"}:
                 latest_funding[key] = _decimal(value.payload.get("rate"))
             elif value.event_type == "open_interest":
                 latest_oi[key] = _decimal(
@@ -618,23 +626,76 @@ class ResearchPipeline:
             canonical_sha256(regimes),
         )
 
-    @staticmethod
     def _rules(
-        config: dict[str, Any], dataset: PointInTimeDataset
+        self, config: dict[str, Any], dataset: PointInTimeDataset
     ) -> dict[tuple[str, str], InstrumentRules]:
-        configured = config.get("instrument_rules", {})
+        requested_ids = tuple(str(item) for item in config.get("rule_snapshot_ids", ()))
+        if not requested_ids:
+            if not config.get("raw_events"):
+                raise ValueError(
+                    "production research requires frozen rule_snapshot_ids from R2 collection"
+                )
+            # Compatibility import for deterministic R1 fixtures: values are persisted as
+            # immutable snapshots before the backtest consumes them.
+            configured = config.get("instrument_rules", {})
+            imported: list[str] = []
+            for venue, instrument, symbol in {
+                (item.venue, item.canonical_instrument_id, item.venue_symbol)
+                for item in dataset.values
+            }:
+                raw = dict(configured.get(f"{venue}:{instrument}", configured.get("default", {})))
+                source_hash = canonical_sha256(raw)
+                rule_id = f"rule-{venue}-{instrument}-{source_hash[:16]}"
+                self.repository.save_instrument_rule(
+                    InstrumentRuleSnapshot(
+                        rule_snapshot_id=rule_id,
+                        venue=venue,
+                        canonical_instrument_id=instrument,
+                        venue_symbol=symbol,
+                        tick_size=_decimal(raw.get("tick_size", "0.01")),
+                        lot_size=_decimal(raw.get("lot_size", "0.001")),
+                        minimum_quantity=_decimal(
+                            raw.get("minimum_quantity", raw.get("lot_size", "0.001"))
+                        ),
+                        minimum_notional=_decimal(raw.get("minimum_notional", "5")),
+                        maker_fee=max(Decimal(0), _decimal(raw.get("maker_fee_rate", "0"))),
+                        taker_fee=_decimal(raw.get("taker_fee_rate", "0.0006")),
+                        maker_rebate=max(Decimal(0), -_decimal(raw.get("maker_fee_rate", "0"))),
+                        funding_interval=int(raw.get("funding_interval", 8)),
+                        margin_asset=str(raw.get("margin_asset", "USD")),
+                        source_endpoint="fixture:legacy-instrument-rules",
+                        source_payload_sha256=source_hash,
+                        retrieved_at=dataset.cutoff_at,
+                        valid_from=dataset.cutoff_at,
+                        valid_until=None,
+                    )
+                )
+                imported.append(rule_id)
+            requested_ids = tuple(sorted(imported))
+        frozen = self.repository.instrument_rules(requested_ids)
+        available = {(item.venue, item.canonical_instrument_id): item for item in frozen}
         rules: dict[tuple[str, str], InstrumentRules] = {}
         symbols = {
             (item.venue, item.canonical_instrument_id, item.venue_symbol) for item in dataset.values
         }
         for venue, instrument, symbol in symbols:
-            raw = dict(configured.get(f"{venue}:{instrument}", configured.get("default", {})))
+            try:
+                rule_snapshot = available[(venue, instrument)]
+            except KeyError as exc:
+                raise ValueError(f"frozen instrument rule missing: {venue}/{instrument}") from exc
+            if rule_snapshot.venue_symbol != symbol:
+                raise ValueError("frozen instrument rule venue symbol mismatch")
+            if not rule_snapshot.valid_from <= dataset.cutoff_at or (
+                rule_snapshot.valid_until is not None
+                and dataset.cutoff_at >= rule_snapshot.valid_until
+            ):
+                raise ValueError("instrument rule snapshot is not valid at dataset cutoff")
             rules[(venue, symbol)] = InstrumentRules(
-                tick_size=_decimal(raw.get("tick_size", "0.01")),
-                lot_size=_decimal(raw.get("lot_size", "0.001")),
-                minimum_notional=_decimal(raw.get("minimum_notional", "5")),
-                maker_fee_rate=_decimal(raw.get("maker_fee_rate", "-0.0001")),
-                taker_fee_rate=_decimal(raw.get("taker_fee_rate", "0.0006")),
+                tick_size=rule_snapshot.tick_size,
+                lot_size=rule_snapshot.lot_size,
+                minimum_notional=rule_snapshot.minimum_notional,
+                maker_fee_rate=rule_snapshot.maker_fee - rule_snapshot.maker_rebate,
+                taker_fee_rate=rule_snapshot.taker_fee,
             )
         return rules
 
@@ -716,7 +777,7 @@ class ResearchPipeline:
             signals = self._strategy_signals(identity, dataset, config, scenario)
             engine.add_events(signals)
         for value in dataset.values:
-            if value.event_type == "funding_rate":
+            if value.event_type in {"funding_rate", "funding_current", "funding_history"}:
                 edge_multiplier = (
                     Decimal("0.5")
                     if scenario == "funding_edge_minus_50pct"
@@ -754,7 +815,11 @@ class ResearchPipeline:
         )
         use_maker = bool(config.get("use_maker_orders", False))
         minimum_edge = _decimal(config.get("minimum_strategy_edge", "0"))
-        funding_values = [item for item in dataset.values if item.event_type == "funding_rate"]
+        funding_values = [
+            item
+            for item in dataset.values
+            if item.event_type in {"funding_rate", "funding_current", "funding_history"}
+        ]
         sequence = 0
         for timestamp, items in groups.items():
             legs: list[tuple[Any, Side]] = []

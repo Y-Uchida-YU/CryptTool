@@ -3,6 +3,13 @@ symbols: [BTC, ETH, SOL]
 timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
 paper_trading: true
 live_trading: false
+research_collection:
+  collection_enabled: false
+  venues: []
+  instruments: [BTC, ETH, SOL, HYPE]
+  event_types: [ohlcv, trade, orderbook_snapshot, orderbook_delta, funding_current, funding_history, open_interest, mark_price, index_price]
+  poll_interval_seconds: 30
+  stale_after_seconds: 120
 risk:
   leverage: 1.0
   max_risk_per_trade: 0.0025
