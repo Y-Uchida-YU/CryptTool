@@ -6,6 +6,8 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Float,
+    ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     Numeric,
     String,
@@ -103,7 +105,35 @@ class RawMarketEventRow(Base):
     raw_payload: Mapped[str] = mapped_column(Text)
     normalizer_version: Mapped[str] = mapped_column(String(80))
     capability_verification_run_id: Mapped[str] = mapped_column(String(160))
+    raw_payload_id: Mapped[str | None] = mapped_column(
+        String(160), ForeignKey("raw_market_payloads.payload_id")
+    )
+    source_payload_sha256: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class RawMarketPayloadRow(Base):
+    __tablename__ = "raw_market_payloads"
+    payload_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    source_endpoint: Mapped[str] = mapped_column(String(500))
+    payload_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    raw_payload: Mapped[str] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ExperimentalMarketEventRow(Base):
+    __tablename__ = "experimental_market_events"
+    event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
+    venue_symbol: Mapped[str] = mapped_column(String(100))
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    raw_payload: Mapped[str] = mapped_column(Text)
+    capability_support: Mapped[str] = mapped_column(String(40))
+    capability_verification_run_id: Mapped[str | None] = mapped_column(String(160))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class MarketDataQuarantineRow(Base):
@@ -117,8 +147,10 @@ class MarketDataQuarantineRow(Base):
 
 class MarketDataCheckpointRow(Base):
     __tablename__ = "market_data_checkpoints"
+    __table_args__ = (UniqueConstraint("venue", "stream_key"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     venue: Mapped[str] = mapped_column(String(40), index=True)
+    stream_key: Mapped[str] = mapped_column(String(200), default="default")
     connection_id: Mapped[str] = mapped_column(String(36))
     last_sequence: Mapped[int | None] = mapped_column(BigInteger)
     last_event_id: Mapped[str | None] = mapped_column(String(160))
@@ -132,15 +164,64 @@ class DataSnapshotRow(Base):
     cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     event_count: Mapped[int] = mapped_column(Integer)
     content_sha256: Mapped[str] = mapped_column(String(64))
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    manifest_json: Mapped[str | None] = mapped_column(Text)
+    quarantine_count: Mapped[int] = mapped_column(Integer, default=0)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DataSnapshotEventRow(Base):
+    __tablename__ = "data_snapshot_events"
+    __table_args__ = (UniqueConstraint("snapshot_id", "ordinal"),)
+    snapshot_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("data_snapshots.snapshot_id"), primary_key=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("raw_market_events.event_id"), primary_key=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    event_payload_sha256: Mapped[str] = mapped_column(String(64))
+    included_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class InstrumentRuleSnapshotRow(Base):
+    __tablename__ = "instrument_rule_snapshots"
+    rule_snapshot_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
+    venue_symbol: Mapped[str] = mapped_column(String(100))
+    tick_size: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    lot_size: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    minimum_quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    minimum_notional: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    maker_fee: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    taker_fee: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    maker_rebate: Mapped[Decimal] = mapped_column(Numeric(38, 18))
+    funding_interval: Mapped[int] = mapped_column(Integer)
+    margin_asset: Mapped[str] = mapped_column(String(40))
+    source_endpoint: Mapped[str] = mapped_column(String(500))
+    source_payload_sha256: Mapped[str] = mapped_column(String(64))
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ResearchRunRow(Base):
     __tablename__ = "research_runs"
+    __table_args__ = (
+        UniqueConstraint("run_id", "data_snapshot_id"),
+        ForeignKeyConstraint(
+            ["strategy_id", "hypothesis_version"],
+            ["frozen_hypotheses.strategy_id", "frozen_hypotheses.hypothesis_version"],
+        ),
+    )
     run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
     commit_sha: Mapped[str] = mapped_column(String(80))
     config_sha256: Mapped[str] = mapped_column(String(64))
-    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    data_snapshot_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("data_snapshots.snapshot_id"), index=True
+    )
     hypothesis_version: Mapped[str] = mapped_column(String(80))
     strategy_id: Mapped[str] = mapped_column(String(100))
     strategy_version: Mapped[str] = mapped_column(String(40))
@@ -153,7 +234,7 @@ class ResearchRunRow(Base):
 class FrozenHypothesisRow(Base):
     __tablename__ = "frozen_hypotheses"
     hypothesis_version: Mapped[str] = mapped_column(String(80), primary_key=True)
-    strategy_id: Mapped[str] = mapped_column(String(100))
+    strategy_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     content_sha256: Mapped[str] = mapped_column(String(64))
     content_json: Mapped[str] = mapped_column(Text)
     frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -161,9 +242,17 @@ class FrozenHypothesisRow(Base):
 
 class ResearchArtifactRow(Base):
     __tablename__ = "research_artifacts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "data_snapshot_id"],
+            ["research_runs.run_id", "research_runs.data_snapshot_id"],
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[str] = mapped_column(String(160), index=True)
-    data_snapshot_id: Mapped[str] = mapped_column(String(160), index=True)
+    data_snapshot_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("data_snapshots.snapshot_id"), index=True
+    )
     artifact_type: Mapped[str] = mapped_column(String(80))
     path: Mapped[str] = mapped_column(String(500))
     content_sha256: Mapped[str] = mapped_column(String(64))

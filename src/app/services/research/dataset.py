@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from app.adapters.exchanges.websocket import ReconciliationState
+from app.services.research.data_operations import DataSnapshotService
 from app.services.research.models import (
     DataQualityResult,
     PointInTimeDataset,
@@ -38,8 +39,16 @@ class PointInTimeDatasetBuilder:
         outages: list[str] = []
         hash_records: list[tuple[object, ...]] = []
         previous_sequences: dict[tuple[str, str, str, object], int] = {}
+        finalized = self.repository.snapshot_manifest(snapshot_id)
+        if finalized is not None and finalized.cutoff_at != cutoff:
+            raise ValueError("requested cutoff does not match finalized snapshot")
+        source_events = (
+            self.repository.snapshot_events(snapshot_id)
+            if finalized is not None
+            else self.repository.raw_events()
+        )
         for event in sorted(
-            self.repository.raw_events(),
+            source_events,
             key=lambda item: (item.available_at, item.event_id),
         ):
             if (
@@ -114,10 +123,17 @@ class PointInTimeDatasetBuilder:
             )
             if bool(payload.get("delisted")):
                 delisted.append(event.event_id)
-            if event.event_type == "venue_outage" or bool(payload.get("outage")):
+            if event.event_type in {"venue_outage", "websocket_disconnect"} or bool(
+                payload.get("outage")
+            ):
                 outages.append(event.event_id)
         content_hash = canonical_sha256(hash_records)
-        self.repository.save_snapshot(snapshot_id, cutoff, len(selected), content_hash)
+        if finalized is None:
+            DataSnapshotService(self.repository).finalize(
+                cutoff_at=cutoff,
+                snapshot_id=snapshot_id,
+                finalized_at=cutoff,
+            )
         return PointInTimeDataset(
             snapshot_id=snapshot_id,
             cutoff_at=cutoff,
@@ -176,7 +192,8 @@ def evaluate_data_quality(
         (
             Decimal(str(item.payload.get("duration_seconds", 0)))
             for item in values
-            if item.event_type == "venue_outage" or bool(item.payload.get("outage"))
+            if item.event_type in {"venue_outage", "websocket_disconnect"}
+            or bool(item.payload.get("outage"))
         ),
         start=Decimal(0),
     )
@@ -196,7 +213,7 @@ def evaluate_data_quality(
     funding_keys = {
         (item.venue, item.canonical_instrument_id)
         for item in values
-        if item.event_type == "funding_rate"
+        if item.event_type in {"funding_rate", "funding_current", "funding_history"}
     }
     oi_keys = {
         (item.venue, item.canonical_instrument_id)
@@ -239,7 +256,13 @@ def evaluate_data_quality(
         reasons.append("clock skew above threshold")
     if divergence > maximum_cross_venue_divergence:
         reasons.append("cross-venue divergence above threshold")
-    if "funding_rate" in dataset.event_types and len(funding_keys) < expected_windows:
+    if (
+        any(
+            name in dataset.event_types
+            for name in ("funding_rate", "funding_current", "funding_history")
+        )
+        and len(funding_keys) < expected_windows
+    ):
         reasons.append("missing funding windows")
     if "open_interest" in dataset.event_types and len(oi_keys) < expected_windows:
         reasons.append("missing open-interest windows")
@@ -278,7 +301,7 @@ def _validate_payload(event_type: str, payload: dict[str, Any]) -> None:
         ask_depth = Decimal(str(payload["ask_depth"]))
         if bid <= 0 or ask <= bid or min(bid_depth, ask_depth) < 0:
             raise ValueError("invalid orderbook schema")
-    elif event_type == "funding_rate":
+    elif event_type in {"funding_rate", "funding_current", "funding_history"}:
         Decimal(str(payload["rate"]))
         if Decimal(str(payload["mark_price"])) <= 0:
             raise ValueError("invalid funding schema")

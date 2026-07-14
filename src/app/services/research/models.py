@@ -91,6 +91,8 @@ class RawMarketEvent:
     normalizer_version: str
     capability_verification_run_id: str
     created_at: datetime
+    raw_payload_id: str | None = None
+    source_payload_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -128,6 +130,72 @@ class QuarantinedMarketEvent:
     event: RawMarketEvent
     reason: str
     quarantined_at: datetime
+
+
+@dataclass(frozen=True)
+class DataSnapshotManifest:
+    snapshot_id: str
+    cutoff_at: datetime
+    events: tuple[tuple[int, str, str], ...]
+    quarantine_count: int
+    quarantine_reasons: tuple[tuple[str, int], ...]
+    outage_event_ids: tuple[str, ...]
+    degraded_event_ids: tuple[str, ...]
+    content_sha256: str
+    manifest_sha256: str
+    finalized_at: datetime
+
+
+@dataclass(frozen=True)
+class InstrumentRuleSnapshot:
+    rule_snapshot_id: str
+    venue: str
+    canonical_instrument_id: str
+    venue_symbol: str
+    tick_size: Decimal
+    lot_size: Decimal
+    minimum_quantity: Decimal
+    minimum_notional: Decimal
+    maker_fee: Decimal
+    taker_fee: Decimal
+    maker_rebate: Decimal
+    funding_interval: int
+    margin_asset: str
+    source_endpoint: str
+    source_payload_sha256: str
+    retrieved_at: datetime
+    valid_from: datetime
+    valid_until: datetime | None
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.rule_snapshot_id,
+                self.venue,
+                self.canonical_instrument_id,
+                self.venue_symbol,
+                self.margin_asset,
+                self.source_endpoint,
+            )
+        ):
+            raise ValueError("instrument rule snapshot identities are required")
+        if len(self.source_payload_sha256) != 64:
+            raise ValueError("source_payload_sha256 must be a SHA-256 digest")
+        for name in ("retrieved_at", "valid_from"):
+            object.__setattr__(self, name, utc(getattr(self, name), name))
+        if self.valid_until is not None:
+            object.__setattr__(self, "valid_until", utc(self.valid_until, "valid_until"))
+
+
+@dataclass(frozen=True)
+class CollectionCheckpoint:
+    venue: str
+    stream_key: str
+    connection_id: UUID
+    last_sequence: int | None
+    last_event_id: str | None
+    reconciliation_state: ReconciliationState
+    checkpointed_at: datetime
 
 
 @dataclass(frozen=True)

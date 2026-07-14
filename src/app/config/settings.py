@@ -121,6 +121,26 @@ class LiveTradingSettings(BaseModel):
     withdrawal_permission_confirmed_disabled: bool = True
 
 
+class ResearchCollectionSettings(BaseModel):
+    collection_enabled: bool = False
+    venues: tuple[str, ...] = ()
+    instruments: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE")
+    event_types: tuple[str, ...] = (
+        "ohlcv",
+        "trade",
+        "orderbook_snapshot",
+        "orderbook_delta",
+        "funding_current",
+        "funding_history",
+        "open_interest",
+        "mark_price",
+        "index_price",
+    )
+    poll_interval_seconds: float = Field(30, gt=0)
+    stale_after_seconds: int = Field(120, ge=1)
+    maximum_cycles: int | None = Field(None, ge=1)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="APP_",
@@ -147,6 +167,9 @@ class Settings(BaseSettings):
     validation: ValidationSettings = Field(default_factory=ValidationSettings)  # type: ignore[arg-type]
     paper: PaperTradingSettings = Field(default_factory=PaperTradingSettings)  # type: ignore[arg-type]
     live: LiveTradingSettings = Field(default_factory=LiveTradingSettings)  # type: ignore[arg-type]
+    research_collection: ResearchCollectionSettings = Field(
+        default_factory=ResearchCollectionSettings  # type: ignore[arg-type]
+    )
     exchanges: tuple[ExchangeSettings, ...] = (
         ExchangeSettings(name="bybit_public", data_enabled=False),
     )

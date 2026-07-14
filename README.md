@@ -65,6 +65,10 @@ uv run app live-preflight  # intentionally exits 2 with the disabled adapter
 uv run app venue-status
 uv run app venue-capabilities hyperliquid
 uv run app public-data-smoke hyperliquid  # public metadata only
+# R2 collection is fail-closed unless its config explicitly sets collection_enabled: true.
+uv run app collect-research-data --config YOUR_EXPLICIT_COLLECTION_CONFIG.yaml
+uv run app finalize-data-snapshot --cutoff 2026-07-14T00:00:00Z
+uv run app verify-data-snapshot --snapshot-id SNAPSHOT_ID
 ```
 
 The generated research report deliberately returns `INSUFFICIENT_EVIDENCE` until external,
