@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from app.cli.main import app
@@ -130,3 +131,38 @@ def test_feature_regime_validation_and_report_cli(tmp_path: Path) -> None:
     assert report.exit_code == 0, report.output
     assert "INSUFFICIENT_EVIDENCE" in report.output
     assert (report_directory / "report.md").exists()
+
+
+def test_collector_health_report_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = "collector-soak-test"
+    monkeypatch.chdir(tmp_path)
+    directory = Path("artifacts/collector-soak") / run_id
+    directory.mkdir(parents=True)
+    (directory / "health.json").write_text(
+        json.dumps(
+            {
+                "live_execution": "OFF",
+                "production_counts": {"hyperliquid": 10},
+                "experimental_counts": {},
+                "quarantine_count": 0,
+                "health": {
+                    "events_by_venue_type_instrument": {"hyperliquid:trade:BTC": 10},
+                    "disconnect_count": 0,
+                    "reconnect_count": 0,
+                    "sequence_gaps": 0,
+                    "snapshot_recoveries": 1,
+                    "stale_duration_seconds": 0,
+                    "checkpoint_lag_seconds": 0.1,
+                    "duplicate_ratio": 0,
+                    "memory_usage_bytes": 1024,
+                    "task_count": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["generate-collector-health-report", "--run-id", run_id])
+    assert result.exit_code == 0, result.output
+    summary = (directory / "summary.md").read_text(encoding="utf-8")
+    assert "Live execution: OFF" in summary
+    assert "Checkpoint lag seconds: 0.1" in summary

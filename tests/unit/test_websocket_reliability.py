@@ -414,6 +414,12 @@ def test_duplicate_cache_remains_bounded() -> None:
     assert value._seen_payload(current, "d")
 
 
+def test_default_heartbeat_accepts_mapping_messages_without_hashing_them() -> None:
+    value = session()
+    assert not value.heartbeat({"channel": "trades", "data": []})
+    assert value.heartbeat("ping")
+
+
 def active_reader_tasks() -> list[asyncio.Task[object]]:
     return [
         task

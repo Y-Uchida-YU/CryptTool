@@ -12,6 +12,7 @@ from typing import Annotated, Any
 import numpy as np
 import pandas as pd
 import typer
+import yaml  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
@@ -53,7 +54,9 @@ from app.services.research.data_operations import (
     DataSnapshotService,
     PublicAdapterCollectorSource,
     ResearchMarketDataCollector,
+    SnapshotEligibilityPolicy,
     TrustedResearchCapabilityGate,
+    write_collector_health_report,
     write_snapshot_manifest,
 )
 from app.services.research.models import ResearchRunResult
@@ -93,6 +96,13 @@ def _write_json(path: Path, payload: object) -> None:
         json.dumps(payload, default=_json_default, indent=2, sort_keys=True), encoding="utf-8"
     )
     temporary.replace(path)
+
+
+def _settings_from_yaml(path: Path) -> Settings:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("settings config must be a YAML mapping")
+    return Settings(**payload)
 
 
 @app.command("validate-config")
@@ -501,12 +511,14 @@ def collect_research_data(
     config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
 ) -> None:
     """Collect public market data; unverified capabilities remain experimental."""
-    settings = Settings(_yaml_file=config)  # type: ignore[call-arg]
+    settings = _settings_from_yaml(config)
     collection = settings.research_collection
     if settings.live_trading or settings.live.enabled:
         raise typer.BadParameter("research collection requires live execution to remain OFF")
     if not collection.collection_enabled:
         raise typer.BadParameter("collection_enabled=true is required")
+    if not collection.venues:
+        raise typer.BadParameter("at least one research collection venue is required")
     adapters = tuple(_research_data_adapter(name) for name in collection.venues)
     registry = TrustedCapabilityRegistry.from_artifacts(
         Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
@@ -536,6 +548,111 @@ def collect_research_data(
         engine.dispose()
 
 
+async def _run_collector_for_duration(
+    collector: ResearchMarketDataCollector, duration_seconds: float
+) -> None:
+    collector_task = asyncio.create_task(collector.run(), name="research-collector-soak")
+    timer = asyncio.create_task(asyncio.sleep(duration_seconds), name="collector-soak-timer")
+    done, _ = await asyncio.wait({collector_task, timer}, return_when=asyncio.FIRST_COMPLETED)
+    if collector_task in done:
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await collector_task
+        return
+    collector.shutdown()
+    await collector_task
+
+
+@app.command("run-collector-soak")
+def run_collector_soak(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    duration_hours: Annotated[float, typer.Option("--duration-hours", min=0.001)] = 24,
+) -> None:
+    """Run a bounded collector soak and persist operational health evidence."""
+    settings = _settings_from_yaml(config)
+    collection = settings.research_collection
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("collector soak requires live execution to remain OFF")
+    if not collection.collection_enabled:
+        raise typer.BadParameter("collection_enabled=true is required")
+    if not collection.venues:
+        raise typer.BadParameter("at least one research collection venue is required")
+    adapters = tuple(_research_data_adapter(name) for name in collection.venues)
+    registry = TrustedCapabilityRegistry.from_artifacts(
+        Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
+    )
+    engine = build_engine(settings.database_url)
+    started_at = datetime.now(UTC)
+    run_id = f"collector-soak-{started_at.strftime('%Y%m%dT%H%M%SZ')}"
+    try:
+        collector = ResearchMarketDataCollector(
+            repository=PostgreSQLResearchRepository(engine),
+            sources=tuple(
+                PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
+            ),
+            capability_gate=TrustedResearchCapabilityGate(registry),
+            instruments=collection.instruments,
+            event_types=collection.event_types,
+            collection_enabled=True,
+            poll_interval_seconds=collection.poll_interval_seconds,
+            maximum_cycles=None,
+            stale_after_seconds=collection.stale_after_seconds,
+        )
+        asyncio.run(_run_collector_for_duration(collector, duration_hours * 3600))
+        completed_at = datetime.now(UTC)
+        result = collector.result
+        payload: dict[str, object] = {
+            "run_id": run_id,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "configured_duration_hours": duration_hours,
+            "production_counts": result.production_counts,
+            "experimental_counts": result.experimental_counts,
+            "quarantine_count": result.quarantine_count,
+            "health": result.health,
+            "live_execution": "OFF",
+        }
+        path = Path("artifacts/collector-soak") / run_id / "health.json"
+        write_collector_health_report(path, payload)
+        typer.echo(f"run_id={run_id} health={path} live_execution=OFF")
+    finally:
+        engine.dispose()
+
+
+@app.command("generate-collector-health-report")
+def generate_collector_health_report(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Generate a concise Markdown report from persisted soak health metrics."""
+    directory = Path("artifacts/collector-soak") / run_id
+    source = directory / "health.json"
+    if not source.is_file():
+        raise typer.BadParameter(f"unknown collector soak run: {run_id}")
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    health = payload.get("health", {})
+    lines = [
+        f"# Collector health: {run_id}",
+        "",
+        f"- Live execution: {payload.get('live_execution')}",
+        f"- Production events: {payload.get('production_counts')}",
+        f"- Experimental events: {payload.get('experimental_counts')}",
+        f"- Quarantine count: {payload.get('quarantine_count')}",
+        f"- Events by venue/type/instrument: {health.get('events_by_venue_type_instrument')}",
+        f"- Disconnects: {health.get('disconnect_count')}",
+        f"- Reconnects: {health.get('reconnect_count')}",
+        f"- Sequence gaps: {health.get('sequence_gaps')}",
+        f"- Snapshot recoveries: {health.get('snapshot_recoveries')}",
+        f"- Stale duration seconds: {health.get('stale_duration_seconds')}",
+        f"- Checkpoint lag seconds: {health.get('checkpoint_lag_seconds')}",
+        f"- Duplicate ratio: {health.get('duplicate_ratio')}",
+        f"- Memory usage bytes: {health.get('memory_usage_bytes')}",
+        f"- Task count: {health.get('task_count')}",
+    ]
+    report = directory / "summary.md"
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    typer.echo(f"run_id={run_id} report={report}")
+
+
 @app.command("finalize-data-snapshot")
 def finalize_data_snapshot(
     cutoff: Annotated[str, typer.Option("--cutoff")],
@@ -545,13 +662,24 @@ def finalize_data_snapshot(
     engine = build_engine(settings.database_url)
     try:
         manifest = DataSnapshotService(PostgreSQLResearchRepository(engine)).finalize(
-            cutoff_at=_timestamp(cutoff)
+            cutoff_at=_timestamp(cutoff),
+            eligibility_policy=SnapshotEligibilityPolicy(
+                required_event_types=settings.research_collection.event_types,
+                required_venues=settings.research_collection.venues,
+                minimum_production_events=(settings.research_collection.minimum_production_events),
+                maximum_gap_ratio=Decimal(str(settings.research_collection.maximum_gap_ratio)),
+                maximum_stale_ratio=Decimal(str(settings.research_collection.maximum_stale_ratio)),
+                require_complete_instrument_rules=(
+                    settings.research_collection.require_complete_instrument_rules
+                ),
+            ),
         )
         path = Path("artifacts/data-snapshots") / manifest.snapshot_id / "manifest.json"
         write_snapshot_manifest(path, manifest)
         typer.echo(
             f"snapshot_id={manifest.snapshot_id} events={len(manifest.events)} "
-            f"manifest_sha256={manifest.manifest_sha256} quarantine={manifest.quarantine_count}"
+            f"manifest_sha256={manifest.manifest_sha256} quarantine={manifest.quarantine_count} "
+            f"eligibility={manifest.eligibility_status}"
         )
     finally:
         engine.dispose()

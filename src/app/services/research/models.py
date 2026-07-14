@@ -93,6 +93,10 @@ class RawMarketEvent:
     created_at: datetime
     raw_payload_id: str | None = None
     source_payload_sha256: str | None = None
+    channel: str = "unknown"
+    snapshot_sequence: int | None = None
+    delta_sequence: int | None = None
+    connection_epoch: int | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -144,6 +148,21 @@ class DataSnapshotManifest:
     content_sha256: str
     manifest_sha256: str
     finalized_at: datetime
+    eligibility_status: str = "FINALIZED_NOT_ELIGIBLE"
+    eligibility_reasons: tuple[str, ...] = ()
+
+
+class RuleVerificationStatus(StrEnum):
+    UNKNOWN = "unknown"
+    OBSERVED = "observed"
+    VERIFIED = "verified"
+
+
+class FeeTierKind(StrEnum):
+    UNKNOWN = "unknown"
+    DEFAULT_PUBLIC = "default_public_tier"
+    OPERATOR_ACCOUNT = "operator_account_tier"
+    HISTORICAL = "historical_tier"
 
 
 @dataclass(frozen=True)
@@ -152,20 +171,23 @@ class InstrumentRuleSnapshot:
     venue: str
     canonical_instrument_id: str
     venue_symbol: str
-    tick_size: Decimal
-    lot_size: Decimal
-    minimum_quantity: Decimal
-    minimum_notional: Decimal
-    maker_fee: Decimal
-    taker_fee: Decimal
-    maker_rebate: Decimal
-    funding_interval: int
-    margin_asset: str
+    tick_size: Decimal | None
+    lot_size: Decimal | None
+    minimum_quantity: Decimal | None
+    minimum_notional: Decimal | None
+    maker_fee: Decimal | None
+    taker_fee: Decimal | None
+    maker_rebate: Decimal | None
+    funding_interval: int | None
+    margin_asset: str | None
     source_endpoint: str
     source_payload_sha256: str
     retrieved_at: datetime
     valid_from: datetime
     valid_until: datetime | None
+    field_evidence: dict[str, dict[str, str | None]]
+    fee_tier: FeeTierKind = FeeTierKind.UNKNOWN
+    verification_status: RuleVerificationStatus = RuleVerificationStatus.UNKNOWN
 
     def __post_init__(self) -> None:
         if not all(
@@ -174,7 +196,6 @@ class InstrumentRuleSnapshot:
                 self.venue,
                 self.canonical_instrument_id,
                 self.venue_symbol,
-                self.margin_asset,
                 self.source_endpoint,
             )
         ):
@@ -196,6 +217,30 @@ class CollectionCheckpoint:
     last_event_id: str | None
     reconciliation_state: ReconciliationState
     checkpointed_at: datetime
+    canonical_instrument_id: str = "SYSTEM"
+    venue_symbol: str = "SYSTEM"
+    event_type: str = "unknown"
+    channel: str = "unknown"
+    last_available_at: datetime | None = None
+    last_funding_at: datetime | None = None
+    last_trade_id: str | None = None
+    snapshot_sequence: int | None = None
+    delta_sequence: int | None = None
+    connection_epoch: int = 0
+    recovery_required: bool = False
+
+
+@dataclass(frozen=True)
+class CollectionFailureEvent:
+    venue: str
+    stream_key: str
+    instrument: str
+    event_type: str
+    endpoint: str
+    error_type: str
+    error_message: str
+    occurred_at: datetime
+    retry_count: int
 
 
 @dataclass(frozen=True)
@@ -380,6 +425,7 @@ class CostStressResult:
     data_snapshot_id: str
     scenarios: tuple[CostStressScenarioResult, ...]
     content_sha256: str
+    evidence_complete: bool = True
 
     def scenario(self, name: str) -> CostStressScenarioResult | None:
         return next((item for item in self.scenarios if item.scenario == name), None)
@@ -417,6 +463,7 @@ class CapitalFeasibilityResult:
     run_id: str
     data_snapshot_id: str
     scenarios: tuple[CapitalScenarioFeasibility, ...]
+    evidence_complete: bool = True
 
     def feasible_at(self, capital: Decimal) -> bool:
         match = next((item for item in self.scenarios if item.capital == capital), None)

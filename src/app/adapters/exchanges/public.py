@@ -61,7 +61,44 @@ async def _websocket_json(
     )
     async for message in session.messages():
         if isinstance(message.normalized_payload, dict):
-            yield message.normalized_payload
+            payload = dict(message.normalized_payload)
+            raw_payload = message.payload.decode("utf-8", errors="replace")
+            payload["_collector_source"] = {
+                "raw_payload": raw_payload,
+                "payload_sha256": message.payload_sha256,
+            }
+            payload["_collector_reconciliation"] = {
+                "connection_id": str(message.connection_id),
+                "connection_epoch": message.connection_epoch,
+                "snapshot_sequence": message.snapshot_sequence,
+                "delta_sequence": message.venue_sequence,
+                "reconciliation_state": (
+                    message.reconciliation_state.value
+                    if message.reconciliation_state is not None
+                    else None
+                ),
+            }
+            yield payload
+
+
+def _orderbook_reconciliation(message: dict[str, Any]) -> dict[str, Any]:
+    metadata = message.get("_collector_reconciliation", {})
+    return {
+        "connection_id": metadata.get("connection_id"),
+        "connection_epoch": int(metadata.get("connection_epoch", 0)),
+        "snapshot_sequence": metadata.get("snapshot_sequence"),
+        "delta_sequence": metadata.get("delta_sequence"),
+        "reconciliation_state": metadata.get("reconciliation_state"),
+        **_source_provenance(message),
+    }
+
+
+def _source_provenance(message: dict[str, Any]) -> dict[str, Any]:
+    metadata = message.get("_collector_source", {})
+    return {
+        "source_raw_payload": metadata.get("raw_payload"),
+        "source_payload_sha256": metadata.get("payload_sha256"),
+    }
 
 
 class PublicRestAdapter(MarketDataAdapter):
@@ -295,6 +332,7 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
                     sequence=item["u"],
                     bids=tuple(OrderBookLevel(price=row[0], quantity=row[1]) for row in item["b"]),
                     asks=tuple(OrderBookLevel(price=row[0], quantity=row[1]) for row in item["a"]),
+                    **_orderbook_reconciliation(item),
                 )
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
@@ -309,6 +347,7 @@ class AsterMarketDataAdapter(BinanceCompatiblePerpAdapter):
                     price=item["p"],
                     quantity=item["q"],
                     side=Side.SELL if item["m"] else Side.BUY,
+                    **_source_provenance(item),
                 )
 
     async def stream_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:
@@ -635,6 +674,7 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
                     OrderBookLevel(price=item["px"], quantity=item["sz"])
                     for item in data["levels"][1]
                 ),
+                **_orderbook_reconciliation(message),
             )
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
@@ -648,6 +688,7 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
                     price=item["px"],
                     quantity=item["sz"],
                     side=Side.BUY if item["side"] == "B" else Side.SELL,
+                    **_source_provenance(message),
                 )
 
     async def stream_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:
@@ -829,20 +870,32 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
             for item in data["openInterestList"]
         )
 
-    async def _stream(self, channel: str, symbol: str) -> AsyncIterator[dict[str, Any]]:
+    async def _stream(
+        self,
+        channel: str,
+        symbol: str,
+        classification: StreamClassification = StreamClassification.EVENTS,
+    ) -> AsyncIterator[dict[str, Any]]:
         request: dict[str, object] = {
             "op": "subscribe",
             "args": [{"instType": "USDT-FUTURES", "channel": channel, "instId": symbol}],
         }
         async with aclosing(
-            _websocket_json("wss://ws.bitget.com/v2/ws/public", request, venue=self.venue)
+            _websocket_json(
+                "wss://ws.bitget.com/v2/ws/public",
+                request,
+                venue=self.venue,
+                classification=classification,
+            )
         ) as messages:
             async for message in messages:
                 if "data" in message:
                     yield message
 
     async def stream_order_book(self, symbol: str) -> AsyncIterator[OrderBook]:
-        async for message in self._stream("books", symbol):
+        async for message in self._stream(
+            "books5", symbol, StreamClassification.LIMITED_DEPTH_SNAPSHOT_STREAM
+        ):
             for data in message["data"]:
                 yield OrderBook(
                     exchange=self.venue,
@@ -855,6 +908,7 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
                     asks=tuple(
                         OrderBookLevel(price=row[0], quantity=row[1]) for row in data["asks"]
                     ),
+                    **_orderbook_reconciliation(message),
                 )
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
@@ -868,6 +922,7 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
                     price=item["price"],
                     quantity=item["size"],
                     side=Side(item["side"]),
+                    **_source_provenance(message),
                 )
 
     async def stream_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:
@@ -1071,6 +1126,7 @@ class MexcMarketDataAdapter(PublicRestAdapter):
                     for item in data["asks"]
                     if item[1] > 0
                 ),
+                **_orderbook_reconciliation(message),
             )
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
@@ -1084,6 +1140,7 @@ class MexcMarketDataAdapter(PublicRestAdapter):
                     price=item["p"],
                     quantity=item["v"],
                     side=Side.BUY if int(item["T"]) == 1 else Side.SELL,
+                    **_source_provenance(message),
                 )
 
     async def stream_ticker(self, symbol: str) -> AsyncIterator[dict[str, Any]]:

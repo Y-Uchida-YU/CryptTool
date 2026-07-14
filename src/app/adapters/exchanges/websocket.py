@@ -36,6 +36,9 @@ class ReconciliationState(StrEnum):
     BUFFERING_DELTAS = "buffering_deltas"
     APPLYING_SNAPSHOT = "applying_snapshot"
     REPLAYING_DELTAS = "replaying_deltas"
+    GAP_DETECTED = "gap_detected"
+    SNAPSHOT_LOADING = "snapshot_loading"
+    DELTA_REPLAYING = "delta_replaying"
     SYNCHRONIZED = "synchronized"
     DEGRADED = "degraded"
 
@@ -67,6 +70,9 @@ class RawVenueMessage:
     payload: bytes
     payload_sha256: str
     normalized_payload: Any | None = None
+    reconciliation_state: ReconciliationState | None = None
+    snapshot_sequence: int | None = None
+    connection_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,7 +99,9 @@ class ResilientWebSocketSession:
         exchange_timestamp: Callable[[Any], datetime | None] = lambda value: None,
         snapshot: Callable[[Any], bool] = lambda value: False,
         delta: Callable[[Any], bool] = lambda value: False,
-        heartbeat: Callable[[Any], bool] = lambda value: value in {"pong", "ping"},
+        heartbeat: Callable[[Any], bool] = lambda value: (
+            isinstance(value, str) and value in {"pong", "ping"}
+        ),
         rest_snapshot: Callable[[], Awaitable[Any]] | None = None,
         snapshot_applier: Callable[[Any], int] | None = None,
         delta_applier: Callable[[Any], None] | None = None,
@@ -141,6 +149,7 @@ class ResilientWebSocketSession:
 
     async def messages(self) -> AsyncIterator[RawVenueMessage]:
         attempt = 0
+        connection_epoch = 0
         while not self._closing:
             now = monotonic()
             while self._reconnects and now - self._reconnects[0] >= 60:
@@ -151,6 +160,7 @@ class ResilientWebSocketSession:
                 continue
             self._reconnects.append(now)
             self._set_state(ConnectionState.CONNECTING)
+            connection_epoch += 1
             connection_id = uuid4()
             context = ConnectionReconciliationContext(
                 connection_id=connection_id,
@@ -230,6 +240,9 @@ class ResilientWebSocketSession:
                             payload=payload,
                             payload_sha256=digest,
                             normalized_payload=self.normalize(decoded),
+                            reconciliation_state=context.state,
+                            snapshot_sequence=context.snapshot_sequence,
+                            connection_epoch=connection_epoch,
                         )
                         if self.raw_message_sink is not None:
                             await self.raw_message_sink(message)
@@ -311,6 +324,7 @@ class ResilientWebSocketSession:
         if self.rest_snapshot is None:
             raise RuntimeError("REST snapshot recovery unavailable")
         self._set_reconciliation(context, ReconciliationState.BUFFERING_DELTAS)
+        self._set_reconciliation(context, ReconciliationState.SNAPSHOT_LOADING)
         snapshot = await self.rest_snapshot()
         await asyncio.sleep(0)
         while not queue.empty():
@@ -330,6 +344,7 @@ class ResilientWebSocketSession:
         self, context: ConnectionReconciliationContext, sequence: int, decoded: Any
     ) -> None:
         self._set_state(ConnectionState.RECOVERING, "sequence gap")
+        self._set_reconciliation(context, ReconciliationState.GAP_DETECTED)
         self._buffer_delta(context, sequence, decoded)
         if (
             self.rest_snapshot is None
@@ -338,7 +353,7 @@ class ResilientWebSocketSession:
         ):
             self._set_state(ConnectionState.DEGRADED, "sequence gap without snapshot semantics")
             raise RuntimeError("REST snapshot recovery unavailable")
-        self._set_reconciliation(context, ReconciliationState.WAITING_FOR_SNAPSHOT)
+        self._set_reconciliation(context, ReconciliationState.SNAPSHOT_LOADING)
         snapshot = await self.rest_snapshot()
         await self._apply_snapshot_and_replay(context, snapshot)
         self._set_state(
@@ -351,14 +366,14 @@ class ResilientWebSocketSession:
     ) -> None:
         if self.snapshot_applier is None or self.delta_applier is None:
             raise RuntimeError("REST snapshot recovery unavailable")
-        self._set_reconciliation(context, ReconciliationState.APPLYING_SNAPSHOT)
+        self._set_reconciliation(context, ReconciliationState.SNAPSHOT_LOADING)
         snapshot_sequence = self.snapshot_applier(snapshot)
         context.snapshot_sequence = snapshot_sequence
         replay = sorted(
             (item for item in context.buffered_deltas if item[0] > snapshot_sequence),
             key=lambda item: item[0],
         )
-        self._set_reconciliation(context, ReconciliationState.REPLAYING_DELTAS)
+        self._set_reconciliation(context, ReconciliationState.DELTA_REPLAYING)
         expected = snapshot_sequence + 1
         for current, delta in replay:
             if current != expected:

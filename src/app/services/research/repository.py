@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.adapters.exchanges.websocket import ReconciliationState
 from app.infrastructure.database.models import (
+    CollectionFailureEventRow,
     DataSnapshotEventRow,
     DataSnapshotRow,
     ExperimentalMarketEventRow,
@@ -27,11 +28,14 @@ from app.infrastructure.database.models import (
 )
 from app.services.research.models import (
     CollectionCheckpoint,
+    CollectionFailureEvent,
     DataSnapshotManifest,
+    FeeTierKind,
     FrozenHypothesis,
     InstrumentRuleSnapshot,
     RawMarketEvent,
     ResearchRunIdentity,
+    RuleVerificationStatus,
 )
 
 
@@ -65,6 +69,10 @@ class ResearchRepository(Protocol):
         self, cutoff_at: datetime
     ) -> tuple[tuple[str, ...], tuple[tuple[str, int], ...]]: ...
 
+    def save_collection_failure(self, failure: CollectionFailureEvent) -> None: ...
+
+    def collection_failures(self) -> tuple[CollectionFailureEvent, ...]: ...
+
     def save_snapshot(
         self, snapshot_id: str, cutoff_at: datetime, event_count: int, content_sha256: str
     ) -> None: ...
@@ -84,6 +92,8 @@ class ResearchRepository(Protocol):
     def instrument_rules(
         self, rule_snapshot_ids: tuple[str, ...]
     ) -> tuple[InstrumentRuleSnapshot, ...]: ...
+
+    def instrument_rules_at(self, cutoff_at: datetime) -> tuple[InstrumentRuleSnapshot, ...]: ...
 
     def freeze_hypothesis(self, hypothesis: FrozenHypothesis) -> None: ...
 
@@ -110,6 +120,7 @@ class InMemoryResearchRepository:
         self.raw_payloads: dict[str, tuple[str, str, str, str, datetime]] = {}
         self.checkpoints: dict[tuple[str, str], CollectionCheckpoint] = {}
         self.rules: dict[str, InstrumentRuleSnapshot] = {}
+        self.failures: list[CollectionFailureEvent] = []
         self.runs: dict[str, tuple[ResearchRunIdentity, str, str | None]] = {}
         self.artifacts: list[tuple[str, str, str, str, str, datetime]] = []
         self.hypotheses: dict[tuple[str, str], FrozenHypothesis] = {}
@@ -190,6 +201,12 @@ class InMemoryResearchRepository:
             tuple(sorted(counts.items())),
         )
 
+    def save_collection_failure(self, failure: CollectionFailureEvent) -> None:
+        self.failures.append(failure)
+
+    def collection_failures(self) -> tuple[CollectionFailureEvent, ...]:
+        return tuple(self.failures)
+
     def save_snapshot(
         self, snapshot_id: str, cutoff_at: datetime, event_count: int, content_sha256: str
     ) -> None:
@@ -242,6 +259,14 @@ class InMemoryResearchRepository:
         self, rule_snapshot_ids: tuple[str, ...]
     ) -> tuple[InstrumentRuleSnapshot, ...]:
         return tuple(self.rules[item] for item in rule_snapshot_ids)
+
+    def instrument_rules_at(self, cutoff_at: datetime) -> tuple[InstrumentRuleSnapshot, ...]:
+        return tuple(
+            item
+            for item in self.rules.values()
+            if item.valid_from <= cutoff_at
+            and (item.valid_until is None or cutoff_at < item.valid_until)
+        )
 
     def save_run(self, identity: ResearchRunIdentity, status: str, verdict: str | None) -> None:
         existing = self.runs.get(identity.run_id)
@@ -297,6 +322,10 @@ class PostgreSQLResearchRepository:
             capability_verification_run_id=event.capability_verification_run_id,
             raw_payload_id=event.raw_payload_id,
             source_payload_sha256=event.source_payload_sha256,
+            channel=event.channel,
+            snapshot_sequence=event.snapshot_sequence,
+            delta_sequence=event.delta_sequence,
+            connection_epoch=event.connection_epoch,
             created_at=event.created_at,
         )
         with Session(self.engine) as session:
@@ -423,6 +452,31 @@ class PostgreSQLResearchRepository:
                 counts[reason] = counts.get(reason, 0) + 1
             return tuple(sorted({row[0] for row in rows})), tuple(sorted(counts.items()))
 
+    def save_collection_failure(self, failure: CollectionFailureEvent) -> None:
+        with Session(self.engine) as session:
+            session.add(CollectionFailureEventRow(**asdict(failure)))
+            session.commit()
+
+    def collection_failures(self) -> tuple[CollectionFailureEvent, ...]:
+        with Session(self.engine) as session:
+            rows = session.scalars(
+                select(CollectionFailureEventRow).order_by(CollectionFailureEventRow.id)
+            ).all()
+            return tuple(
+                CollectionFailureEvent(
+                    venue=row.venue,
+                    stream_key=row.stream_key,
+                    instrument=row.instrument,
+                    event_type=row.event_type,
+                    endpoint=row.endpoint,
+                    error_type=row.error_type,
+                    error_message=row.error_message,
+                    occurred_at=self._aware(row.occurred_at),
+                    retry_count=row.retry_count,
+                )
+                for row in rows
+            )
+
     def save_snapshot(
         self, snapshot_id: str, cutoff_at: datetime, event_count: int, content_sha256: str
     ) -> None:
@@ -475,6 +529,8 @@ class PostgreSQLResearchRepository:
                     manifest_json=None,
                     quarantine_count=manifest.quarantine_count,
                     finalized_at=None,
+                    eligibility_status=manifest.eligibility_status,
+                    eligibility_reasons_json=json.dumps(manifest.eligibility_reasons),
                     created_at=manifest.finalized_at,
                 )
                 session.add(current)
@@ -500,6 +556,8 @@ class PostgreSQLResearchRepository:
             current.manifest_json = payload
             current.quarantine_count = manifest.quarantine_count
             current.finalized_at = manifest.finalized_at
+            current.eligibility_status = manifest.eligibility_status
+            current.eligibility_reasons_json = json.dumps(manifest.eligibility_reasons)
             session.commit()
 
     def snapshot_manifest(self, snapshot_id: str) -> DataSnapshotManifest | None:
@@ -521,6 +579,8 @@ class PostgreSQLResearchRepository:
                 content_sha256=payload["content_sha256"],
                 manifest_sha256=payload["manifest_sha256"],
                 finalized_at=self._aware(datetime.fromisoformat(payload["finalized_at"])),
+                eligibility_status=payload.get("eligibility_status", "FINALIZED_NOT_ELIGIBLE"),
+                eligibility_reasons=tuple(payload.get("eligibility_reasons", ())),
             )
 
     def snapshot_events(self, snapshot_id: str) -> tuple[RawMarketEvent, ...]:
@@ -550,6 +610,17 @@ class PostgreSQLResearchRepository:
                 "last_event_id": checkpoint.last_event_id,
                 "reconciliation_state": checkpoint.reconciliation_state.value,
                 "checkpointed_at": checkpoint.checkpointed_at,
+                "canonical_instrument_id": checkpoint.canonical_instrument_id,
+                "venue_symbol": checkpoint.venue_symbol,
+                "event_type": checkpoint.event_type,
+                "channel": checkpoint.channel,
+                "last_available_at": checkpoint.last_available_at,
+                "last_funding_at": checkpoint.last_funding_at,
+                "last_trade_id": checkpoint.last_trade_id,
+                "snapshot_sequence": checkpoint.snapshot_sequence,
+                "delta_sequence": checkpoint.delta_sequence,
+                "connection_epoch": checkpoint.connection_epoch,
+                "recovery_required": checkpoint.recovery_required,
             }
             if row is None:
                 session.add(
@@ -582,12 +653,30 @@ class PostgreSQLResearchRepository:
                 last_event_id=row.last_event_id,
                 reconciliation_state=ReconciliationState(row.reconciliation_state),
                 checkpointed_at=self._aware(row.checkpointed_at),
+                canonical_instrument_id=row.canonical_instrument_id,
+                venue_symbol=row.venue_symbol,
+                event_type=row.event_type,
+                channel=row.channel,
+                last_available_at=(
+                    self._aware(row.last_available_at) if row.last_available_at else None
+                ),
+                last_funding_at=(self._aware(row.last_funding_at) if row.last_funding_at else None),
+                last_trade_id=row.last_trade_id,
+                snapshot_sequence=row.snapshot_sequence,
+                delta_sequence=row.delta_sequence,
+                connection_epoch=row.connection_epoch,
+                recovery_required=row.recovery_required,
             )
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None:
         with Session(self.engine) as session:
             current = session.get(InstrumentRuleSnapshotRow, rule.rule_snapshot_id)
             values = asdict(rule)
+            values["field_evidence_json"] = json.dumps(
+                values.pop("field_evidence"), sort_keys=True, separators=(",", ":")
+            )
+            values["fee_tier"] = rule.fee_tier.value
+            values["verification_status"] = rule.verification_status.value
             if current is not None:
                 mismatched = False
                 for key, value in values.items():
@@ -639,9 +728,27 @@ class PostgreSQLResearchRepository:
                         if by_id[item].valid_until is not None
                         else None
                     ),
+                    field_evidence=json.loads(by_id[item].field_evidence_json),
+                    fee_tier=FeeTierKind(by_id[item].fee_tier),
+                    verification_status=RuleVerificationStatus(by_id[item].verification_status),
                 )
                 for item in rule_snapshot_ids
             )
+
+    def instrument_rules_at(self, cutoff_at: datetime) -> tuple[InstrumentRuleSnapshot, ...]:
+        with Session(self.engine) as session:
+            ids = tuple(
+                session.scalars(
+                    select(InstrumentRuleSnapshotRow.rule_snapshot_id).where(
+                        InstrumentRuleSnapshotRow.valid_from <= cutoff_at,
+                        (
+                            InstrumentRuleSnapshotRow.valid_until.is_(None)
+                            | (InstrumentRuleSnapshotRow.valid_until > cutoff_at)
+                        ),
+                    )
+                ).all()
+            )
+        return self.instrument_rules(ids)
 
     def save_run(self, identity: ResearchRunIdentity, status: str, verdict: str | None) -> None:
         with Session(self.engine) as session:
@@ -749,4 +856,8 @@ class PostgreSQLResearchRepository:
             created_at=aware(row.created_at),
             raw_payload_id=row.raw_payload_id,
             source_payload_sha256=row.source_payload_sha256,
+            channel=row.channel,
+            snapshot_sequence=row.snapshot_sequence,
+            delta_sequence=row.delta_sequence,
+            connection_epoch=row.connection_epoch,
         )

@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,7 @@ from app.services.research.models import (
     CostStressScenarioResult,
     DataQualityResult,
     FeatureArtifact,
+    FeeTierKind,
     FrozenHypothesis,
     InstrumentRuleSnapshot,
     OverfittingResult,
@@ -40,6 +41,7 @@ from app.services.research.models import (
     RegimeArtifact,
     ResearchRunIdentity,
     ResearchRunResult,
+    RuleVerificationStatus,
     WalkForwardResult,
     WalkForwardWindowResult,
     canonical_sha256,
@@ -210,7 +212,9 @@ def evaluate_acceptance(
         AcceptanceCheckResult(
             "cost_stress_survival",
             None
-            if base is None or any(item is None for item in major)
+            if not cost_stress.evidence_complete
+            or base is None
+            or any(item is None for item in major)
             else all(
                 item is not None and item.metrics.net_pnl > -Decimal("1000") for item in major
             ),
@@ -235,7 +239,9 @@ def evaluate_acceptance(
         ),
         AcceptanceCheckResult(
             "capital_100_300_1000",
-            all(
+            None
+            if not capital_feasibility.evidence_complete
+            else all(
                 capital_feasibility.feasible_at(capital)
                 for capital in (Decimal("100"), Decimal("300"), Decimal("1000"))
             ),
@@ -386,20 +392,38 @@ class ResearchPipeline:
         )
         features = self._features(identity, dataset, config)
         regimes = self._regimes(identity, features)
-        rules = self._rules(config, dataset)
-        base_result = self._run_backtest(identity, dataset, config, rules, quality.passed)
+        rules, rule_evidence_complete = self._rules(config, dataset)
+        base_result = (
+            self._run_backtest(identity, dataset, config, rules, quality.passed)
+            if rule_evidence_complete
+            else self._empty_backtest(identity, config)
+        )
         walk_forward = (
             self._walk_forward(identity, features, hypothesis, config)
             if quality.passed
             else self._empty_walk_forward(identity, config)
         )
-        stress = self._cost_stress(identity, dataset, config, rules, quality.passed)
+        stress = (
+            self._cost_stress(identity, dataset, config, rules, quality.passed)
+            if rule_evidence_complete
+            else CostStressResult(
+                identity.run_id,
+                identity.data_snapshot_id,
+                (),
+                canonical_sha256((identity.run_id, "unknown-instrument-rules")),
+                False,
+            )
+        )
         overfitting = (
             self._overfitting(identity, features, hypothesis, config)
             if quality.passed
             else self._empty_overfitting(identity)
         )
-        capital = self._capital(identity, config, rules)
+        capital = (
+            self._capital(identity, config, rules)
+            if rule_evidence_complete
+            else CapitalFeasibilityResult(identity.run_id, identity.data_snapshot_id, (), False)
+        )
         acceptance = evaluate_acceptance(
             data_quality=quality,
             walk_forward=walk_forward,
@@ -440,6 +464,24 @@ class ResearchPipeline:
             overfitting,
             acceptance,
             str(manifest_path),
+        )
+
+    @staticmethod
+    def _empty_backtest(identity: ResearchRunIdentity, config: dict[str, Any]) -> BacktestResult:
+        initial = _decimal(config.get("initial_cash", "1000"))
+        return BacktestResult(
+            processed_events=0,
+            event_trace=(),
+            orders=(),
+            fills=(),
+            snapshots=(),
+            funding=(),
+            liquidations=(),
+            rejected_signals=(),
+            final_cash=initial,
+            final_equity=initial,
+            run_id=identity.run_id,
+            data_snapshot_id=identity.data_snapshot_id,
         )
 
     @staticmethod
@@ -628,7 +670,7 @@ class ResearchPipeline:
 
     def _rules(
         self, config: dict[str, Any], dataset: PointInTimeDataset
-    ) -> dict[tuple[str, str], InstrumentRules]:
+    ) -> tuple[dict[tuple[str, str], InstrumentRules], bool]:
         requested_ids = tuple(str(item) for item in config.get("rule_snapshot_ids", ()))
         if not requested_ids:
             if not config.get("raw_events"):
@@ -668,6 +710,27 @@ class ResearchPipeline:
                         retrieved_at=dataset.cutoff_at,
                         valid_from=dataset.cutoff_at,
                         valid_until=None,
+                        field_evidence={
+                            name: {
+                                "source_endpoint": "fixture:legacy-instrument-rules",
+                                "source_payload_sha256": source_hash,
+                                "retrieved_at": dataset.cutoff_at.isoformat(),
+                                "verification_status": RuleVerificationStatus.VERIFIED.value,
+                            }
+                            for name in (
+                                "tick_size",
+                                "lot_size",
+                                "minimum_quantity",
+                                "minimum_notional",
+                                "maker_fee",
+                                "taker_fee",
+                                "maker_rebate",
+                                "funding_interval",
+                                "margin_asset",
+                            )
+                        },
+                        fee_tier=FeeTierKind.HISTORICAL,
+                        verification_status=RuleVerificationStatus.VERIFIED,
                     )
                 )
                 imported.append(rule_id)
@@ -675,6 +738,7 @@ class ResearchPipeline:
         frozen = self.repository.instrument_rules(requested_ids)
         available = {(item.venue, item.canonical_instrument_id): item for item in frozen}
         rules: dict[tuple[str, str], InstrumentRules] = {}
+        complete = True
         symbols = {
             (item.venue, item.canonical_instrument_id, item.venue_symbol) for item in dataset.values
         }
@@ -690,14 +754,58 @@ class ResearchPipeline:
                 and dataset.cutoff_at >= rule_snapshot.valid_until
             ):
                 raise ValueError("instrument rule snapshot is not valid at dataset cutoff")
-            rules[(venue, symbol)] = InstrumentRules(
-                tick_size=rule_snapshot.tick_size,
-                lot_size=rule_snapshot.lot_size,
-                minimum_notional=rule_snapshot.minimum_notional,
-                maker_fee_rate=rule_snapshot.maker_fee - rule_snapshot.maker_rebate,
-                taker_fee_rate=rule_snapshot.taker_fee,
+            required = (
+                rule_snapshot.tick_size,
+                rule_snapshot.lot_size,
+                rule_snapshot.minimum_quantity,
+                rule_snapshot.minimum_notional,
+                rule_snapshot.maker_fee,
+                rule_snapshot.taker_fee,
+                rule_snapshot.maker_rebate,
+                rule_snapshot.funding_interval,
+                rule_snapshot.margin_asset,
             )
-        return rules
+            required_names = (
+                "tick_size",
+                "lot_size",
+                "minimum_quantity",
+                "minimum_notional",
+                "maker_fee",
+                "taker_fee",
+                "maker_rebate",
+                "funding_interval",
+                "margin_asset",
+            )
+            provenance_complete = all(
+                (evidence := rule_snapshot.field_evidence.get(name)) is not None
+                and evidence.get("verification_status") != RuleVerificationStatus.UNKNOWN.value
+                and bool(evidence.get("source_endpoint"))
+                and len(evidence.get("source_payload_sha256") or "") == 64
+                and bool(evidence.get("retrieved_at"))
+                for name in required_names
+            )
+            if (
+                any(item is None for item in required)
+                or rule_snapshot.fee_tier == FeeTierKind.UNKNOWN
+                or rule_snapshot.verification_status == RuleVerificationStatus.UNKNOWN
+                or not provenance_complete
+            ):
+                complete = False
+                continue
+            tick_size = cast(Decimal, rule_snapshot.tick_size)
+            lot_size = cast(Decimal, rule_snapshot.lot_size)
+            minimum_notional = cast(Decimal, rule_snapshot.minimum_notional)
+            maker_fee = cast(Decimal, rule_snapshot.maker_fee)
+            maker_rebate = cast(Decimal, rule_snapshot.maker_rebate)
+            taker_fee = cast(Decimal, rule_snapshot.taker_fee)
+            rules[(venue, symbol)] = InstrumentRules(
+                tick_size=tick_size,
+                lot_size=lot_size,
+                minimum_notional=minimum_notional,
+                maker_fee_rate=maker_fee - maker_rebate,
+                taker_fee_rate=taker_fee,
+            )
+        return rules, complete
 
     def _run_backtest(
         self,
