@@ -8,6 +8,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     Numeric,
     String,
@@ -109,6 +110,10 @@ class RawMarketEventRow(Base):
         String(160), ForeignKey("raw_market_payloads.payload_id")
     )
     source_payload_sha256: Mapped[str | None] = mapped_column(String(64))
+    channel: Mapped[str] = mapped_column(String(120), default="unknown")
+    snapshot_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    connection_epoch: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -147,7 +152,13 @@ class MarketDataQuarantineRow(Base):
 
 class MarketDataCheckpointRow(Base):
     __tablename__ = "market_data_checkpoints"
-    __table_args__ = (UniqueConstraint("venue", "stream_key"),)
+    __table_args__ = (
+        UniqueConstraint("venue", "stream_key"),
+        Index(
+            "ix_market_data_checkpoints_checkpoint_namespace",
+            "checkpoint_namespace",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     venue: Mapped[str] = mapped_column(String(40), index=True)
     stream_key: Mapped[str] = mapped_column(String(200), default="default")
@@ -156,6 +167,75 @@ class MarketDataCheckpointRow(Base):
     last_event_id: Mapped[str | None] = mapped_column(String(160))
     reconciliation_state: Mapped[str] = mapped_column(String(40))
     checkpointed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), default="SYSTEM")
+    venue_symbol: Mapped[str] = mapped_column(String(100), default="SYSTEM")
+    event_type: Mapped[str] = mapped_column(String(80), default="unknown")
+    channel: Mapped[str] = mapped_column(String(120), default="unknown")
+    last_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_funding_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_trade_id: Mapped[str | None] = mapped_column(String(200))
+    snapshot_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    connection_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_required: Mapped[bool] = mapped_column(default=False)
+    bootstrap_completed: Mapped[bool] = mapped_column(default=False)
+    recovery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_recovery_failure: Mapped[str | None] = mapped_column(String(500))
+    checkpoint_namespace: Mapped[str] = mapped_column(String(200), default="production")
+
+
+class CollectorLeaseRow(Base):
+    __tablename__ = "collector_leases"
+    collector_group: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    owner_id: Mapped[str] = mapped_column(String(240))
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    renewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CollectorRunRow(Base):
+    __tablename__ = "collector_runs"
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    collector_group: Mapped[str] = mapped_column(String(160), index=True)
+    owner_id: Mapped[str] = mapped_column(String(240))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    config_path: Mapped[str] = mapped_column(String(1000))
+    database_identity: Mapped[str] = mapped_column(String(1000))
+    schema_name: Mapped[str] = mapped_column(String(160))
+    checkpoint_namespace: Mapped[str] = mapped_column(String(200))
+    artifact_namespace: Mapped[str] = mapped_column(String(500))
+    venues_json: Mapped[str] = mapped_column(Text)
+    instruments_json: Mapped[str] = mapped_column(Text)
+    event_types_json: Mapped[str] = mapped_column(Text)
+    duration_seconds: Mapped[float | None] = mapped_column()
+    pid: Mapped[int] = mapped_column(Integer)
+    process_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    hostname: Mapped[str] = mapped_column(String(255))
+    command_sha256: Mapped[str] = mapped_column(String(64))
+    run_token_sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    artifact_directory: Mapped[str | None] = mapped_column(String(1000))
+    failure_reason: Mapped[str | None] = mapped_column(String(1000))
+
+
+class CollectionFailureEventRow(Base):
+    __tablename__ = "collection_failure_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    stream_key: Mapped[str] = mapped_column(String(300), index=True)
+    instrument: Mapped[str] = mapped_column(String(100))
+    event_type: Mapped[str] = mapped_column(String(80))
+    endpoint: Mapped[str] = mapped_column(String(500))
+    error_type: Mapped[str] = mapped_column(String(120))
+    error_message: Mapped[str] = mapped_column(String(500))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    retry_count: Mapped[int] = mapped_column(Integer)
 
 
 class DataSnapshotRow(Base):
@@ -168,6 +248,8 @@ class DataSnapshotRow(Base):
     manifest_json: Mapped[str | None] = mapped_column(Text)
     quarantine_count: Mapped[int] = mapped_column(Integer, default=0)
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    eligibility_status: Mapped[str] = mapped_column(String(40), default="FINALIZED_NOT_ELIGIBLE")
+    eligibility_reasons_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -191,20 +273,23 @@ class InstrumentRuleSnapshotRow(Base):
     venue: Mapped[str] = mapped_column(String(40), index=True)
     canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
     venue_symbol: Mapped[str] = mapped_column(String(100))
-    tick_size: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    lot_size: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    minimum_quantity: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    minimum_notional: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    maker_fee: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    taker_fee: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    maker_rebate: Mapped[Decimal] = mapped_column(Numeric(38, 18))
-    funding_interval: Mapped[int] = mapped_column(Integer)
-    margin_asset: Mapped[str] = mapped_column(String(40))
+    tick_size: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    lot_size: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    minimum_quantity: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    minimum_notional: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    maker_fee: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    taker_fee: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    maker_rebate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18))
+    funding_interval: Mapped[int | None] = mapped_column(Integer)
+    margin_asset: Mapped[str | None] = mapped_column(String(40))
     source_endpoint: Mapped[str] = mapped_column(String(500))
     source_payload_sha256: Mapped[str] = mapped_column(String(64))
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    field_evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    fee_tier: Mapped[str] = mapped_column(String(40), default="unknown")
+    verification_status: Mapped[str] = mapped_column(String(40), default="unknown")
 
 
 class ResearchRunRow(Base):

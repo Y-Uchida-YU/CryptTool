@@ -1,0 +1,27 @@
+{
+  "bounded": true,
+  "failure_reasons": [],
+  "file_descriptors_end": 7,
+  "file_descriptors_start": 7,
+  "gc_current_memory_bytes_end": 40816,
+  "memory_bytes_end_before_gc": 44432,
+  "memory_bytes_start_before_gc": 1168,
+  "memory_growth_description": "Traced current memory increased; this is not reported as no growth. Post-warmup slope and bounded RSS are the acceptance basis.",
+  "memory_slope_per_cycle": 386.20716471647165,
+  "open_db_connections_end": 0,
+  "open_db_connections_start": 0,
+  "rss_bytes_end": 184483840,
+  "rss_bytes_peak": 184483840,
+  "rss_bytes_start": 184369152,
+  "rss_slope_per_cycle": 1301.6751275127513,
+  "task_count_end": 1,
+  "task_count_start": 1,
+  "top_allocation_traceback": [
+    "accelerated_validation.py:907: ResourceUsageSample retention, 16864 bytes in 201 allocations",
+    "accelerated_validation.py:902: sample collection, 6400 bytes in 200 allocations",
+    "subprocess.py:1023: RSS sampling, 3783 bytes in 63 allocations"
+  ],
+  "warmup_excluded_memory_slope_per_cycle": 374.63427583652305,
+  "warmup_excluded_rss_slope_per_cycle": 1345.9465777668024,
+  "warmup_iterations": 10
+}

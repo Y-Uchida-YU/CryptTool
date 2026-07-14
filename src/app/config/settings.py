@@ -139,6 +139,10 @@ class ResearchCollectionSettings(BaseModel):
     poll_interval_seconds: float = Field(30, gt=0)
     stale_after_seconds: int = Field(120, ge=1)
     maximum_cycles: int | None = Field(None, ge=1)
+    minimum_production_events: int = Field(1, ge=1)
+    maximum_gap_ratio: float = Field(0.01, ge=0, le=1)
+    maximum_stale_ratio: float = Field(0.05, ge=0, le=1)
+    require_complete_instrument_rules: bool = True
 
 
 class Settings(BaseSettings):
@@ -153,6 +157,7 @@ class Settings(BaseSettings):
 
     environment: Literal["development", "test", "production"] = "development"
     database_url: str = "sqlite+pysqlite:///cryptbot.db"
+    production_database_url: str | None = None
     symbols: tuple[str, ...] = ("BTC", "ETH", "SOL")
     timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
     paper_trading: bool = True

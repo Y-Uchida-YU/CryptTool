@@ -1,0 +1,30 @@
+{
+  "schema_version": "1",
+  "run_id": "collector-soak-20260714T051602Z",
+  "generated_at": "2026-07-14T11:29:59Z",
+  "source_commit_sha": "d96567d099b379d9b15a3f7f0bac72dea3f671fe",
+  "artifact_commit_parent_sha": "31c06d293cd64cfcd7c4333d01e6076accab3974",
+  "verdict": "FAIL",
+  "files": [
+    {
+      "path": "health.json",
+      "sha256": "4280d3beef4a52f941a60950ee2c997463bb395225b3fd4d36efe451d4eb6fb3"
+    },
+    {
+      "path": "summary.md",
+      "sha256": "383597db50376c052ec1ca1787b54d9fa701eb99a0b51096d8f68f3344672183"
+    }
+  ],
+  "evidence": {
+    "database_identity": "sqlite:////tmp/crypttool-accelerated-live-soak-d96567d.db",
+    "database_size_bytes": 3597963264,
+    "sqlite_integrity_check": "ok",
+    "checkpoint_rows": 74,
+    "wal_present_after_completion": false,
+    "shm_present_after_completion": false,
+    "process_running_after_completion": false,
+    "collector_run_registry_available": false,
+    "collector_lease_registry_available": false
+  },
+  "live_execution": "OFF"
+}

@@ -13,8 +13,9 @@ from typer.testing import CliRunner
 
 from app.cli.main import app
 from app.infrastructure.database.models import Base
+from app.services.research.data_operations import DataSnapshotService
 from app.services.research.dataset import PointInTimeDatasetBuilder, raw_event_from_dict
-from app.services.research.models import FrozenHypothesis
+from app.services.research.models import FrozenHypothesis, InstrumentRuleSnapshot
 from app.services.research.pipeline import (
     FrozenHypothesisRegistry,
     ResearchPipeline,
@@ -54,6 +55,7 @@ def raw_event(
         "canonical_instrument_id": instrument,
         "venue_symbol": "SOLUSDT" if instrument.startswith("SOL") else "BTCUSDT",
         "event_type": event_type,
+        "reconciliation_state": ("synchronized" if event_type.startswith("orderbook_") else None),
         "exchange_timestamp": (exchange_timestamp or available_at).isoformat(),
         "received_at": available_at.isoformat(),
         "available_at": available_at.isoformat(),
@@ -215,6 +217,34 @@ def test_delisted_outage_and_quarantine_are_preserved() -> None:
     assert repository.quarantined[0][0].raw_payload == "{"
 
 
+def test_missing_required_funding_field_is_quarantined_instead_of_crashing() -> None:
+    repository = InMemoryResearchRepository()
+    repository.add_raw_event(
+        raw_event_from_dict(
+            raw_event(
+                "funding-without-mark",
+                event_type="funding_history",
+                payload={"rate": "0.001"},
+            )
+        )
+    )
+    DataSnapshotService(repository).finalize(
+        cutoff_at=BASE,
+        snapshot_id="missing-funding-field",
+        finalized_at=BASE,
+    )
+    dataset = PointInTimeDatasetBuilder(repository).build(
+        snapshot_id="missing-funding-field",
+        cutoff_at=BASE,
+        instruments=("BTC-USD-PERP",),
+        venues=("hyperliquid",),
+        event_types=("funding_history",),
+    )
+    assert dataset.values == ()
+    assert repository.quarantine_count() == 1
+    assert "normalization failure" in repository.quarantined[0][1]
+
+
 def test_train_only_normalization_purge_embargo_and_real_strategy(tmp_path: Path) -> None:
     result = run_pipeline(tmp_path)
     rows = result.feature_artifact.rows
@@ -325,6 +355,56 @@ def test_acceptance_requires_real_complete_evidence(tmp_path: Path) -> None:
     assert result.acceptance_result.data_snapshot_id == result.identity.data_snapshot_id
     with pytest.raises(TypeError):
         evaluate_acceptance()  # type: ignore[call-arg]
+
+
+def test_unknown_instrument_rule_fields_produce_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    repository = InMemoryResearchRepository()
+    config = pipeline_config()
+    rule_ids: list[str] = []
+    for venue in ("hyperliquid", "bitget"):
+        rule_id = f"unknown-{venue}-btc"
+        rule_ids.append(rule_id)
+        repository.save_instrument_rule(
+            InstrumentRuleSnapshot(
+                rule_snapshot_id=rule_id,
+                venue=venue,
+                canonical_instrument_id="BTC-USD-PERP",
+                venue_symbol="BTCUSDT",
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.001"),
+                minimum_quantity=None,
+                minimum_notional=None,
+                maker_fee=None,
+                taker_fee=None,
+                maker_rebate=None,
+                funding_interval=None,
+                margin_asset=None,
+                source_endpoint="public-adapter:fetch_markets",
+                source_payload_sha256="a" * 64,
+                retrieved_at=BASE,
+                valid_from=BASE,
+                valid_until=None,
+                field_evidence={
+                    name: {"verification_status": "unknown"}
+                    for name in (
+                        "minimum_quantity",
+                        "minimum_notional",
+                        "maker_fee",
+                        "taker_fee",
+                        "maker_rebate",
+                        "funding_interval",
+                        "margin_asset",
+                    )
+                },
+            )
+        )
+    config["rule_snapshot_ids"] = rule_ids
+    result = ResearchPipeline(repository, artifact_root=tmp_path / "artifacts").run(config)
+    assert result.acceptance_result.verdict.value == "INSUFFICIENT_EVIDENCE"
+    assert not result.cost_stress_result.evidence_complete
+    assert not result.acceptance_result.capital_feasibility.evidence_complete
 
 
 def test_data_quality_failure_prevents_strategy_execution(tmp_path: Path) -> None:

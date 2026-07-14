@@ -1,0 +1,44 @@
+{
+  "verdict": "PASS",
+  "results": [
+    {
+      "venue": "hyperliquid",
+      "instrument": "BTC",
+      "venue_symbol": "BTC",
+      "stream_semantics": "snapshot_only",
+      "started_at": "2026-07-14T12:05:25.398695+00:00",
+      "ended_at": "2026-07-14T12:35:42.085808+00:00",
+      "duration_seconds": 1816.687113,
+      "forced_reconnect_recovery_success": 3,
+      "forced_reconnect_recovery_total": 3,
+      "forced_reconnect_states": ["synchronized", "synchronized", "synchronized"],
+      "continuous_messages": 336,
+      "final_state": "synchronized",
+      "final_bootstrap_completed": true,
+      "final_recovery_required": false,
+      "permanently_degraded": 0,
+      "exceptions": [],
+      "disconnect_reasons": {"client_shutdown": 3}
+    },
+    {
+      "venue": "bitget",
+      "instrument": "BTC",
+      "venue_symbol": "BTCUSDT",
+      "stream_semantics": "snapshot_and_delta",
+      "started_at": "2026-07-14T12:05:25.406066+00:00",
+      "ended_at": "2026-07-14T12:35:26.180457+00:00",
+      "duration_seconds": 1800.774391,
+      "forced_reconnect_recovery_success": 3,
+      "forced_reconnect_recovery_total": 3,
+      "forced_reconnect_snapshot_sequences": [751038009363, 751038020502, 751038037284],
+      "forced_reconnect_states": ["synchronized", "synchronized", "synchronized"],
+      "continuous_messages": 18537,
+      "final_state": "synchronized",
+      "final_bootstrap_completed": true,
+      "final_recovery_required": false,
+      "permanently_degraded": 0,
+      "exceptions": [],
+      "disconnect_reasons": {"client_shutdown": 3}
+    }
+  ]
+}

@@ -3,6 +3,7 @@ from decimal import Decimal
 from enum import StrEnum
 from time import monotonic
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -33,6 +34,8 @@ class TimedModel(BaseModel):
     available_at: datetime | None = None
     local_monotonic_time: float = Field(default_factory=monotonic, ge=0)
     clock_offset_estimate: float | None = None
+    source_raw_payload: str | None = None
+    source_payload_sha256: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -116,6 +119,17 @@ class OrderBook(TimedModel):
     sequence: int | None = None
     bids: tuple[OrderBookLevel, ...]
     asks: tuple[OrderBookLevel, ...]
+    connection_id: UUID | None = None
+    connection_epoch: int = 0
+    snapshot_sequence: int | None = None
+    delta_sequence: int | None = None
+    previous_delta_sequence: int | None = None
+    reconciliation_state: str | None = None
+    stream_semantics: str | None = None
+    bootstrap_completed: bool = False
+    recovery_started_at: datetime | None = None
+    recovery_completed_at: datetime | None = None
+    last_recovery_failure: str | None = None
 
     @model_validator(mode="after")
     def validate_book(self) -> "OrderBook":

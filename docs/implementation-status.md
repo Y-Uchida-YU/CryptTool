@@ -1,4 +1,4 @@
-# Implementation status through Research Data Operations Phase R2
+# Implementation status through Research Data Operations Phase R2.1
 
 ## Completed
 
@@ -44,6 +44,16 @@ ordered daily snapshot membership have separate durable identities. Finalized me
 immutable, hash-verifiable and reproducible, and database foreign keys bind research runs and
 artifacts to the exact data snapshot and strategy-scoped frozen hypothesis. Collection remains
 opt-in (`collection_enabled: false` by default), and live execution remains off.
+
+Phase R2.1 makes collection stream-scoped by venue, instrument, event type and channel. REST
+pollers, continuous WebSocket readers, raw persistence and checkpoint writes are separate workers;
+restart cursors preserve timestamps, trade IDs and order-book connection/sequence recovery state.
+Order-book events cannot become research-eligible until the adapter's snapshot/delta reconciler has
+completed a continuous replay. Gap, stale and unsynchronized observations remain durable but are
+quarantined from production membership. Instrument-rule fields without endpoint/hash/time evidence
+remain UNKNOWN, so capital and cost evidence fail closed. Finalized snapshots explicitly distinguish
+research-eligible from control-only or incomplete datasets, and database triggers protect finalized
+rows as well as membership. Collection and live execution both remain disabled by default.
 
 ## Verification snapshot
 

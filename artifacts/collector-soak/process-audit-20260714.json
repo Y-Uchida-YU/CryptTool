@@ -1,0 +1,75 @@
+{
+  "audited_at": "2026-07-14T06:20:26Z",
+  "after": [
+    {
+      "pid": 89704,
+      "run_id": "collector-soak-20260714T051602Z",
+      "status": "RUNNING"
+    }
+  ],
+  "before": [
+    {
+      "artifact_directory": "artifacts/collector-soak/collector-soak-20260714T025719Z",
+      "command": ".venv/bin/app run-collector-soak --config configs/research-collector-soak.yaml --duration-hours 24",
+      "commit_sha": "1bed4798e8c300f633ed7204c2e67f358ebb33dc (commit was subsequently amended to d96567d)",
+      "config_path": "configs/research-collector-soak.yaml",
+      "database_url": "sqlite:////tmp/crypttool-r2-1-soak-1bed479.db",
+      "duration_hours": 24,
+      "instruments": ["BTC"],
+      "pid": 37694,
+      "run_id": "collector-soak-20260714T025719Z",
+      "schema": "main",
+      "start_time": "2026-07-14T11:57:19+09:00",
+      "venues": ["hyperliquid", "bitget"]
+    },
+    {
+      "artifact_directory": "artifacts/collector-soak/collector-soak-20260714T025935Z",
+      "command": ".venv/bin/app run-collector-soak --config configs/research-collector-soak.yaml --duration-hours 24",
+      "commit_sha": "d96567d099b379d9b15a3f7f0bac72dea3f671fe",
+      "config_path": "configs/research-collector-soak.yaml",
+      "database_url": "sqlite:////tmp/crypttool-r2-1-soak-d96567d.db",
+      "duration_hours": 24,
+      "instruments": ["BTC"],
+      "pid": 40976,
+      "run_id": "collector-soak-20260714T025935Z",
+      "schema": "main",
+      "start_time": "2026-07-14T11:59:35+09:00",
+      "venues": ["hyperliquid", "bitget"]
+    },
+    {
+      "artifact_directory": "artifacts/collector-soak/collector-soak-20260714T051602Z",
+      "command": ".venv/bin/app run-collector-soak --config /tmp/accelerated-live-soak-d96567d.yaml --duration-hours 6",
+      "commit_sha": "d96567d099b379d9b15a3f7f0bac72dea3f671fe (started before later branch commits)",
+      "config_path": "/tmp/accelerated-live-soak-d96567d.yaml",
+      "database_url": "sqlite:////tmp/crypttool-accelerated-live-soak-d96567d.db",
+      "duration_hours": 6,
+      "instruments": ["BTC", "ETH", "SOL", "HYPE"],
+      "pid": 89704,
+      "run_id": "collector-soak-20260714T051602Z",
+      "schema": "main",
+      "start_time": "2026-07-14T14:16:02+09:00",
+      "venues": ["hyperliquid", "bitget"]
+    }
+  ],
+  "container_audit": {
+    "collector_containers": [],
+    "other_database_containers": ["point-db-1 (postgres:16-alpine; no soak connection observed)"]
+  },
+  "database_isolation": {
+    "artifact_directory_overlap": false,
+    "checkpoint_table_is_physically_separate": true,
+    "database_url_overlap": false,
+    "postgresql_schema_overlap": false,
+    "shared_stream_keys_across_separate_sqlite_files": true,
+    "sqlite_file_overlap": false
+  },
+  "launch_agent_audit": {
+    "collector_launch_agents": []
+  },
+  "live_execution": "OFF",
+  "retained": ["collector-soak-20260714T051602Z"],
+  "stopped": [
+    "collector-soak-20260714T025719Z",
+    "collector-soak-20260714T025935Z"
+  ]
+}

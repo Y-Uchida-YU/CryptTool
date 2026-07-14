@@ -42,6 +42,8 @@ class PointInTimeDatasetBuilder:
         finalized = self.repository.snapshot_manifest(snapshot_id)
         if finalized is not None and finalized.cutoff_at != cutoff:
             raise ValueError("requested cutoff does not match finalized snapshot")
+        if finalized is not None and finalized.eligibility_status != "FINALIZED_RESEARCH_ELIGIBLE":
+            raise ValueError("data snapshot is finalized but not research eligible")
         source_events = (
             self.repository.snapshot_events(snapshot_id)
             if finalized is not None
@@ -63,7 +65,7 @@ class PointInTimeDatasetBuilder:
             try:
                 payload = event.payload()
                 _validate_payload(event.event_type, payload)
-            except (ValueError, TypeError) as exc:
+            except (KeyError, ValueError, TypeError) as exc:
                 self.repository.quarantine(event, f"normalization failure: {exc}", cutoff)
                 continue
             if (
@@ -129,11 +131,13 @@ class PointInTimeDatasetBuilder:
                 outages.append(event.event_id)
         content_hash = canonical_sha256(hash_records)
         if finalized is None:
-            DataSnapshotService(self.repository).finalize(
+            finalized = DataSnapshotService(self.repository).finalize(
                 cutoff_at=cutoff,
                 snapshot_id=snapshot_id,
                 finalized_at=cutoff,
             )
+            if finalized.eligibility_status != "FINALIZED_RESEARCH_ELIGIBLE":
+                raise ValueError("data snapshot is finalized but not research eligible")
         return PointInTimeDataset(
             snapshot_id=snapshot_id,
             cutoff_at=cutoff,

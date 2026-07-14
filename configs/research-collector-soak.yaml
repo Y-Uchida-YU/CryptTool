@@ -1,0 +1,26 @@
+database_url: sqlite+pysqlite:///collector-soak.db
+production_database_url: sqlite+pysqlite:///cryptbot.db
+live_trading: false
+live:
+  enabled: false
+  adapter_name: disabled
+research_collection:
+  collection_enabled: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC]
+  event_types:
+    - ohlcv
+    - trade
+    - orderbook_snapshot
+    - orderbook_delta
+    - funding_current
+    - funding_history
+    - open_interest
+    - mark_price
+    - index_price
+  poll_interval_seconds: 30
+  stale_after_seconds: 120
+  minimum_production_events: 1
+  maximum_gap_ratio: 0.01
+  maximum_stale_ratio: 0.05
+  require_complete_instrument_rules: true

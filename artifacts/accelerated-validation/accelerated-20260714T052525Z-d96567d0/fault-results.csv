@@ -1,0 +1,15 @@
+event_index,kind,injected,recovered,detail
+299,consumer_slowdown,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+407,missing_snapshot,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+432,checkpoint_write_failure,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+573,websocket_disconnect,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+704,duplicate_event,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+1531,malformed_payload,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+2352,out_of_order,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+2976,clock_skew,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+3825,database_transient_failure,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+5812,sequence_gap,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+6657,queue_backpressure,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+7188,stale_event,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+7449,process_interruption,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence
+7875,reconnect,True,True,injected deterministically; outcome verified from persistence/checkpoint evidence

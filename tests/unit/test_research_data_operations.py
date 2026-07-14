@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,19 +12,33 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
-from app.adapters.exchanges.websocket import ReconciliationState
+from app.adapters.exchanges.websocket import (
+    OrderBookStreamSemantics,
+    ReconciliationState,
+    WebSocketConnectionLifecycle,
+)
+from app.domain.market_data.models import Market, Side, Trade
 from app.domain.venues.models import CapabilitySupport
 from app.infrastructure.database.models import Base, ResearchArtifactRow
 from app.infrastructure.database.session import build_engine
 from app.services.research.data_operations import (
     CapabilityDecision,
+    CheckpointWriter,
     CollectedEnvelope,
+    CollectorHealthMetrics,
     DataSnapshotService,
+    PublicAdapterCollectorSource,
+    RawPersistenceConsumer,
     ResearchMarketDataCollector,
     ResearchRetentionService,
+    ResearchStreamIdentity,
+    SnapshotEligibilityPolicy,
 )
 from app.services.research.models import (
     CollectionCheckpoint,
@@ -123,6 +139,59 @@ def envelope(
     )
 
 
+class SplitSource:
+    venue = "hyperliquid"
+
+    def __init__(self, websocket_values: tuple[CollectedEnvelope, ...] = ()) -> None:
+        self.websocket_values = websocket_values
+        self.rest_checkpoints: list[CollectionCheckpoint | None] = []
+        self.websocket_checkpoints: list[CollectionCheckpoint | None] = []
+        self.calls: list[str] = []
+        self.closed = False
+
+    async def rest_events(
+        self,
+        identity: ResearchStreamIdentity,
+        checkpoint: CollectionCheckpoint | None,
+    ) -> AsyncIterator[CollectedEnvelope]:
+        del identity
+        self.calls.append("rest")
+        self.rest_checkpoints.append(checkpoint)
+        if False:
+            yield envelope()
+
+    async def websocket_events(
+        self,
+        identity: ResearchStreamIdentity,
+        checkpoint: CollectionCheckpoint | None,
+        shutdown: asyncio.Event,
+    ) -> AsyncIterator[CollectedEnvelope]:
+        del identity, shutdown
+        self.calls.append("websocket")
+        self.websocket_checkpoints.append(checkpoint)
+        for item in self.websocket_values:
+            yield item
+
+    async def instrument_rules(
+        self, instruments: tuple[str, ...]
+    ) -> tuple[InstrumentRuleSnapshot, ...]:
+        del instruments
+        return ()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def persistence_consumer(repository: InMemoryResearchRepository) -> RawPersistenceConsumer:
+    return RawPersistenceConsumer(
+        repository,
+        Gate(CapabilitySupport.LIVE_VERIFIED),
+        CheckpointWriter(repository),
+        CollectorHealthMetrics(),
+        timedelta(seconds=999999),
+    )
+
+
 @pytest.mark.asyncio
 async def test_same_raw_payload_is_idempotent_and_checkpoint_resumes() -> None:
     repository = InMemoryResearchRepository()
@@ -153,7 +222,7 @@ async def test_same_raw_payload_is_idempotent_and_checkpoint_resumes() -> None:
     await restarted.run()
     assert second.seen_checkpoint is not None
     assert second.seen_checkpoint.last_sequence == 1
-    assert len(repository.raw_payloads) == 1
+    assert len(repository.raw_payloads) == 2  # trade plus collector health payload
     assert len([item for item in repository.events.values() if item.event_type == "trade"]) == 1
 
 
@@ -202,7 +271,7 @@ async def test_sequence_gap_enters_quarantine_and_degraded_checkpoint() -> None:
     repository.save_checkpoint(
         CollectionCheckpoint(
             venue="hyperliquid",
-            stream_key="public-rest-and-websocket",
+            stream_key="hyperliquid:trade:BTC:unknown",
             connection_id=uuid4(),
             last_sequence=4,
             last_event_id="prior",
@@ -220,12 +289,590 @@ async def test_sequence_gap_enters_quarantine_and_degraded_checkpoint() -> None:
         maximum_cycles=1,
     )
     await collector.run()
-    checkpoint = repository.get_checkpoint("hyperliquid", "public-rest-and-websocket")
+    checkpoint = repository.get_checkpoint("hyperliquid", "hyperliquid:trade:BTC:unknown")
     assert (
         checkpoint is not None and checkpoint.reconciliation_state == ReconciliationState.DEGRADED
     )
     assert any(item.event_type == "sequence_gap" for item in repository.events.values())
     assert repository.quarantine_count() == 1
+
+
+def test_stream_identity_isolates_instrument_event_type_and_channel() -> None:
+    keys = {
+        ResearchStreamIdentity("hyperliquid", instrument, symbol, event_type, channel).stream_key
+        for instrument, symbol, event_type, channel in (
+            ("BTC", "BTC", "trade", "trades"),
+            ("ETH", "ETH", "trade", "trades"),
+            ("BTC", "BTC", "ohlcv", "rest"),
+            ("BTC", "BTC", "trade", "rest"),
+        )
+    }
+    assert keys == {
+        "hyperliquid:trade:BTC:trades",
+        "hyperliquid:trade:ETH:trades",
+        "hyperliquid:ohlcv:BTC:rest",
+        "hyperliquid:trade:BTC:rest",
+    }
+
+
+def test_rest_without_sequence_does_not_overwrite_websocket_checkpoint() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    consumer.persist(
+        replace(
+            envelope(sequence=9),
+            channel="trades",
+            trade_id="trade-9",
+        )
+    )
+    consumer.persist(
+        replace(
+            envelope(sequence=None, stable_event_key="rest-trade"),
+            channel="rest",
+        )
+    )
+    websocket = repository.get_checkpoint("hyperliquid", "hyperliquid:trade:BTC:trades")
+    rest = repository.get_checkpoint("hyperliquid", "hyperliquid:trade:BTC:rest")
+    assert websocket is not None and websocket.last_sequence == 9
+    assert websocket.last_trade_id == "trade-9"
+    assert rest is not None and rest.last_sequence is None
+
+
+@pytest.mark.asyncio
+async def test_restart_passes_rest_timestamp_and_websocket_sequence_cursors() -> None:
+    repository = InMemoryResearchRepository()
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="hyperliquid",
+            stream_key="hyperliquid:ohlcv:BTC:rest",
+            connection_id=uuid4(),
+            last_sequence=None,
+            last_event_id="ohlcv-prior",
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type="ohlcv",
+            channel="rest",
+            last_available_at=BASE,
+        )
+    )
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="hyperliquid",
+            stream_key="hyperliquid:trade:BTC:trades",
+            connection_id=uuid4(),
+            last_sequence=41,
+            last_event_id="trade-prior",
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type="trade",
+            channel="trades",
+            last_trade_id="trade-41",
+        )
+    )
+    source = SplitSource((replace(envelope(sequence=42), channel="trades"),))
+    collector = ResearchMarketDataCollector(
+        repository=repository,
+        sources=(source,),
+        capability_gate=Gate(CapabilitySupport.LIVE_VERIFIED),
+        instruments=("BTC",),
+        event_types=("ohlcv", "trade"),
+        collection_enabled=True,
+        maximum_cycles=1,
+        poll_interval_seconds=0.001,
+    )
+    await collector.run()
+    assert source.rest_checkpoints[0] is not None
+    assert source.rest_checkpoints[0].last_available_at == BASE
+    assert source.websocket_checkpoints[0] is not None
+    assert source.websocket_checkpoints[0].last_sequence == 41
+    assert source.websocket_checkpoints[0].last_trade_id == "trade-41"
+    assert source.calls.index("rest") < source.calls.index("websocket")
+
+
+@pytest.mark.asyncio
+async def test_websocket_worker_keeps_connection_for_multiple_messages() -> None:
+    source = SplitSource(
+        tuple(
+            replace(
+                envelope(sequence=number, stable_event_key=f"trade-{number}"),
+                channel="trades",
+            )
+            for number in (1, 2, 3)
+        )
+    )
+    repository = InMemoryResearchRepository()
+    collector = ResearchMarketDataCollector(
+        repository=repository,
+        sources=(source,),
+        capability_gate=Gate(CapabilitySupport.LIVE_VERIFIED),
+        instruments=("BTC",),
+        event_types=("trade",),
+        collection_enabled=True,
+        maximum_cycles=3,
+    )
+    await collector.run()
+    assert len(source.websocket_checkpoints) == 1
+    assert len([item for item in repository.raw_events() if item.event_type == "trade"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_orderbook_restart_restores_sequence_epoch_and_recovery_requirement() -> None:
+    repository = InMemoryResearchRepository()
+    connection_id = uuid4()
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="hyperliquid",
+            stream_key="hyperliquid:orderbook:BTC:orderbook",
+            connection_id=connection_id,
+            last_sequence=102,
+            last_event_id="book-102",
+            reconciliation_state=ReconciliationState.DEGRADED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type="orderbook",
+            channel="orderbook",
+            snapshot_sequence=100,
+            delta_sequence=102,
+            connection_epoch=7,
+            recovery_required=True,
+        )
+    )
+    source = SplitSource(
+        (
+            replace(
+                envelope(stable_event_key="book-recovered"),
+                event_type="orderbook_snapshot",
+                channel="orderbook",
+                sequence=None,
+                snapshot_sequence=110,
+                connection_id=uuid4(),
+                connection_epoch=8,
+                reconciliation_state=ReconciliationState.SYNCHRONIZED,
+                recovery_completed=True,
+            ),
+        )
+    )
+    collector = ResearchMarketDataCollector(
+        repository=repository,
+        sources=(source,),
+        capability_gate=Gate(CapabilitySupport.LIVE_VERIFIED),
+        instruments=("BTC",),
+        event_types=("orderbook_snapshot",),
+        collection_enabled=True,
+        maximum_cycles=1,
+    )
+    await collector.run()
+    resumed = source.websocket_checkpoints[0]
+    assert resumed is not None
+    assert resumed.snapshot_sequence == 100
+    assert resumed.delta_sequence == 102
+    assert resumed.connection_epoch == 7
+    assert resumed.recovery_required
+    final = repository.get_checkpoint("hyperliquid", "hyperliquid:orderbook:BTC:orderbook")
+    assert final is not None and not final.recovery_required
+    assert final.snapshot_sequence == 110
+    assert final.connection_epoch == 8
+
+
+def test_orderbook_gap_requires_snapshot_recovery_before_synchronized() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    connection_id = uuid4()
+    base = replace(
+        envelope(stable_event_key="book-10"),
+        event_type="orderbook_delta",
+        channel="orderbook",
+        connection_id=connection_id,
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        sequence=10,
+        delta_sequence=10,
+        snapshot_sequence=8,
+        connection_epoch=1,
+    )
+    consumer.persist(base)
+    consumer.persist(replace(base, stable_event_key="book-12", sequence=12, delta_sequence=12))
+    key = "hyperliquid:orderbook:BTC:orderbook"
+    gap = repository.get_checkpoint("hyperliquid", key)
+    assert gap is not None and gap.recovery_required
+    assert gap.reconciliation_state == ReconciliationState.DEGRADED
+    consumer.persist(
+        replace(
+            base,
+            stable_event_key="book-delta-after-gap",
+            sequence=13,
+            delta_sequence=13,
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            recovery_completed=False,
+        )
+    )
+    unrecovered = repository.get_checkpoint("hyperliquid", key)
+    assert unrecovered is not None and unrecovered.recovery_required
+    consumer.persist(
+        replace(
+            base,
+            stable_event_key="book-recovery-snapshot",
+            event_type="orderbook_snapshot",
+            sequence=None,
+            delta_sequence=None,
+            snapshot_sequence=20,
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            recovery_completed=True,
+        )
+    )
+    recovered = repository.get_checkpoint("hyperliquid", key)
+    assert recovered is not None and not recovered.recovery_required
+    assert recovered.reconciliation_state == ReconciliationState.SYNCHRONIZED
+
+
+def test_bitget_gap_without_snapshot_remains_degraded() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    connection_id = uuid4()
+    snapshot = replace(
+        envelope(stable_event_key="bitget-snapshot"),
+        venue="bitget",
+        canonical_instrument_id="BTC",
+        venue_symbol="BTCUSDT",
+        event_type="orderbook_snapshot",
+        channel="orderbook",
+        connection_id=connection_id,
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        snapshot_sequence=100,
+        connection_epoch=1,
+        stream_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+        bootstrap_completed=True,
+        recovery_completed=True,
+    )
+    consumer.persist(snapshot)
+    consumer.persist(
+        replace(
+            snapshot,
+            stable_event_key="bitget-gap",
+            event_type="orderbook_delta",
+            sequence=110,
+            delta_sequence=110,
+            previous_delta_sequence=99,
+        )
+    )
+    checkpoint = repository.get_checkpoint("bitget", "bitget:orderbook:BTCUSDT:orderbook")
+    assert checkpoint is not None
+    assert checkpoint.reconciliation_state == ReconciliationState.DEGRADED
+    assert checkpoint.recovery_required
+
+
+def test_old_epoch_orderbook_delta_is_rejected() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="bitget",
+            stream_key="bitget:orderbook:BTCUSDT:orderbook",
+            connection_id=uuid4(),
+            last_sequence=200,
+            last_event_id="current",
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTCUSDT",
+            event_type="orderbook",
+            channel="orderbook",
+            snapshot_sequence=190,
+            delta_sequence=200,
+            connection_epoch=4,
+            recovery_required=False,
+            bootstrap_completed=True,
+        )
+    )
+    consumer.persist(
+        replace(
+            envelope(stable_event_key="old-epoch"),
+            venue="bitget",
+            canonical_instrument_id="BTC",
+            venue_symbol="BTCUSDT",
+            event_type="orderbook_delta",
+            channel="orderbook",
+            connection_id=uuid4(),
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            sequence=201,
+            delta_sequence=201,
+            previous_delta_sequence=200,
+            connection_epoch=3,
+            stream_semantics=OrderBookStreamSemantics.SNAPSHOT_AND_DELTA,
+            bootstrap_completed=True,
+            recovery_completed=True,
+        )
+    )
+    checkpoint = repository.get_checkpoint("bitget", "bitget:orderbook:BTCUSDT:orderbook")
+    assert checkpoint is not None and checkpoint.last_event_id == "current"
+    assert any("old connection epoch" in reason for _, reason, _ in repository.quarantined)
+
+
+def test_hyperliquid_snapshot_recovery_clears_requirement_without_sequence() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    repository.save_checkpoint(
+        CollectionCheckpoint(
+            venue="hyperliquid",
+            stream_key="hyperliquid:orderbook:BTC:orderbook",
+            connection_id=uuid4(),
+            last_sequence=None,
+            last_event_id="disconnect",
+            reconciliation_state=ReconciliationState.DISCONNECTED,
+            checkpointed_at=BASE,
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type="orderbook",
+            channel="orderbook",
+            connection_epoch=2,
+            recovery_required=True,
+            recovery_started_at=BASE,
+        )
+    )
+    completed = BASE + timedelta(seconds=1)
+    consumer.persist(
+        replace(
+            envelope(stable_event_key="hl-new-snapshot"),
+            event_type="orderbook_snapshot",
+            channel="orderbook",
+            connection_id=uuid4(),
+            reconciliation_state=ReconciliationState.SYNCHRONIZED,
+            connection_epoch=3,
+            stream_semantics=OrderBookStreamSemantics.SNAPSHOT_ONLY,
+            bootstrap_completed=True,
+            recovery_completed=True,
+            recovery_started_at=BASE,
+            recovery_completed_at=completed,
+        )
+    )
+    checkpoint = repository.get_checkpoint("hyperliquid", "hyperliquid:orderbook:BTC:orderbook")
+    assert checkpoint is not None
+    assert checkpoint.reconciliation_state == ReconciliationState.SYNCHRONIZED
+    assert not checkpoint.recovery_required
+    assert checkpoint.bootstrap_completed
+    assert checkpoint.snapshot_sequence is None
+    assert checkpoint.recovery_completed_at == completed
+
+
+def test_shutdown_disconnect_is_not_a_recovery_failure() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    key = "hyperliquid:orderbook:BTC:orderbook"
+    current = CollectionCheckpoint(
+        venue="hyperliquid",
+        stream_key=key,
+        connection_id=uuid4(),
+        last_sequence=None,
+        last_event_id="book",
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        checkpointed_at=BASE,
+        canonical_instrument_id="BTC",
+        venue_symbol="BTC",
+        event_type="orderbook",
+        channel="orderbook",
+        connection_epoch=1,
+        recovery_required=False,
+        bootstrap_completed=True,
+    )
+    repository.save_checkpoint(current)
+    payload = json.dumps({"client_initiated_close": True, "reason": "client_shutdown"})
+    consumer.persist(
+        replace(
+            envelope(raw_payload=payload, stable_event_key="shutdown"),
+            event_type="websocket_disconnect",
+            channel="control",
+            logical_stream_event_type="orderbook",
+            connection_id=current.connection_id,
+            connection_epoch=1,
+        )
+    )
+    checkpoint = repository.get_checkpoint("hyperliquid", key)
+    assert checkpoint == current
+    assert consumer.metrics.disconnect_count == 0
+
+
+def test_unsynchronized_book_is_excluded_and_control_only_snapshot_is_not_eligible() -> None:
+    repository = InMemoryResearchRepository()
+    book = replace(
+        event("unsynchronized-book", event_type="orderbook_delta"),
+        reconciliation_state=ReconciliationState.DEGRADED,
+    )
+    health = event("health", event_type="venue_health", payload={"status": "up"})
+    repository.add_raw_event(book)
+    repository.add_raw_event(health)
+    manifest = DataSnapshotService(repository).finalize(
+        cutoff_at=BASE,
+        finalized_at=BASE,
+        eligibility_policy=SnapshotEligibilityPolicy(minimum_production_events=1),
+    )
+    assert tuple(item[1] for item in manifest.events) == ("health",)
+    assert manifest.eligibility_status == "FINALIZED_NOT_ELIGIBLE"
+    assert "unsynchronized order-book events present" in manifest.eligibility_reasons
+
+
+def test_collection_failure_is_persisted_with_sanitized_endpoint_and_secret() -> None:
+    repository = InMemoryResearchRepository()
+    consumer = persistence_consumer(repository)
+    identity = ResearchStreamIdentity("hyperliquid", "BTC", "BTC", "trade", "trades")
+    consumer.persist_failure(
+        identity,
+        "https://user:password@example.test/ws?api_key=visible",
+        RuntimeError('headers={"Authorization": "Bearer visible-token"}; socket failed'),
+        2,
+    )
+    failure = repository.collection_failures()[0]
+    assert failure.endpoint == "https://example.test/ws"
+    assert "visible" not in failure.error_message
+    assert "password" not in failure.endpoint
+    assert failure.retry_count == 2
+
+
+def test_websocket_raw_frame_is_preserved_separately_from_normalized_event() -> None:
+    source = PublicAdapterCollectorSource(object(), "hyperliquid")  # type: ignore[arg-type]
+    raw_frame = '{"channel":"trades","data":[{"px":"100","sz":"1"}]}'
+    trade = Trade(
+        exchange="hyperliquid",
+        symbol="BTC",
+        exchange_timestamp=BASE,
+        received_at=BASE,
+        available_at=BASE,
+        trade_id="trade-1",
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        side=Side.BUY,
+        source_raw_payload=raw_frame,
+        source_payload_sha256=hashlib.sha256(raw_frame.encode()).hexdigest(),
+    )
+    identity = ResearchStreamIdentity("hyperliquid", "BTC", "BTC", "trade", "trades")
+    collected = source._envelope(identity, trade)
+    assert collected.raw_payload == raw_frame
+    assert collected.normalized_payload is not None
+    assert "source_raw_payload" not in collected.normalized_payload
+
+
+def test_connection_lifecycle_is_filtered_and_persisted_with_recovery_identity() -> None:
+    matching = WebSocketConnectionLifecycle(
+        venue="hyperliquid",
+        instrument="BTC",
+        connection_id=uuid4(),
+        connection_epoch=2,
+        connected_at=BASE,
+        disconnected_at=BASE + timedelta(seconds=3),
+        duration_ms=3000,
+        reason="forced_disconnect",
+        close_code=1001,
+        close_message="validation",
+        exception_type="ConnectionClosed",
+        messages_received=42,
+        heartbeat_sent=1,
+        heartbeat_received=1,
+        stale_timeout=False,
+        server_initiated_close=True,
+        client_initiated_close=False,
+    )
+    other = replace(matching, instrument="ETH", connection_id=uuid4())
+
+    class LifecycleAdapter:
+        client = None
+
+        def __init__(self) -> None:
+            self.connection_lifecycle_events = deque((other, matching))
+
+    source = PublicAdapterCollectorSource(
+        LifecycleAdapter(),
+        "hyperliquid",  # type: ignore[arg-type]
+    )
+    identity = ResearchStreamIdentity("hyperliquid", "BTC", "BTC", "orderbook", "orderbook")
+    assert source._drain_connection_lifecycle(identity) == (matching,)
+    assert tuple(source.adapter.connection_lifecycle_events) == (other,)  # type: ignore[attr-defined]
+    collected = source._connection_lifecycle_envelope(identity, matching, 8)
+    payload = json.loads(collected.raw_payload)
+    assert collected.event_type == "websocket_disconnect"
+    assert collected.logical_stream_event_type == "orderbook"
+    assert collected.connection_epoch == 9
+    assert collected.recovery_started_at == matching.disconnected_at
+    assert payload["reason"] == "forced_disconnect"
+    assert payload["messages_received"] == 42
+    assert payload["heartbeat_sent"] == payload["heartbeat_received"] == 1
+
+
+@pytest.mark.asyncio
+async def test_public_rest_ohlcv_uses_checkpoint_cursor_and_explicit_end() -> None:
+    class OhlcvAdapter:
+        client = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[datetime | None, datetime | None]] = []
+
+        async def fetch_ohlcv(
+            self,
+            symbol: str,
+            timeframe: str,
+            start: datetime | None = None,
+            end: datetime | None = None,
+            limit: int = 1000,
+        ) -> tuple[object, ...]:
+            del symbol, timeframe, limit
+            self.calls.append((start, end))
+            return ()
+
+    adapter = OhlcvAdapter()
+    source = PublicAdapterCollectorSource(
+        adapter,
+        "hyperliquid",  # type: ignore[arg-type]
+    )
+    checkpoint = CollectionCheckpoint(
+        venue="hyperliquid",
+        stream_key="hyperliquid:ohlcv:BTC:rest",
+        connection_id=uuid4(),
+        last_sequence=None,
+        last_event_id="last-candle",
+        reconciliation_state=ReconciliationState.SYNCHRONIZED,
+        checkpointed_at=BASE,
+        last_available_at=BASE,
+    )
+    identity = ResearchStreamIdentity("hyperliquid", "BTC", "BTC", "ohlcv", "rest")
+    assert [item async for item in source.rest_events(identity, checkpoint)] == []
+    assert adapter.calls[0][0] == BASE
+    assert adapter.calls[0][1] is not None and adapter.calls[0][1] > BASE
+
+
+@pytest.mark.asyncio
+async def test_unknown_instrument_fees_and_limits_remain_none_not_zero() -> None:
+    class RuleAdapter:
+        client = None
+
+        async def fetch_markets(self) -> list[Market]:
+            return [
+                Market(
+                    exchange="hyperliquid",
+                    symbol="BTC",
+                    base="BTC",
+                    quote="USDC",
+                    market_type="perpetual",
+                    tick_size=Decimal("0.1"),
+                    lot_size=Decimal("0.001"),
+                    minimum_notional=None,
+                )
+            ]
+
+    source = PublicAdapterCollectorSource(
+        RuleAdapter(),
+        "hyperliquid",  # type: ignore[arg-type]
+    )
+    rule = (await source.instrument_rules(("BTC",)))[0]
+    assert rule.minimum_quantity is None
+    assert rule.minimum_notional is None
+    assert rule.maker_fee is None
+    assert rule.taker_fee is None
+    assert rule.maker_rebate is None
+    assert rule.funding_interval is None
+    assert rule.field_evidence["maker_fee"]["verification_status"] == "unknown"
+    assert rule.fee_tier.value == "unknown"
 
 
 def test_snapshot_membership_exact_reproduction_cutoff_and_quarantine_visibility() -> None:
@@ -282,6 +929,20 @@ def test_instrument_rule_is_frozen_and_hypothesis_version_is_strategy_scoped() -
         retrieved_at=BASE,
         valid_from=BASE,
         valid_until=None,
+        field_evidence={
+            name: {"verification_status": "verified"}
+            for name in (
+                "tick_size",
+                "lot_size",
+                "minimum_quantity",
+                "minimum_notional",
+                "maker_fee",
+                "taker_fee",
+                "maker_rebate",
+                "funding_interval",
+                "margin_asset",
+            )
+        },
     )
     repository.save_instrument_rule(rule)
     with pytest.raises(ValueError, match="immutable"):
@@ -335,6 +996,33 @@ def test_sql_snapshot_membership_is_reproduced_in_ordinal_order(tmp_path: Path) 
     engine.dispose()
 
 
+def test_database_trigger_rejects_finalized_snapshot_row_update_and_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "immutable.db"
+    url = f"sqlite+pysqlite:///{database}"
+    monkeypatch.setenv("APP_DATABASE_URL", url)
+    command.upgrade(Config("alembic.ini"), "head")
+    engine = build_engine(url)
+    repository = PostgreSQLResearchRepository(engine)
+    repository.add_raw_event(event("immutable-event"))
+    manifest = DataSnapshotService(repository).finalize(cutoff_at=BASE, finalized_at=BASE)
+    with engine.begin() as connection, pytest.raises(DBAPIError, match="immutable"):
+        connection.execute(
+            text(
+                "UPDATE data_snapshots SET content_sha256 = :digest "
+                "WHERE snapshot_id = :snapshot_id"
+            ),
+            {"digest": "f" * 64, "snapshot_id": manifest.snapshot_id},
+        )
+    with engine.begin() as connection, pytest.raises(DBAPIError, match="immutable"):
+        connection.execute(
+            text("DELETE FROM data_snapshots WHERE snapshot_id = :snapshot_id"),
+            {"snapshot_id": manifest.snapshot_id},
+        )
+    engine.dispose()
+
+
 def test_raw_payload_retention_protects_finalized_snapshot_membership() -> None:
     repository = InMemoryResearchRepository()
     protected_hash = "a" * 64
@@ -369,3 +1057,7 @@ def test_raw_payload_retention_protects_finalized_snapshot_membership() -> None:
     assert removed == 1
     assert protected_hash in repository.raw_payloads
     assert removable_hash not in repository.raw_payloads
+
+
+def test_collector_health_report_is_available_after_event_loop_shutdown() -> None:
+    assert CollectorHealthMetrics().report()["task_count"] == 0

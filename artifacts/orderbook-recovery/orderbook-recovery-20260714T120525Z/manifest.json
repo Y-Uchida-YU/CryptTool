@@ -1,0 +1,35 @@
+{
+  "run_id": "orderbook-recovery-20260714T120525Z",
+  "validated_commit_sha": "47da05bcc6201d1cba528021465893e708c3af5a",
+  "stage_1": {
+    "started_at": "2026-07-14T12:05:25.398695+00:00",
+    "ended_at": "2026-07-14T12:35:42.085808+00:00",
+    "duration_seconds": 1816.687113,
+    "venues": ["hyperliquid", "bitget"],
+    "instrument": "BTC",
+    "forced_reconnects_per_venue": 3,
+    "verdict": "PASS",
+    "results_path": "stage-1.json"
+  },
+  "stage_2": {
+    "started_at": "2026-07-14T13:37:38.245617+00:00",
+    "ended_at": "2026-07-14T14:37:38.429294+00:00",
+    "configured_duration_seconds": 3600,
+    "venues": ["hyperliquid", "bitget"],
+    "instruments": ["BTC", "ETH", "SOL", "HYPE"],
+    "stream_count": 8,
+    "verdict": "PASS",
+    "results_path": "stage-2.json"
+  },
+  "merge_gate": {
+    "all_streams_synchronized": true,
+    "permanently_degraded_streams": 0,
+    "recovery_required_streams": 0,
+    "forced_reconnect_recovery_pass": true,
+    "unhandled_exceptions": 0,
+    "lease_renewal_failures": 0,
+    "checkpoint_regressions": 0,
+    "live_execution_enabled": false,
+    "verdict": "PASS"
+  }
+}

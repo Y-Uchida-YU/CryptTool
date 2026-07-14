@@ -1,0 +1,22 @@
+database_url: sqlite+pysqlite:///accelerated-validation.db
+production_database_url: sqlite+pysqlite:///cryptbot.db
+paper_trading: true
+live_trading: false
+dry_run: true
+live:
+  enabled: false
+  adapter_name: disabled
+research_collection:
+  collection_enabled: false
+  venues: [hyperliquid, bitget]
+  instruments: [BTC, ETH, SOL, HYPE]
+  event_types:
+    - ohlcv
+    - trade
+    - orderbook_snapshot
+    - orderbook_delta
+    - funding_current
+    - funding_history
+    - open_interest
+    - mark_price
+    - index_price

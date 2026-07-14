@@ -10,6 +10,7 @@ from app.adapters.exchanges.public import (
     BitgetMarketDataAdapter,
     HyperliquidMarketDataAdapter,
     MexcMarketDataAdapter,
+    _valid_exchange_ms,
 )
 from app.adapters.exchanges.staged_execution import (
     AsterExecutionAdapter,
@@ -18,6 +19,7 @@ from app.adapters.exchanges.staged_execution import (
     HyperliquidExecutionAdapter,
     MexcExecutionAdapter,
 )
+from app.adapters.exchanges.websocket import OrderBookStreamSemantics
 from app.config.settings import Settings
 from app.domain.execution.leg_state import LegExecutionMachine, LegExecutionState, LegRiskPolicy
 from app.domain.market_data.clock import VenueClock
@@ -429,3 +431,58 @@ def test_priority_one_capability_matrices_exist() -> None:
         assert adapter.capabilities.perpetual.support != CapabilitySupport.UNAVAILABLE
         assert adapter.capabilities.orderbook_snapshot.support != CapabilitySupport.UNAVAILABLE
     assert MexcMarketDataAdapter.capabilities.open_interest.support == CapabilitySupport.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_bitget_maps_canonical_hour_timeframe_for_historical_candles() -> None:
+    observed: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    [
+                        str(int(NOW.timestamp() * 1000)),
+                        "100",
+                        "102",
+                        "99",
+                        "101",
+                        "12",
+                    ]
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.bitget.com"
+    ) as client:
+        candles = await BitgetMarketDataAdapter(client).fetch_ohlcv(
+            "BTCUSDT", "1h", NOW - timedelta(days=30), NOW
+        )
+    assert observed["granularity"] == "1H"
+    assert candles[0].timeframe == "1h"
+
+
+def test_orderbook_stream_semantics_are_explicit_per_venue() -> None:
+    assert (
+        BitgetMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.SNAPSHOT_AND_DELTA
+    )
+    assert (
+        HyperliquidMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.SNAPSHOT_ONLY
+    )
+    assert (
+        AsterMarketDataAdapter.order_book_stream_semantics
+        == OrderBookStreamSemantics.LIMITED_DEPTH_SNAPSHOT
+    )
+
+
+def test_orderbook_snapshot_timestamp_validation_rejects_invalid_and_future_values() -> None:
+    assert _valid_exchange_ms(int(NOW.timestamp() * 1000))
+    assert not _valid_exchange_ms("not-a-timestamp")
+    future = datetime.now(UTC) + timedelta(days=1)
+    assert not _valid_exchange_ms(int(future.timestamp() * 1000))
+    assert not _valid_exchange_ms(0)
