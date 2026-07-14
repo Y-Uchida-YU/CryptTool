@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from sqlalchemy import delete, select
@@ -85,7 +86,9 @@ class ResearchRepository(Protocol):
 
     def save_checkpoint(self, checkpoint: CollectionCheckpoint) -> None: ...
 
-    def get_checkpoint(self, venue: str, stream_key: str) -> CollectionCheckpoint | None: ...
+    def get_checkpoint(
+        self, venue: str, stream_key: str, checkpoint_namespace: str = "production"
+    ) -> CollectionCheckpoint | None: ...
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None: ...
 
@@ -110,6 +113,35 @@ class ResearchRepository(Protocol):
     ) -> None: ...
 
 
+class NamespacedResearchRepository:
+    """Shares immutable events while isolating mutable collector checkpoints by run."""
+
+    def __init__(self, repository: ResearchRepository, checkpoint_namespace: str) -> None:
+        if not checkpoint_namespace or checkpoint_namespace == "production":
+            raise ValueError("test collectors require a non-production checkpoint namespace")
+        self.repository = repository
+        self.checkpoint_namespace = checkpoint_namespace
+
+    def save_checkpoint(self, checkpoint: CollectionCheckpoint) -> None:
+        self.repository.save_checkpoint(
+            replace(checkpoint, checkpoint_namespace=self.checkpoint_namespace)
+        )
+
+    def get_checkpoint(
+        self,
+        venue: str,
+        stream_key: str,
+        checkpoint_namespace: str = "production",
+    ) -> CollectionCheckpoint | None:
+        del checkpoint_namespace
+        return self.repository.get_checkpoint(
+            venue, stream_key, checkpoint_namespace=self.checkpoint_namespace
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.repository, name)
+
+
 class InMemoryResearchRepository:
     def __init__(self) -> None:
         self.events: dict[str, RawMarketEvent] = {}
@@ -118,7 +150,7 @@ class InMemoryResearchRepository:
         self.snapshot_manifests: dict[str, DataSnapshotManifest] = {}
         self.experimental_events: dict[str, tuple[RawMarketEvent, str]] = {}
         self.raw_payloads: dict[str, tuple[str, str, str, str, datetime]] = {}
-        self.checkpoints: dict[tuple[str, str], CollectionCheckpoint] = {}
+        self.checkpoints: dict[tuple[str, str, str], CollectionCheckpoint] = {}
         self.rules: dict[str, InstrumentRuleSnapshot] = {}
         self.failures: list[CollectionFailureEvent] = []
         self.runs: dict[str, tuple[ResearchRunIdentity, str, str | None]] = {}
@@ -244,10 +276,14 @@ class InMemoryResearchRepository:
         return tuple(self.events[event_id] for _, event_id, _ in manifest.events)
 
     def save_checkpoint(self, checkpoint: CollectionCheckpoint) -> None:
-        self.checkpoints[(checkpoint.venue, checkpoint.stream_key)] = checkpoint
+        self.checkpoints[
+            (checkpoint.checkpoint_namespace, checkpoint.venue, checkpoint.stream_key)
+        ] = checkpoint
 
-    def get_checkpoint(self, venue: str, stream_key: str) -> CollectionCheckpoint | None:
-        return self.checkpoints.get((venue, stream_key))
+    def get_checkpoint(
+        self, venue: str, stream_key: str, checkpoint_namespace: str = "production"
+    ) -> CollectionCheckpoint | None:
+        return self.checkpoints.get((checkpoint_namespace, venue, stream_key))
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None:
         current = self.rules.get(rule.rule_snapshot_id)
@@ -597,11 +633,14 @@ class PostgreSQLResearchRepository:
             return tuple(self._event(row) for row in session.scalars(statement).all())
 
     def save_checkpoint(self, checkpoint: CollectionCheckpoint) -> None:
+        storage_key = self._checkpoint_storage_key(
+            checkpoint.stream_key, checkpoint.checkpoint_namespace
+        )
         with Session(self.engine) as session:
             row = session.scalar(
                 select(MarketDataCheckpointRow).where(
                     MarketDataCheckpointRow.venue == checkpoint.venue,
-                    MarketDataCheckpointRow.stream_key == checkpoint.stream_key,
+                    MarketDataCheckpointRow.stream_key == storage_key,
                 )
             )
             values = {
@@ -621,12 +660,13 @@ class PostgreSQLResearchRepository:
                 "delta_sequence": checkpoint.delta_sequence,
                 "connection_epoch": checkpoint.connection_epoch,
                 "recovery_required": checkpoint.recovery_required,
+                "checkpoint_namespace": checkpoint.checkpoint_namespace,
             }
             if row is None:
                 session.add(
                     MarketDataCheckpointRow(
                         venue=checkpoint.venue,
-                        stream_key=checkpoint.stream_key,
+                        stream_key=storage_key,
                         **values,
                     )
                 )
@@ -635,19 +675,22 @@ class PostgreSQLResearchRepository:
                     setattr(row, key, value)
             session.commit()
 
-    def get_checkpoint(self, venue: str, stream_key: str) -> CollectionCheckpoint | None:
+    def get_checkpoint(
+        self, venue: str, stream_key: str, checkpoint_namespace: str = "production"
+    ) -> CollectionCheckpoint | None:
+        storage_key = self._checkpoint_storage_key(stream_key, checkpoint_namespace)
         with Session(self.engine) as session:
             row = session.scalar(
                 select(MarketDataCheckpointRow).where(
                     MarketDataCheckpointRow.venue == venue,
-                    MarketDataCheckpointRow.stream_key == stream_key,
+                    MarketDataCheckpointRow.stream_key == storage_key,
                 )
             )
             if row is None:
                 return None
             return CollectionCheckpoint(
                 venue=row.venue,
-                stream_key=row.stream_key,
+                stream_key=stream_key,
                 connection_id=UUID(row.connection_id),
                 last_sequence=row.last_sequence,
                 last_event_id=row.last_event_id,
@@ -666,7 +709,15 @@ class PostgreSQLResearchRepository:
                 delta_sequence=row.delta_sequence,
                 connection_epoch=row.connection_epoch,
                 recovery_required=row.recovery_required,
+                checkpoint_namespace=row.checkpoint_namespace,
             )
+
+    @staticmethod
+    def _checkpoint_storage_key(stream_key: str, checkpoint_namespace: str) -> str:
+        if checkpoint_namespace == "production":
+            return stream_key
+        namespace_hash = hashlib.sha256(checkpoint_namespace.encode()).hexdigest()[:16]
+        return f"ns-{namespace_hash}::{stream_key}"
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None:
         with Session(self.engine) as session:

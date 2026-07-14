@@ -228,6 +228,11 @@ class CollectionCheckpoint:
     delta_sequence: int | None = None
     connection_epoch: int = 0
     recovery_required: bool = False
+    checkpoint_namespace: str = "production"
+
+    def __post_init__(self) -> None:
+        if not self.checkpoint_namespace:
+            raise ValueError("checkpoint_namespace is required")
 
 
 @dataclass(frozen=True)

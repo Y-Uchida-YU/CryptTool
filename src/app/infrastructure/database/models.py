@@ -171,6 +171,42 @@ class MarketDataCheckpointRow(Base):
     delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
     connection_epoch: Mapped[int] = mapped_column(Integer, default=0)
     recovery_required: Mapped[bool] = mapped_column(default=False)
+    checkpoint_namespace: Mapped[str] = mapped_column(String(200), default="production", index=True)
+
+
+class CollectorLeaseRow(Base):
+    __tablename__ = "collector_leases"
+    collector_group: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    owner_id: Mapped[str] = mapped_column(String(240))
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    renewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CollectorRunRow(Base):
+    __tablename__ = "collector_runs"
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    collector_group: Mapped[str] = mapped_column(String(160), index=True)
+    owner_id: Mapped[str] = mapped_column(String(240))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    config_path: Mapped[str] = mapped_column(String(1000))
+    database_identity: Mapped[str] = mapped_column(String(1000))
+    schema_name: Mapped[str] = mapped_column(String(160))
+    checkpoint_namespace: Mapped[str] = mapped_column(String(200))
+    artifact_namespace: Mapped[str] = mapped_column(String(500))
+    venues_json: Mapped[str] = mapped_column(Text)
+    instruments_json: Mapped[str] = mapped_column(Text)
+    event_types_json: Mapped[str] = mapped_column(Text)
+    duration_seconds: Mapped[float | None] = mapped_column()
+    pid: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    artifact_directory: Mapped[str | None] = mapped_column(String(1000))
+    failure_reason: Mapped[str | None] = mapped_column(String(1000))
 
 
 class CollectionFailureEventRow(Base):

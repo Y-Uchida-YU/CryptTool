@@ -1,0 +1,15 @@
+{
+  "data_quality_passed": false,
+  "data_quality_reasons": [
+    "quarantine ratio above threshold",
+    "quarantined events present",
+    "clock skew above threshold",
+    "missing funding windows"
+  ],
+  "live_execution": "OFF",
+  "pipeline_completed": true,
+  "research_manifest": "artifacts/research/research-d17f63ab0d71d426993bd0b9/manifest.json",
+  "research_run_id": "research-d17f63ab0d71d426993bd0b9",
+  "snapshot_id": "clean-3a30fc56ffac50f8",
+  "verdict": "FAIL"
+}

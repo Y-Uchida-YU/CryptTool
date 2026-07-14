@@ -129,14 +129,35 @@ async def test_historical_replay_realtime_modes_are_supported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clean_replay_has_no_faults_restarts_and_distinct_snapshot_namespace() -> None:
+    repository = InMemoryResearchRepository()
+    result = await HistoricalMarketEventReplay(
+        repository=repository,
+        restart_percentages=(),
+        snapshot_prefix="clean",
+    ).replay(
+        events=event_stream(tuple(replay_event(index) for index in range(1, 5))),
+        speed=None,
+        maximum_queue_depth=2,
+        fault_schedule=None,
+    )
+    assert result.snapshot_manifest.snapshot_id.startswith("clean-")
+    assert result.fault_results == ()
+    assert result.restart_results == ()
+    assert result.event_loss == 0
+
+
+@pytest.mark.asyncio
 async def test_one_hundred_start_stop_cycles_do_not_leak_resources() -> None:
     async def cycle(_: int) -> None:
         task = __import__("asyncio").create_task(__import__("asyncio").sleep(0))
         await task
 
-    samples, leaked = await run_start_stop_resource_test(iterations=100, cycle=cycle)
+    samples, analysis = await run_start_stop_resource_test(iterations=100, cycle=cycle)
     assert len(samples) == 100
-    assert not leaked
+    assert analysis.bounded
+    assert analysis.warmup_iterations == 10
+    assert analysis.top_allocation_traceback
     assert samples[-1].task_count <= samples[0].task_count + 1
     assert samples[-1].open_db_connections == samples[0].open_db_connections
 
@@ -152,14 +173,15 @@ async def test_accelerated_artifact_manifest_hash_verification(tmp_path: Path) -
         maximum_queue_depth=2,
         fault_schedule=None,
     )
-    samples, leaked = await run_start_stop_resource_test(iterations=2, cycle=lambda _: None)
+    samples, analysis = await run_start_stop_resource_test(iterations=2, cycle=lambda _: None)
     manifest = AcceleratedValidationArtifactWriter.write(
         root=tmp_path,
         run_id="accelerated-test",
         commit_sha="d96567d",
         replay=replay,
         resources=samples,
-        resource_leak_detected=leaked,
+        resource_leak_detected=not analysis.bounded,
+        resource_analysis=analysis,
         live_soak_status="INSUFFICIENT_EVIDENCE",
         research_pipeline_verdict="INSUFFICIENT_EVIDENCE",
         unresolved_items=("historical order-book delta unavailable",),

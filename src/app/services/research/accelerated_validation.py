@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import gc
 import hashlib
 import json
 import math
 import os
 import random
+import resource
+import subprocess  # nosec B404
 import time
 import tracemalloc
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -373,6 +376,25 @@ class ResourceUsageSample:
     open_db_connections: int
     queue_depth: int
     file_descriptors: int
+    rss_bytes: int
+    rss_peak_bytes: int
+    gc_memory_bytes: int
+
+
+@dataclass(frozen=True)
+class ResourceLeakAnalysis:
+    warmup_iterations: int
+    memory_slope_per_cycle: float
+    warmup_excluded_memory_slope: float
+    rss_slope_per_cycle: float
+    warmup_excluded_rss_slope: float
+    rss_start_bytes: int
+    rss_end_bytes: int
+    rss_peak_bytes: int
+    gc_current_memory_bytes: int
+    top_allocation_traceback: tuple[str, ...]
+    bounded: bool
+    failure_reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -470,10 +492,14 @@ class HistoricalMarketEventReplay:
         repository: ResearchRepository,
         capability_gate: ResearchCapabilityGate | None = None,
         restart_percentages: tuple[int, ...] = (10, 50, 90),
+        snapshot_prefix: str = "accelerated",
     ) -> None:
         self.repository = repository
         self.capability_gate = capability_gate or StaticReplayCapabilityGate()
         self.restart_percentages = restart_percentages
+        if not snapshot_prefix:
+            raise ValueError("snapshot_prefix is required")
+        self.snapshot_prefix = snapshot_prefix
         self._observed_streams: set[tuple[str, str]] = set()
 
     async def replay(
@@ -604,7 +630,9 @@ class HistoricalMarketEventReplay:
         cutoff = max(item.envelope.available_at for item in ordered)
         manifest = DataSnapshotService(self.repository).finalize(
             cutoff_at=cutoff,
-            snapshot_id=f"accelerated-{canonical_sha256(tuple(sorted(expected_ids)))[:16]}",
+            snapshot_id=(
+                f"{self.snapshot_prefix}-{canonical_sha256(tuple(sorted(expected_ids)))[:16]}"
+            ),
             finalized_at=datetime.now(UTC),
             eligibility_policy=SnapshotEligibilityPolicy(minimum_production_events=1),
         )
@@ -861,16 +889,20 @@ async def run_start_stop_resource_test(
     iterations: int,
     cycle: Callable[[int], Any],
     database_connections: Callable[[], int] | None = None,
-) -> tuple[tuple[ResourceUsageSample, ...], bool]:
+) -> tuple[tuple[ResourceUsageSample, ...], ResourceLeakAnalysis]:
     if iterations < 1:
         raise ValueError("iterations must be positive")
     tracemalloc.start()
     samples: list[ResourceUsageSample] = []
+    top_allocation_traceback: tuple[str, ...] = ()
     for iteration in range(iterations):
         value = cycle(iteration)
         if hasattr(value, "__await__"):
             await value
         current, peak = tracemalloc.get_traced_memory()
+        gc.collect()
+        gc_current, _ = tracemalloc.get_traced_memory()
+        rss_current, rss_peak = _rss_usage()
         samples.append(
             ResourceUsageSample(
                 iteration + 1,
@@ -880,11 +912,19 @@ async def run_start_stop_resource_test(
                 database_connections() if database_connections else 0,
                 0,
                 _file_descriptor_count(),
+                rss_current,
+                rss_peak,
+                gc_current,
             )
         )
+    snapshot = tracemalloc.take_snapshot()
+    top_allocation_traceback = tuple(
+        f"{stat.traceback}: {stat.size} bytes in {stat.count} allocations"
+        for stat in snapshot.statistics("traceback")[:10]
+    )
     tracemalloc.stop()
-    leak = _unbounded_growth(samples)
-    return tuple(samples), leak
+    analysis = analyze_resource_usage(samples, top_allocation_traceback)
+    return tuple(samples), analysis
 
 
 def _file_descriptor_count() -> int:
@@ -896,22 +936,74 @@ def _file_descriptor_count() -> int:
     return -1
 
 
-def _unbounded_growth(samples: Sequence[ResourceUsageSample]) -> bool:
-    if len(samples) < 10:
-        return False
-    tail = samples[len(samples) // 2 :]
-    monotonic_memory = all(
-        left.memory_bytes <= right.memory_bytes for left, right in pairwise(tail)
-    )
-    memory_growth = tail[-1].memory_bytes - tail[0].memory_bytes > 5_000_000
-    task_growth = tail[-1].task_count > tail[0].task_count + 1
-    connection_growth = tail[-1].open_db_connections > tail[0].open_db_connections
-    descriptor_growth = tail[-1].file_descriptors > tail[0].file_descriptors + 2
+def _rss_usage() -> tuple[int, int]:
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = int(peak if os.uname().sysname == "Darwin" else peak * 1024)
+    try:
+        completed = subprocess.run(  # nosec B603
+            ("/bin/ps", "-o", "rss=", "-p", str(os.getpid())),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        current_bytes = int(completed.stdout.strip()) * 1024
+    except (OSError, subprocess.SubprocessError, ValueError):
+        current_bytes = peak_bytes
+    return current_bytes, peak_bytes
+
+
+def _linear_slope(values: Sequence[int]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean_x = (len(values) - 1) / 2
+    mean_y = sum(values) / len(values)
+    denominator = sum((index - mean_x) ** 2 for index in range(len(values)))
     return (
-        (monotonic_memory and memory_growth)
-        or task_growth
-        or connection_growth
-        or descriptor_growth
+        sum((index - mean_x) * (value - mean_y) for index, value in enumerate(values)) / denominator
+    )
+
+
+def analyze_resource_usage(
+    samples: Sequence[ResourceUsageSample],
+    top_allocation_traceback: tuple[str, ...] = (),
+) -> ResourceLeakAnalysis:
+    if not samples:
+        raise ValueError("resource samples are required")
+    warmup = min(max(1, len(samples) // 10), 10) if len(samples) >= 10 else 0
+    steady = samples[warmup:] or samples
+    memory_slope = _linear_slope([item.gc_memory_bytes for item in samples])
+    steady_memory_slope = _linear_slope([item.gc_memory_bytes for item in steady])
+    rss_slope = _linear_slope([item.rss_bytes for item in samples])
+    steady_rss_slope = _linear_slope([item.rss_bytes for item in steady])
+    reasons: list[str] = []
+    # Small allocator drift is expected. Fail on sustained post-warmup growth that is
+    # both monotonic in effect and material in absolute size.
+    memory_growth = steady[-1].gc_memory_bytes - steady[0].gc_memory_bytes
+    rss_growth = steady[-1].rss_bytes - steady[0].rss_bytes
+    if steady_memory_slope > 100_000 and memory_growth > 5_000_000:
+        reasons.append("post-warmup traced memory is unbounded")
+    if steady_rss_slope > 1_000_000 and rss_growth > 25_000_000:
+        reasons.append("post-warmup RSS is unbounded")
+    if steady[-1].task_count > steady[0].task_count + 1:
+        reasons.append("task count increased")
+    if steady[-1].open_db_connections > steady[0].open_db_connections:
+        reasons.append("database connections increased")
+    if steady[-1].file_descriptors > steady[0].file_descriptors + 2:
+        reasons.append("file descriptors increased")
+    return ResourceLeakAnalysis(
+        warmup_iterations=warmup,
+        memory_slope_per_cycle=memory_slope,
+        warmup_excluded_memory_slope=steady_memory_slope,
+        rss_slope_per_cycle=rss_slope,
+        warmup_excluded_rss_slope=steady_rss_slope,
+        rss_start_bytes=samples[0].rss_bytes,
+        rss_end_bytes=samples[-1].rss_bytes,
+        rss_peak_bytes=max(item.rss_peak_bytes for item in samples),
+        gc_current_memory_bytes=samples[-1].gc_memory_bytes,
+        top_allocation_traceback=top_allocation_traceback,
+        bounded=not reasons,
+        failure_reasons=tuple(reasons),
     )
 
 
@@ -936,6 +1028,7 @@ class AcceleratedValidationArtifactWriter:
         replay: ReplayResult,
         resources: tuple[ResourceUsageSample, ...],
         resource_leak_detected: bool,
+        resource_analysis: ResourceLeakAnalysis | None = None,
         live_soak_status: str,
         research_pipeline_verdict: str,
         unresolved_items: tuple[str, ...],
@@ -951,6 +1044,7 @@ class AcceleratedValidationArtifactWriter:
             "commit_sha": commit_sha,
             "replay": replay,
             "resource_leak_detected": resource_leak_detected,
+            "resource_analysis": resource_analysis,
             "live_soak_status": live_soak_status,
             "research_pipeline_verdict": research_pipeline_verdict,
             "unresolved_items": unresolved_items,
@@ -975,6 +1069,11 @@ class AcceleratedValidationArtifactWriter:
             and live_soak_status == "PASS"
             and research_pipeline_verdict == "PASS"
         )
+        memory_slope: float | str = "unavailable"
+        steady_memory_slope: float | str = "unavailable"
+        if resource_analysis is not None:
+            memory_slope = resource_analysis.memory_slope_per_cycle
+            steady_memory_slope = resource_analysis.warmup_excluded_memory_slope
         summary = (
             f"# Accelerated validation {run_id}\n\n"
             f"- Replay: {'PASS' if replay.passed else 'FAIL'}\n"
@@ -982,6 +1081,9 @@ class AcceleratedValidationArtifactWriter:
             f"- Unexpected duplicate: {replay.unexpected_duplicates}\n"
             f"- Restarts: {len(replay.restart_results)}\n"
             f"- Resource leak: {resource_leak_detected}\n"
+            f"- Memory slope/cycle: "
+            f"{memory_slope}\n"
+            f"- Post-warmup memory slope/cycle: {steady_memory_slope}\n"
             f"- Live soak: {live_soak_status}\n"
             f"- Research pipeline: {research_pipeline_verdict}\n"
             f"- Paper operation allowed: {paper_allowed}\n"

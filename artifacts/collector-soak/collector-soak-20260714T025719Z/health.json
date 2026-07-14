@@ -1,0 +1,31 @@
+{
+  "artifact_directory": "artifacts/collector-soak/collector-soak-20260714T025719Z",
+  "cancellation_reason": "A second long-duration public collector was active concurrently; retained only the dedicated six-hour validation soak.",
+  "checkpoint_namespace": "legacy-default (pre-namespace implementation)",
+  "command": ".venv/bin/app run-collector-soak --config configs/research-collector-soak.yaml --duration-hours 24",
+  "commit_sha": "1bed4798e8c300f633ed7204c2e67f358ebb33dc",
+  "config_path": "configs/research-collector-soak.yaml",
+  "connection_epoch_max": 7300,
+  "database_identity": "sqlite:////tmp/crypttool-r2-1-soak-1bed479.db",
+  "duration_hours": 24,
+  "failure_count": 7626,
+  "failures_by_venue_event_type": {
+    "bitget:orderbook": 7300,
+    "hyperliquid:ohlcv": 326
+  },
+  "instruments": ["BTC"],
+  "last_checkpoint_at": "2026-07-14T05:42:59.393740Z",
+  "last_event_id": "hyperliquid-15b515fee95cc087beacb7c971e5ff820ce283d9906e942064dc154c1c3aa450",
+  "live_execution": "OFF",
+  "memory_last_observed_bytes": 210812928,
+  "memory_observation_is_exact_pre_stop": false,
+  "pid": 37694,
+  "schema": "main",
+  "start_time": "2026-07-14T11:57:19+09:00",
+  "status": "CANCELED_DUE_TO_OVERLAP",
+  "stop_method": "SIGINT graceful shutdown",
+  "stream_keys_shared_with_other_database": true,
+  "task_count": null,
+  "task_count_note": "not captured before the legacy process exited; no value was inferred",
+  "venues": ["hyperliquid", "bitget"]
+}

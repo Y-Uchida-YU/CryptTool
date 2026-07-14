@@ -65,7 +65,7 @@ class PointInTimeDatasetBuilder:
             try:
                 payload = event.payload()
                 _validate_payload(event.event_type, payload)
-            except (ValueError, TypeError) as exc:
+            except (KeyError, ValueError, TypeError) as exc:
                 self.repository.quarantine(event, f"normalization failure: {exc}", cutoff)
                 continue
             if (

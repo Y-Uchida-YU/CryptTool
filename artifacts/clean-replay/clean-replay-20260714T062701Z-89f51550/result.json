@@ -1,0 +1,1184 @@
+{
+  "checkpoint_namespace": "clean-replay:clean-replay-20260714T062701Z-89f51550",
+  "commit_sha": "89f51550ec1885e0b140f6ceb8df95a527bcbd5c",
+  "database_identity": "sqlite:////private/tmp/crypttool-clean-replay-89f5155-v2.db",
+  "dataset_coverage": [
+    {
+      "coverage_end": "2026-07-14T05:00:00+00:00",
+      "coverage_start": "2026-06-14T06:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "BTC",
+      "missing_intervals": [],
+      "payload_sha256": "aeedb7fcdd1555998deedd3c0898bb910542d93eef8973842871d8d851556c8f",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-05T01:00:00.057000+00:00",
+      "coverage_start": "2026-06-14T06:00:00.020000+00:00",
+      "detail": null,
+      "event_count": 500,
+      "event_type": "funding_history",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-07-05T09:00:00.057000+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": "911280f9965c7ad88b63c5cfc78838d0492c1593de18a2f1adf62410814d9282",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-14T05:00:00+00:00",
+      "coverage_start": "2026-06-14T06:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "ETH",
+      "missing_intervals": [],
+      "payload_sha256": "be608fb72320e2f8b2a169cac0d057223b10a9b626b80cef66dae6cdc3b477c2",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-05T01:00:00.057000+00:00",
+      "coverage_start": "2026-06-14T06:00:00.020000+00:00",
+      "detail": null,
+      "event_count": 500,
+      "event_type": "funding_history",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-07-05T09:00:00.057000+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": "16701953348a05815186f74a7782d69fa45715eff84c6e4202f175ab01f10b16",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-14T05:00:00+00:00",
+      "coverage_start": "2026-06-14T06:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "SOL",
+      "missing_intervals": [],
+      "payload_sha256": "6c769f3f82e9894fa477dd3bf0dbb8ecd77af7f75eeb89b9e86a80517959f28f",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-05T01:00:00.057000+00:00",
+      "coverage_start": "2026-06-14T06:00:00.020000+00:00",
+      "detail": null,
+      "event_count": 500,
+      "event_type": "funding_history",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-07-05T09:00:00.057000+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": "73e8bd53849d74a89311cc92c1b44ddb21d3c9268a8097caadc85803f7b9f879",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-14T05:00:00+00:00",
+      "coverage_start": "2026-06-14T06:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "HYPE",
+      "missing_intervals": [],
+      "payload_sha256": "b0ad390946160d5ec5095ce9d0d942de1af22f5ca43b8d713f360e70d35882ea",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-05T01:00:00.057000+00:00",
+      "coverage_start": "2026-06-14T06:00:00.020000+00:00",
+      "detail": null,
+      "event_count": 500,
+      "event_type": "funding_history",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-07-05T09:00:00.057000+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": "08791422677ab0903cf27ba8477071906f147dafa4ec781ef6ea08531b1f2814",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:HyperliquidMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "hyperliquid"
+    },
+    {
+      "coverage_end": "2026-07-14T06:00:00+00:00",
+      "coverage_start": "2026-06-14T07:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "BTC",
+      "missing_intervals": [],
+      "payload_sha256": "2dc44ed086c725be38cdee181bbf328c3275ed46becca7deb867e0e97b57e382",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T00:00:00+00:00",
+      "coverage_start": "2026-06-11T00:00:00+00:00",
+      "detail": null,
+      "event_count": 100,
+      "event_type": "funding_history",
+      "instrument": "BTC",
+      "missing_intervals": [],
+      "payload_sha256": "0fe6fa3ad044f09bd7ee7a225460bda499445d871c544cc3e7f385321f53eb54",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "BTC",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T06:00:00+00:00",
+      "coverage_start": "2026-06-14T07:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "ETH",
+      "missing_intervals": [],
+      "payload_sha256": "84c61d817f1b2379ec7733463cb8dedcc795b6f912d3b73354d6b13645dc493a",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T00:00:00+00:00",
+      "coverage_start": "2026-06-11T00:00:00+00:00",
+      "detail": null,
+      "event_count": 100,
+      "event_type": "funding_history",
+      "instrument": "ETH",
+      "missing_intervals": [],
+      "payload_sha256": "974b74f17a8a1a66a6c66ed0adcf98f5babba848d2ccb494d8f6f96c69a5dad7",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "ETH",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T06:00:00+00:00",
+      "coverage_start": "2026-06-14T07:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "SOL",
+      "missing_intervals": [],
+      "payload_sha256": "8c21cac981071acc56e462d03ef5b9bd8e6e492cc04b0363d543e71f95d30214",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T00:00:00+00:00",
+      "coverage_start": "2026-06-11T00:00:00+00:00",
+      "detail": null,
+      "event_count": 100,
+      "event_type": "funding_history",
+      "instrument": "SOL",
+      "missing_intervals": [],
+      "payload_sha256": "e22395d5e2e626496e447df0f565dc45bdefc27c9af94b654e64d69c01fa3889",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "SOL",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T06:00:00+00:00",
+      "coverage_start": "2026-06-14T07:00:00+00:00",
+      "detail": null,
+      "event_count": 720,
+      "event_type": "ohlcv",
+      "instrument": "HYPE",
+      "missing_intervals": [],
+      "payload_sha256": "695b686be976bcfe58902098055a8083fc29ad48cfc78371e0904a4914b0d7ef",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:ohlcv",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": "2026-07-14T04:00:00+00:00",
+      "coverage_start": "2026-06-27T16:00:00+00:00",
+      "detail": null,
+      "event_count": 100,
+      "event_type": "funding_history",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-06-27T16:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": "514d3415e45671386f05f4478c600655efcac401489b6d75bd5cb89b6722581b",
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "public-adapter:BitgetMarketDataAdapter:historical:funding_history",
+      "status": "AVAILABLE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "trade",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "open_interest",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "mark_price",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "index_price",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical endpoint unavailable in existing public adapter",
+      "event_count": 0,
+      "event_type": "orderbook_snapshot",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    },
+    {
+      "coverage_end": null,
+      "coverage_start": null,
+      "detail": "historical order-book delta unavailable; synthetic sequence/reconciliation tests used instead",
+      "event_count": 0,
+      "event_type": "orderbook_delta",
+      "instrument": "HYPE",
+      "missing_intervals": [
+        [
+          "2026-06-14T06:00:00+00:00",
+          "2026-07-14T06:00:00+00:00"
+        ]
+      ],
+      "payload_sha256": null,
+      "retrieved_at": "2026-07-14T06:27:01.357375+00:00",
+      "source_endpoint": "unavailable",
+      "status": "INSUFFICIENT_EVIDENCE",
+      "venue": "bitget"
+    }
+  ],
+  "effective_speed": 52165.49540356778,
+  "elapsed_seconds": 55.28108954199706,
+  "event_count": 8160,
+  "event_loss": 0,
+  "fault_injection": "disabled",
+  "live_execution": "OFF",
+  "requested_end": "2026-07-14T06:00:00+00:00",
+  "requested_start": "2026-06-14T06:00:00+00:00",
+  "restart_injection": "disabled",
+  "run_id": "clean-replay-20260714T062701Z-89f51550",
+  "schema_name": "main",
+  "snapshot_eligibility_reasons": [],
+  "snapshot_eligibility_status": "FINALIZED_RESEARCH_ELIGIBLE",
+  "snapshot_id": "clean-3a30fc56ffac50f8",
+  "snapshot_manifest_sha256": "ef376ba65451a76ab5a1a8a2a59f5789af7403b632ae65a1ac0e080ea22ce9c5",
+  "unexpected_duplicates": 0
+}

@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import resource
+import subprocess  # nosec B404
+import time
 from collections import Counter
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
@@ -588,13 +591,41 @@ class CollectorHealthMetrics:
     checkpoint_lag_seconds: float = 0
     production_by_venue: Counter[str] = field(default_factory=Counter)
     experimental_by_venue: Counter[str] = field(default_factory=Counter)
+    queue_peak: int = 0
+    database_write_count: int = 0
+    database_write_latency_total_seconds: float = 0
+    database_write_latency_peak_seconds: float = 0
+    task_count_start: int = 0
+    task_count_end: int = 0
+    task_count_peak: int = 0
+    rss_start_bytes: int = 0
+    rss_end_bytes: int = 0
+    rss_peak_bytes: int = 0
+
+    def observe_runtime(self, *, queue_depth: int) -> None:
+        rss = _current_rss_bytes()
+        task_count = len([task for task in asyncio.all_tasks() if not task.done()])
+        if self.rss_start_bytes == 0:
+            self.rss_start_bytes = rss
+            self.task_count_start = task_count
+        self.rss_end_bytes = rss
+        self.rss_peak_bytes = max(self.rss_peak_bytes, rss)
+        self.task_count_end = task_count
+        self.task_count_peak = max(self.task_count_peak, task_count)
+        self.queue_peak = max(self.queue_peak, queue_depth)
+
+    def observe_database_write(self, elapsed_seconds: float) -> None:
+        self.database_write_count += 1
+        self.database_write_latency_total_seconds += elapsed_seconds
+        self.database_write_latency_peak_seconds = max(
+            self.database_write_latency_peak_seconds, elapsed_seconds
+        )
 
     def report(self) -> dict[str, object]:
         total = self.production_count + self.experimental_count + self.duplicate_count
-        try:
-            task_count = len(asyncio.all_tasks())
-        except RuntimeError:
-            task_count = 0
+        average_write_latency = self.database_write_latency_total_seconds / max(
+            1, self.database_write_count
+        )
         return {
             "events_by_venue_type_instrument": {
                 ":".join(key): value for key, value in sorted(self.events.items())
@@ -609,9 +640,34 @@ class CollectorHealthMetrics:
             "production_count": self.production_count,
             "checkpoint_lag_seconds": self.checkpoint_lag_seconds,
             "duplicate_ratio": self.duplicate_count / max(1, total),
-            "memory_usage_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-            "task_count": task_count,
+            "queue_peak": self.queue_peak,
+            "database_write_latency_average_seconds": average_write_latency,
+            "database_write_latency_peak_seconds": self.database_write_latency_peak_seconds,
+            "rss_start_bytes": self.rss_start_bytes,
+            "rss_end_bytes": self.rss_end_bytes,
+            "rss_peak_bytes": self.rss_peak_bytes,
+            "task_count_start": self.task_count_start,
+            "task_count_end": self.task_count_end,
+            "task_count_peak": self.task_count_peak,
+            # Retained for compatibility with the prior health artifact schema.
+            "memory_usage_bytes": self.rss_end_bytes,
+            "task_count": self.task_count_end,
         }
+
+
+def _current_rss_bytes() -> int:
+    try:
+        completed = subprocess.run(  # nosec B603
+            ("/bin/ps", "-o", "rss=", "-p", str(os.getpid())),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return int(completed.stdout.strip()) * 1024
+    except (OSError, subprocess.SubprocessError, ValueError):
+        maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(maximum if os.uname().sysname == "Darwin" else maximum * 1024)
 
 
 def _sanitize_endpoint(endpoint: str) -> str:
@@ -656,6 +712,8 @@ class RawPersistenceConsumer:
             try:
                 if envelope is None:
                     return
+                self.metrics.observe_runtime(queue_depth=queue.qsize())
+                started = time.perf_counter()
                 try:
                     self.persist(envelope)
                 except Exception as exc:
@@ -665,6 +723,8 @@ class RawPersistenceConsumer:
                         exc,
                         0,
                     )
+                finally:
+                    self.metrics.observe_database_write(time.perf_counter() - started)
             finally:
                 queue.task_done()
 
@@ -1188,6 +1248,17 @@ class ResearchMarketDataCollector:
             self.metrics,
             self.stale_after,
         )
+        resource_monitor_shutdown = asyncio.Event()
+
+        async def monitor_resources() -> None:
+            while not resource_monitor_shutdown.is_set():
+                self.metrics.observe_runtime(queue_depth=queue.qsize())
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(resource_monitor_shutdown.wait(), timeout=1)
+
+        resource_monitor = asyncio.create_task(
+            monitor_resources(), name="collector-resource-monitor"
+        )
         consumer_task = asyncio.create_task(consumer.run(queue), name="raw-persistence-consumer")
         workers: list[asyncio.Task[None]] = []
         try:
@@ -1235,6 +1306,8 @@ class ResearchMarketDataCollector:
             await queue.join()
         finally:
             self._shutdown.set()
+            resource_monitor_shutdown.set()
+            await resource_monitor
             for task in workers:
                 task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)

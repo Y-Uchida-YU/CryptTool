@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 from app.cli.main import app
 from app.infrastructure.database.models import Base
+from app.services.research.data_operations import DataSnapshotService
 from app.services.research.dataset import PointInTimeDatasetBuilder, raw_event_from_dict
 from app.services.research.models import FrozenHypothesis, InstrumentRuleSnapshot
 from app.services.research.pipeline import (
@@ -214,6 +215,34 @@ def test_delisted_outage_and_quarantine_are_preserved() -> None:
     assert dataset.retained_outage_event_ids == ("outage",)
     assert repository.quarantine_count() == 1
     assert repository.quarantined[0][0].raw_payload == "{"
+
+
+def test_missing_required_funding_field_is_quarantined_instead_of_crashing() -> None:
+    repository = InMemoryResearchRepository()
+    repository.add_raw_event(
+        raw_event_from_dict(
+            raw_event(
+                "funding-without-mark",
+                event_type="funding_history",
+                payload={"rate": "0.001"},
+            )
+        )
+    )
+    DataSnapshotService(repository).finalize(
+        cutoff_at=BASE,
+        snapshot_id="missing-funding-field",
+        finalized_at=BASE,
+    )
+    dataset = PointInTimeDatasetBuilder(repository).build(
+        snapshot_id="missing-funding-field",
+        cutoff_at=BASE,
+        instruments=("BTC-USD-PERP",),
+        venues=("hyperliquid",),
+        event_types=("funding_history",),
+    )
+    assert dataset.values == ()
+    assert repository.quarantine_count() == 1
+    assert "normalization failure" in repository.quarantined[0][1]
 
 
 def test_train_only_normalization_purge_embargo_and_real_strategy(tmp_path: Path) -> None:
