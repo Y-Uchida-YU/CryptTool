@@ -6,6 +6,7 @@ import json
 import os
 import plistlib
 import subprocess  # nosec B404
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -73,7 +74,7 @@ class LaunchAgentSpec:
             "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": str((self.repository_root / "src").resolve()),
-            "TMPDIR": str(Path(os.environ.get("TMPDIR", "/tmp")).resolve()),
+            "TMPDIR": str(Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()),
         }
 
     def validate(self) -> None:
