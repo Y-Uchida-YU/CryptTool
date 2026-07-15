@@ -469,8 +469,8 @@ def test_trade_ordering_is_isolated_by_connection_epoch() -> None:
 
 
 def test_equal_trade_timestamp_is_allowed() -> None:
-    first = _trade_with_order(event_id="first", trade_id="trade-a")
-    second = _trade_with_order(event_id="second", trade_id="trade-b")
+    first = _trade_with_order(event_id="first", trade_id="2")
+    second = _trade_with_order(event_id="second", trade_id="1")
     metrics = certification_metrics(
         (first, second), spec("trade"), NOW - timedelta(minutes=1), NOW, ()
     )
@@ -645,6 +645,42 @@ async def test_bitget_funding_backfill_paginates_and_deduplicates_overlap() -> N
     await client.aclose()
     assert len(values) == 101
     assert values[0].exchange_timestamp < values[-1].exchange_timestamp  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_bitget_live_trade_batch_is_normalized_to_exchange_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+    )
+    adapter = BitgetMarketDataAdapter(client)
+
+    async def messages(*args: object, **kwargs: object):
+        del args, kwargs
+        yield {
+            "data": [
+                {
+                    "ts": int(NOW.timestamp() * 1000),
+                    "tradeId": "2",
+                    "price": "100",
+                    "size": "1",
+                    "side": "buy",
+                },
+                {
+                    "ts": int((NOW - timedelta(seconds=1)).timestamp() * 1000),
+                    "tradeId": "1",
+                    "price": "99",
+                    "size": "1",
+                    "side": "sell",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(adapter, "_stream", messages)
+    trades = [item async for item in adapter.stream_trades("BTCUSDT")]
+    await client.aclose()
+    assert trades[0].exchange_timestamp < trades[1].exchange_timestamp  # type: ignore[operator]
 
 
 def test_funding_checkpoint_cannot_silently_filter_all_history() -> None:

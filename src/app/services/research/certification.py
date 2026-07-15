@@ -1110,6 +1110,11 @@ def live_trade_out_of_order_count(events: Sequence[RawMarketEvent]) -> int:
     for stream in streams.values():
         ordered = sorted(stream, key=lambda item: item.received_at)
         for previous, current in pairwise(ordered):
+            if (
+                previous.exchange_timestamp is not None
+                and current.exchange_timestamp == previous.exchange_timestamp
+            ):
+                continue
             if previous.sequence is not None and current.sequence is not None:
                 count += int(current.sequence < previous.sequence)
                 continue

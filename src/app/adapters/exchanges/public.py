@@ -849,7 +849,7 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
         async for message in self._stream({"type": "trades", "coin": symbol}):
-            for item in message["data"]:
+            for item in sorted(message["data"], key=lambda value: int(value["time"])):
                 yield Trade(
                     exchange=self.venue,
                     symbol=symbol,
@@ -1197,7 +1197,7 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
 
     async def stream_trades(self, symbol: str) -> AsyncIterator[Trade]:
         async for message in self._stream("trade", symbol):
-            for item in message["data"]:
+            for item in sorted(message["data"], key=lambda value: int(value["ts"])):
                 yield Trade(
                     exchange=self.venue,
                     symbol=symbol,
