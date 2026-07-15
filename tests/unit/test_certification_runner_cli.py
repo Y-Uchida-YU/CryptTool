@@ -101,6 +101,9 @@ def test_cli_json_and_timestamp_helpers(tmp_path: Path) -> None:
         cli._json_default(object())
     with pytest.raises(Exception, match="UTC offset"):
         cli._timestamp("2026-07-15")
+    event_id = cli._certified_market_event_id("certification-" + "x" * 200, "event-" + "y" * 200)
+    assert event_id.startswith("certified-")
+    assert len(event_id) == 74
 
 
 @pytest.mark.parametrize(

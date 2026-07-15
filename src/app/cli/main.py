@@ -1334,6 +1334,12 @@ def _certification_cross_source_pairs(
     return ((values[0], values[1]),)
 
 
+def _certified_market_event_id(certification_id: str, source_event_id: str) -> str:
+    return "certified-" + canonical_sha256(
+        {"certification_id": certification_id, "source_event_id": source_event_id}
+    )
+
+
 def _observed_funding_interval(
     events: tuple[RawMarketEvent, ...], *, venue: str, instrument: str
 ) -> int | None:
@@ -1574,7 +1580,9 @@ def run_market_data_certification(
                             )
                             production_event = replace(
                                 event,
-                                event_id=f"certified-{certification_id}-{event.event_id}",
+                                event_id=_certified_market_event_id(
+                                    certification_id, event.event_id
+                                ),
                                 capability_verification_run_id=certification_id,
                                 created_at=ended_at,
                             )

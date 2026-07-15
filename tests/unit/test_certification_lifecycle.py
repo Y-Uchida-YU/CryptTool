@@ -57,6 +57,15 @@ def test_startup_exception_creates_failed_record_and_crash_artifact(tmp_path: Pa
     assert "adapter startup failed" in payload["traceback"]
 
 
+def test_failure_reason_is_bounded_for_registry_storage(tmp_path: Path) -> None:
+    value, repository = lifecycle(tmp_path)
+    value.fail(RuntimeError("x" * 3000))
+    record = repository.get("certification-test")
+    assert record is not None
+    assert record.status is CertificationRunStatus.FAILED
+    assert record.failure_reason == "x" * 2000
+
+
 def test_normal_sigterm_marks_canceled(tmp_path: Path) -> None:
     value, repository = lifecycle(tmp_path)
     value.fail(

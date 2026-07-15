@@ -172,7 +172,8 @@ class CertificationLifecycle:
     ) -> Path:
         now = datetime.now(UTC)
         status = CertificationRunStatus.CANCELED if canceled else CertificationRunStatus.FAILED
-        message = str(exc) or type(exc).__name__
+        full_message = str(exc) or type(exc).__name__
+        message = full_message[:2000]
         self.record = replace(
             self.record,
             status=status,
