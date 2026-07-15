@@ -51,6 +51,8 @@ class ResearchRepository(Protocol):
 
     def experimental_event_count(self) -> int: ...
 
+    def list_experimental_events(self) -> tuple[RawMarketEvent, ...]: ...
+
     def save_raw_payload(
         self,
         *,
@@ -186,6 +188,9 @@ class InMemoryResearchRepository:
 
     def experimental_event_count(self) -> int:
         return len(self.experimental_events)
+
+    def list_experimental_events(self) -> tuple[RawMarketEvent, ...]:
+        return tuple(item[0] for item in self.experimental_events.values())
 
     def save_raw_payload(
         self,
@@ -437,7 +442,19 @@ class PostgreSQLResearchRepository:
                         capability_verification_run_id=(
                             event.capability_verification_run_id or None
                         ),
+                        exchange_timestamp=event.exchange_timestamp,
                         received_at=event.received_at,
+                        available_at=event.available_at,
+                        sequence=event.sequence,
+                        connection_id=(str(event.connection_id) if event.connection_id else None),
+                        reconciliation_state=(
+                            event.reconciliation_state.value
+                            if event.reconciliation_state is not None
+                            else None
+                        ),
+                        normalizer_version=event.normalizer_version,
+                        channel=event.channel,
+                        connection_epoch=event.connection_epoch,
                     )
                 )
                 session.commit()
@@ -450,6 +467,43 @@ class PostgreSQLResearchRepository:
         with Session(self.engine) as session:
             return int(
                 session.scalar(select(func.count()).select_from(ExperimentalMarketEventRow)) or 0
+            )
+
+    def list_experimental_events(self) -> tuple[RawMarketEvent, ...]:
+        with Session(self.engine) as session:
+            rows = session.scalars(select(ExperimentalMarketEventRow)).all()
+            return tuple(
+                RawMarketEvent(
+                    event_id=row.event_id,
+                    venue=row.venue,
+                    canonical_instrument_id=row.canonical_instrument_id,
+                    venue_symbol=row.venue_symbol,
+                    event_type=row.event_type,
+                    exchange_timestamp=(
+                        self._aware(row.exchange_timestamp)
+                        if row.exchange_timestamp is not None
+                        else None
+                    ),
+                    received_at=self._aware(row.received_at),
+                    available_at=self._aware(row.available_at),
+                    sequence=row.sequence,
+                    connection_id=UUID(row.connection_id) if row.connection_id else None,
+                    reconciliation_state=(
+                        ReconciliationState(row.reconciliation_state)
+                        if row.reconciliation_state
+                        else None
+                    ),
+                    payload_sha256=row.payload_sha256,
+                    raw_payload=row.raw_payload,
+                    normalizer_version=row.normalizer_version,
+                    capability_verification_run_id=(
+                        row.capability_verification_run_id or "unverified-experimental"
+                    ),
+                    created_at=self._aware(row.received_at),
+                    channel=row.channel,
+                    connection_epoch=row.connection_epoch,
+                )
+                for row in rows
             )
 
     def save_raw_payload(

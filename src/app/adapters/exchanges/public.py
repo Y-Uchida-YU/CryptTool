@@ -203,6 +203,12 @@ class PublicRestAdapter(MarketDataAdapter):
         del symbol, start, end
         raise CapabilityUnavailableError(f"{self.venue} funding history is unavailable")
 
+    async def fetch_current_funding_rate(self, symbol: str) -> FundingRate:
+        values = await self.fetch_funding_rates(symbol)
+        if not values:
+            raise CapabilityUnavailableError(f"{self.venue} current funding is unavailable")
+        return values[-1]
+
     async def fetch_open_interest(
         self, symbol: str, start: datetime | None = None, end: datetime | None = None
     ) -> Sequence[OpenInterest]:
@@ -671,8 +677,28 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
                 symbol=symbol,
                 timestamp=_ms(item["time"]),
                 rate=item["fundingRate"],
+                funding_interval_seconds=3600,
+                funding_schedule_source="hyperliquid_documented_hourly_schedule",
             )
             for item in data
+        )
+
+    async def fetch_current_funding_rate(self, symbol: str) -> FundingRate:
+        meta, contexts = await self._info({"type": "metaAndAssetCtxs"})
+        index = next(i for i, item in enumerate(meta["universe"]) if item["name"] == symbol)
+        item = contexts[index]
+        received_at = datetime.now(UTC)
+        next_hour = received_at.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return FundingRate(
+            exchange=self.venue,
+            symbol=symbol,
+            exchange_timestamp=None,
+            received_at=received_at,
+            available_at=received_at,
+            rate=item["funding"],
+            next_funding_at=next_hour,
+            funding_interval_seconds=3600,
+            funding_schedule_source="hyperliquid_documented_hourly_schedule",
         )
 
     async def fetch_open_interest(
@@ -982,6 +1008,29 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
                 rate=item["fundingRate"],
             )
             for item in response.json()["data"]
+        )
+
+    async def fetch_current_funding_rate(self, symbol: str) -> FundingRate:
+        response = await self.client.get(
+            "/api/v2/mix/market/current-fund-rate",
+            params={"symbol": symbol, "productType": "USDT-FUTURES"},
+        )
+        response.raise_for_status()
+        data = response.json()["data"]
+        if not data:
+            raise CapabilityUnavailableError(f"{self.venue} current funding is unavailable")
+        item = data[0]
+        received_at = datetime.now(UTC)
+        return FundingRate(
+            exchange=self.venue,
+            symbol=symbol,
+            exchange_timestamp=None,
+            received_at=received_at,
+            available_at=received_at,
+            rate=item["fundingRate"],
+            next_funding_at=_ms(item["nextUpdate"]),
+            funding_interval_seconds=int(item["fundingRateInterval"]) * 3600,
+            funding_schedule_source="exchange_payload",
         )
 
     async def fetch_open_interest(

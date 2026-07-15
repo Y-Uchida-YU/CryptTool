@@ -115,17 +115,34 @@ class CapabilityDecision:
 
 
 class ResearchCapabilityGate(Protocol):
-    def decide(self, *, venue: str, capability: str, now: datetime) -> CapabilityDecision: ...
+    def decide(
+        self,
+        *,
+        venue: str,
+        capability: str,
+        canonical_instrument_id: str,
+        now: datetime,
+    ) -> CapabilityDecision: ...
 
 
 class TrustedResearchCapabilityGate:
     def __init__(self, registry: TrustedCapabilityRegistry) -> None:
         self.registry = registry
 
-    def decide(self, *, venue: str, capability: str, now: datetime) -> CapabilityDecision:
+    def decide(
+        self,
+        *,
+        venue: str,
+        capability: str,
+        canonical_instrument_id: str,
+        now: datetime,
+    ) -> CapabilityDecision:
         try:
             record = self.registry.require_live_verified(
-                venue=venue, capability=capability, now=now
+                venue=venue,
+                capability=capability,
+                canonical_instrument_id=canonical_instrument_id,
+                now=now,
             )
         except ValueError:
             return CapabilityDecision(CapabilitySupport.IMPLEMENTED, "")
@@ -295,11 +312,19 @@ class PublicAdapterCollectorSource:
                 )
             elif identity.event_type in {"funding_current", "funding_history"}:
                 funding_start = checkpoint.last_funding_at if checkpoint else None
-                values = await self.adapter.fetch_funding_rates(
-                    identity.venue_symbol, start=funding_start
-                )
                 if identity.event_type == "funding_current":
-                    values = values[-1:]
+                    current_loader = getattr(self.adapter, "fetch_current_funding_rate", None)
+                    if current_loader is None:
+                        values = await self.adapter.fetch_funding_rates(
+                            identity.venue_symbol, start=funding_start
+                        )
+                        values = values[-1:]
+                    else:
+                        values = (await current_loader(identity.venue_symbol),)
+                else:
+                    values = await self.adapter.fetch_funding_rates(
+                        identity.venue_symbol, start=funding_start
+                    )
             elif identity.event_type == "open_interest":
                 values = await self.adapter.fetch_open_interest(identity.venue_symbol, start=start)
             else:
@@ -872,6 +897,7 @@ class RawPersistenceConsumer:
             self.capability_gate.decide(
                 venue=envelope.venue,
                 capability=capability,
+                canonical_instrument_id=envelope.canonical_instrument_id,
                 now=envelope.received_at,
             )
             if capability
@@ -1589,6 +1615,8 @@ class SnapshotEligibilityPolicy:
     maximum_gap_ratio: Decimal = Decimal("0.01")
     maximum_stale_ratio: Decimal = Decimal("0.05")
     require_complete_instrument_rules: bool = False
+    minimum_venue_event_coverage_ratio: Decimal = Decimal("0")
+    minimum_history_windows_per_venue_event: int = 0
 
 
 class DataSnapshotService:
@@ -1602,6 +1630,8 @@ class DataSnapshotService:
         snapshot_id: str | None = None,
         finalized_at: datetime | None = None,
         eligibility_policy: SnapshotEligibilityPolicy | None = None,
+        included_event_types: tuple[str, ...] | None = None,
+        included_venues: tuple[str, ...] | None = None,
     ) -> DataSnapshotManifest:
         cutoff = utc(cutoff_at, "cutoff_at")
         finalized = utc(finalized_at or datetime.now(UTC), "finalized_at")
@@ -1614,6 +1644,8 @@ class DataSnapshotService:
                 self.repository.raw_events(), key=lambda item: (item.available_at, item.event_id)
             )
             if event.available_at <= cutoff
+            and (included_event_types is None or event.event_type in included_event_types)
+            and (included_venues is None or event.venue in included_venues)
         )
         unsynchronized_books = {
             event.event_id
@@ -1692,6 +1724,27 @@ class DataSnapshotService:
         missing_venues = set(policy.required_venues) - present_venues
         if missing_venues:
             reasons.append(f"missing required venues: {','.join(sorted(missing_venues))}")
+        required_pairs = tuple(
+            (venue, event_type)
+            for venue in policy.required_venues
+            for event_type in policy.required_event_types
+        )
+        if required_pairs:
+            counts = Counter((item.venue, item.event_type) for item in market)
+            covered = sum(
+                counts[pair] >= policy.minimum_history_windows_per_venue_event
+                for pair in required_pairs
+            )
+            coverage = Decimal(covered) / Decimal(len(required_pairs))
+            if coverage < policy.minimum_venue_event_coverage_ratio:
+                reasons.append("venue/event capability coverage ratio below threshold")
+            incomplete = tuple(
+                f"{venue}:{event_type}"
+                for venue, event_type in required_pairs
+                if counts[(venue, event_type)] < policy.minimum_history_windows_per_venue_event
+            )
+            if incomplete:
+                reasons.append(f"insufficient history windows: {','.join(incomplete)}")
         if unsynchronized_books:
             reasons.append("unsynchronized order-book events present")
         gaps = sum(item.event_type == "sequence_gap" for item in source)

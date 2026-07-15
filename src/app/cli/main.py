@@ -8,6 +8,7 @@ import secrets
 import signal
 import socket
 import subprocess  # nosec B404
+import sys
 import tempfile
 import time
 from dataclasses import asdict, replace
@@ -24,6 +25,7 @@ import yaml  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from app.adapters.exchanges.dex import (
     DydxMarketDataAdapter,
@@ -78,6 +80,13 @@ from app.services.research.accelerated_validation import (
     HistoricalPublicDatasetLoader,
     run_start_stop_resource_test,
 )
+from app.services.research.certification import (
+    TIER_ONE_CAPABILITIES,
+    ContractValidationSpec,
+    MarketDataCertificationService,
+    SQLCertificationRepository,
+    write_certification_artifacts,
+)
 from app.services.research.collector_runs import (
     CollectorLeaseConflict,
     CollectorRunRecord,
@@ -94,7 +103,7 @@ from app.services.research.data_operations import (
     write_collector_health_report,
     write_snapshot_manifest,
 )
-from app.services.research.models import ResearchRunResult, canonical_sha256
+from app.services.research.models import RawMarketEvent, ResearchRunResult, canonical_sha256
 from app.services.research.pipeline import ResearchPipeline
 from app.services.research.report import ResearchArtifactWriter
 from app.services.research.repository import (
@@ -107,6 +116,11 @@ from app.services.validation.splits import anchored_walk_forward, rolling_walk_f
 from app.services.venue_eligibility import eligibility_from_settings
 
 app = typer.Typer(help="CryptBot research and market-regime CLI", no_args_is_help=True)
+
+
+def _redact_database_url(value: str) -> str:
+    url = make_url(value)
+    return url.render_as_string(hide_password=True)
 
 
 def _timestamp(value: Any) -> datetime:
@@ -943,6 +957,370 @@ def collect_research_data(
         if release_failures:
             typer.echo(f"collector lease release failures={release_failures}", err=True)
         token_path.unlink(missing_ok=True)
+        engine.dispose()
+
+
+async def _run_certification_collection(
+    collector: ResearchMarketDataCollector, *, duration_seconds: float
+) -> None:
+    collector_task = asyncio.create_task(collector.run(), name="r4-certification-collector")
+    timer_task = asyncio.create_task(asyncio.sleep(duration_seconds), name="r4-certification-timer")
+    done, _ = await asyncio.wait({collector_task, timer_task}, return_when=asyncio.FIRST_COMPLETED)
+    if timer_task in done:
+        collector.shutdown()
+        await collector_task
+        return
+    timer_task.cancel()
+    await asyncio.gather(timer_task, return_exceptions=True)
+    await collector_task
+    raise RuntimeError("certification collector stopped before the configured duration")
+
+
+def _certification_contract_spec(
+    *,
+    venue: str,
+    capability: str,
+    instrument: str,
+    root: Path,
+    normalization_test_passed: bool = True,
+) -> ContractValidationSpec:
+    fixture = root / f"tests/contracts/{venue}/public.json"
+    endpoints = {
+        "hyperliquid": {
+            "funding_current": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "funding_history": "POST https://api.hyperliquid.xyz/info type=fundingHistory",
+            "mark_price": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "index_price": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "open_interest": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "trade": "WebSocket wss://api.hyperliquid.xyz/ws channel=trades",
+            "ohlcv": "POST https://api.hyperliquid.xyz/info type=candleSnapshot",
+        },
+        "bitget": {
+            "funding_current": "GET https://api.bitget.com/api/v2/mix/market/current-fund-rate",
+            "funding_history": "GET https://api.bitget.com/api/v2/mix/market/history-fund-rate",
+            "mark_price": "GET https://api.bitget.com/api/v2/mix/market/symbol-price",
+            "index_price": "GET https://api.bitget.com/api/v2/mix/market/symbol-price",
+            "open_interest": "GET https://api.bitget.com/api/v2/mix/market/open-interest",
+            "trade": "WebSocket wss://ws.bitget.com/v2/ws/public channel=trade",
+            "ohlcv": "GET https://api.bitget.com/api/v2/mix/market/candles",
+        },
+    }
+    response_fields = {
+        "funding_current": ("exchange", "symbol", "rate", "received_at", "available_at"),
+        "funding_history": ("exchange", "symbol", "rate", "received_at", "available_at"),
+        "mark_price": ("symbol",),
+        "index_price": ("symbol",),
+        "open_interest": ("exchange", "symbol", "value", "unit"),
+        "trade": ("exchange", "symbol", "trade_id", "price", "quantity", "side"),
+        "ohlcv": ("exchange", "symbol", "open", "high", "low", "close", "volume"),
+    }[capability]
+    symbol = instrument if venue == "hyperliquid" else f"{instrument}USDT"
+    return ContractValidationSpec(
+        venue=venue,
+        capability=capability,
+        canonical_instrument_id=instrument,
+        source_endpoint=endpoints[venue][capability],
+        request_parameters=("symbol",),
+        response_fields=response_fields,
+        symbol=symbol,
+        price_unit="USDT or USD quote units",
+        quantity_unit="base asset units",
+        funding_unit="decimal" if capability.startswith("funding") else None,
+        funding_interval_seconds=(
+            (3600 if venue == "hyperliquid" else 28800)
+            if capability.startswith("funding")
+            else None
+        ),
+        timestamp_unit="normalized UTC datetime from documented seconds/milliseconds",
+        timestamp_timezone="UTC",
+        sequence_semantics=("venue sequence when supplied; None is explicit otherwise"),
+        snapshot_delta_semantics=(
+            "hyperliquid snapshot_only; bitget snapshot_and_delta"
+            if capability.startswith("orderbook")
+            else "not_applicable"
+        ),
+        null_behavior="missing exchange timestamps remain None; required values reject",
+        rate_limit_behavior="HTTP 429 is recorded as a collection failure and retried",
+        error_behavior="venue errors are persisted without promoting evidence",
+        fixture_path=str(fixture.relative_to(root)),
+        fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
+        normalization_test_node_id=(
+            "tests/unit/test_market_data_certification.py::"
+            "test_contract_fixture_is_bound_to_normalization"
+        ),
+        normalization_test_passed=normalization_test_passed,
+        minimum_event_count=1,
+        minimum_coverage_ratio=Decimal("0.80"),
+        maximum_stale_ratio=Decimal("0.05"),
+        maximum_absolute_error=(Decimal("0.001") if capability == "funding_current" else None),
+    )
+
+
+def _certification_cross_source_pairs(
+    events: tuple[RawMarketEvent, ...],
+    *,
+    venue: str,
+    instrument: str,
+    capability: str,
+) -> tuple[tuple[Decimal, Decimal], ...]:
+    relevant = tuple(
+        item
+        for item in events
+        if item.venue == venue and item.canonical_instrument_id == instrument
+    )
+
+    def latest(event_type: str, keys: tuple[str, ...]) -> Decimal | None:
+        matching = sorted(
+            (item for item in relevant if item.event_type == event_type),
+            key=lambda item: item.available_at,
+        )
+        if not matching:
+            return None
+        payload = matching[-1].payload()
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                return Decimal(str(payload[key]))
+        return None
+
+    values: tuple[Decimal | None, Decimal | None] | None = None
+    if capability == "funding_current":
+        values = (
+            latest("funding_current", ("rate", "funding_rate")),
+            latest("funding_history", ("rate", "funding_rate")),
+        )
+    elif capability == "mark_price":
+        values = (
+            latest("mark_price", ("mark_price", "markPrice", "mid", "price")),
+            latest("index_price", ("index_price", "indexPrice", "mid", "price")),
+        )
+    elif capability == "ohlcv":
+        values = (
+            latest("ohlcv", ("close",)),
+            latest("trade", ("price",)),
+        )
+    if values is None or values[0] is None or values[1] is None:
+        return ()
+    return ((values[0], values[1]),)
+
+
+def _observed_funding_interval(
+    events: tuple[RawMarketEvent, ...], *, venue: str, instrument: str
+) -> int | None:
+    current = sorted(
+        (
+            item
+            for item in events
+            if item.venue == venue
+            and item.canonical_instrument_id == instrument
+            and item.event_type == "funding_current"
+        ),
+        key=lambda item: item.available_at,
+    )
+    if not current:
+        return None
+    value = current[-1].payload().get("funding_interval_seconds")
+    return int(value) if value is not None else None
+
+
+def _certification_normalization_test_passed(root: Path) -> bool:
+    node_id = (
+        "tests/unit/test_market_data_certification.py::"
+        "test_contract_fixture_is_bound_to_normalization"
+    )
+    collected = subprocess.run(  # nosec B603
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", node_id],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if collected.returncode != 0:
+        return False
+    executed = subprocess.run(  # nosec B603
+        [sys.executable, "-m", "pytest", "-q", node_id],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return executed.returncode == 0
+
+
+@app.command("run-market-data-certification")
+def run_market_data_certification(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    duration_minutes: Annotated[float | None, typer.Option("--duration-minutes", min=0.01)] = None,
+) -> None:
+    """Collect isolated public evidence and issue no certificate without measured PASS evidence."""
+    settings = _settings_from_yaml(config)
+    certification_settings = settings.market_data_certification
+    if not certification_settings.enabled:
+        raise typer.BadParameter("market_data_certification.enabled=true is required")
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("market-data certification requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("market-data certification refuses execution credentials")
+    if tuple(certification_settings.venues) != ("hyperliquid", "bitget"):
+        raise typer.BadParameter("R4 certification supports only Hyperliquid and Bitget")
+    if not set(certification_settings.capabilities) <= set(TIER_ONE_CAPABILITIES):
+        raise typer.BadParameter("Tier 1 run cannot promote non-Tier-1 capabilities")
+    _require_nonproduction_database_isolation(settings, run_mode="certification")
+    resolved_run_id = run_id or f"certification-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    started_at = datetime.now(UTC)
+    duration = duration_minutes or float(certification_settings.duration_minutes)
+    artifact_root = Path(certification_settings.artifact_root)
+    typer.echo(
+        f"run_id={resolved_run_id} pid={os.getpid()} started_at={started_at.isoformat()} "
+        f"expected_end={(started_at + timedelta(minutes=duration)).isoformat()} "
+        f"database={_redact_database_url(settings.database_url)} "
+        f"artifact={artifact_root / resolved_run_id} live_execution=OFF"
+    )
+    engine = build_engine(settings.database_url)
+    try:
+        repository = PostgreSQLResearchRepository(engine)
+        namespaced = NamespacedResearchRepository(
+            repository, checkpoint_namespace=f"certification:{resolved_run_id}"
+        )
+        adapters = tuple(_research_data_adapter(name) for name in certification_settings.venues)
+        collector = ResearchMarketDataCollector(
+            repository=namespaced,
+            sources=tuple(
+                PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
+            ),
+            capability_gate=TrustedResearchCapabilityGate(TrustedCapabilityRegistry(())),
+            instruments=certification_settings.instruments,
+            event_types=certification_settings.capabilities,
+            collection_enabled=True,
+            poll_interval_seconds=settings.research_collection.poll_interval_seconds,
+            stale_after_seconds=settings.research_collection.stale_after_seconds,
+        )
+        asyncio.run(_run_certification_collection(collector, duration_seconds=duration * 60))
+        ended_at = datetime.now(UTC)
+        certification_repository = SQLCertificationRepository(engine)
+        service = MarketDataCertificationService(
+            certification_repository,
+            root=Path.cwd(),
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+            source_version=certification_settings.source_version,
+            certification_ttl=timedelta(hours=certification_settings.certification_ttl_hours),
+        )
+        normalization_test_passed = _certification_normalization_test_passed(Path.cwd())
+        events = repository.list_experimental_events()
+        certifications = []
+        for venue in certification_settings.venues:
+            for instrument in certification_settings.instruments:
+                for capability in certification_settings.capabilities:
+                    certification_id = f"{resolved_run_id}-{venue}-{instrument}-{capability}"
+                    spec = _certification_contract_spec(
+                        venue=venue,
+                        capability=capability,
+                        instrument=instrument,
+                        root=Path.cwd(),
+                        normalization_test_passed=normalization_test_passed,
+                    )
+                    if capability.startswith("funding"):
+                        observed_interval = _observed_funding_interval(
+                            events, venue=venue, instrument=instrument
+                        )
+                        if observed_interval is not None:
+                            spec = replace(spec, funding_interval_seconds=observed_interval)
+                    certification = service.certify(
+                        certification_id=certification_id,
+                        spec=spec,
+                        events=events,
+                        sample_start=started_at,
+                        sample_end=ended_at,
+                        cross_source_pairs=_certification_cross_source_pairs(
+                            events,
+                            venue=venue,
+                            instrument=instrument,
+                            capability=capability,
+                        ),
+                        audit_passed=False,
+                        audit_run_id="",
+                        ci_run_id="",
+                    )
+                    stored = certification_repository.get(certification_id)
+                    if stored is None:
+                        raise RuntimeError("certification repository lost a committed record")
+                    write_certification_artifacts(
+                        root=artifact_root,
+                        certification=certification,
+                        evidence=stored[1],
+                        contract=spec,
+                        events=events,
+                    )
+                    certifications.append(certification)
+        run_directory = artifact_root / resolved_run_id
+        run_directory.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "run_id": resolved_run_id,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "certifications": [asdict(item) for item in certifications],
+            "promoted_capability_count": 0,
+            "live_execution": "OFF",
+        }
+        (run_directory / "manifest.json").write_text(
+            json.dumps(summary, default=_json_default, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        typer.echo(
+            f"run_id={resolved_run_id} certifications={len(certifications)} "
+            "promoted=0 live_execution=OFF"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("verify-market-data-certification")
+def verify_market_data_certification(
+    certification_id: Annotated[str, typer.Option("--certification-id", min=1)],
+) -> None:
+    """Verify immutable database evidence and every certification artifact hash."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        stored = SQLCertificationRepository(engine).get(certification_id)
+        if stored is None:
+            raise typer.BadParameter("certification does not exist")
+        certification, evidence = stored
+        if evidence.manifest_sha256 != certification.evidence_manifest_sha256:
+            raise typer.BadParameter("certification evidence manifest mismatch")
+        directory = Path(settings.market_data_certification.artifact_root) / certification_id
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for relative, expected in manifest["files"].items():
+            actual = hashlib.sha256((directory / relative).read_bytes()).hexdigest()
+            if actual != expected:
+                raise typer.BadParameter(f"artifact hash mismatch: {relative}")
+        typer.echo(
+            f"certification_id={certification_id} verdict={certification.verdict.value} "
+            "verified=true live_execution=OFF"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("capability-certification-status")
+def capability_certification_status() -> None:
+    """List instrument-scoped certification verdicts without changing capability support."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        records = SQLCertificationRepository(engine).list()
+        typer.echo(
+            json.dumps(
+                [asdict(item) for item in records],
+                default=_json_default,
+                sort_keys=True,
+            )
+        )
+    finally:
         engine.dispose()
 
 

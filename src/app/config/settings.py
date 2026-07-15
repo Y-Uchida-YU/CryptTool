@@ -179,6 +179,26 @@ class ContinuousPaperSettings(BaseModel):
     discord_webhook_url: SecretStr | None = None
 
 
+class MarketDataCertificationSettings(BaseModel):
+    enabled: bool = False
+    venues: tuple[str, ...] = ("hyperliquid", "bitget")
+    instruments: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE")
+    capabilities: tuple[str, ...] = (
+        "funding_current",
+        "funding_history",
+        "mark_price",
+        "index_price",
+        "open_interest",
+        "trade",
+        "ohlcv",
+    )
+    duration_minutes: int = Field(30, ge=15, le=60)
+    adapter_version: str = "public-adapters-r4"
+    source_version: str = "r4-contract-v1"
+    certification_ttl_hours: int = Field(24, ge=1, le=168)
+    artifact_root: str = "artifacts/certification"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="APP_",
@@ -211,6 +231,9 @@ class Settings(BaseSettings):
     )
     continuous_paper: ContinuousPaperSettings = Field(
         default_factory=ContinuousPaperSettings  # type: ignore[arg-type]
+    )
+    market_data_certification: MarketDataCertificationSettings = Field(
+        default_factory=MarketDataCertificationSettings  # type: ignore[arg-type]
     )
     exchanges: tuple[ExchangeSettings, ...] = (
         ExchangeSettings(name="bybit_public", data_enabled=False),

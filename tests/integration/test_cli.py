@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -407,3 +408,153 @@ def test_yaml_settings_honor_runtime_database_and_live_safety_overrides(
 
     with pytest.raises(ValidationError, match="live mode requires"):
         cli._settings_from_yaml(config)
+
+
+def test_market_data_certification_cli_runs_isolated_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'certification.db'}")
+    Base.metadata.create_all(engine)
+    artifact_root = tmp_path / "certification"
+    config = tmp_path / "certification.yaml"
+    config.write_text("market_data_certification: {enabled: true}\n", encoding="utf-8")
+    configured = Settings(
+        database_url="postgresql+psycopg://localhost/certification",
+        production_database_url="postgresql+psycopg://localhost/production",
+        symbols=("BTC", "ETH", "SOL", "HYPE"),
+        paper_trading=True,
+        live_trading=False,
+        paper={"enabled": True},
+        live={"enabled": False, "allowed_symbols": ("BTC", "ETH", "SOL", "HYPE")},
+        research_collection={
+            "collection_enabled": True,
+            "venues": ("hyperliquid", "bitget"),
+            "instruments": ("BTC", "ETH", "SOL", "HYPE"),
+        },
+        market_data_certification={
+            "enabled": True,
+            "artifact_root": str(artifact_root),
+        },
+    )
+
+    class Adapter:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+    def certification_event(event_type: str, payload: dict[str, object]) -> RawMarketEvent:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        now = datetime.now(UTC)
+        return RawMarketEvent(
+            event_id=f"hyperliquid-BTC-{event_type}",
+            venue="hyperliquid",
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type=event_type,
+            exchange_timestamp=now,
+            received_at=now,
+            available_at=now,
+            sequence=None,
+            connection_id=None,
+            reconciliation_state=None,
+            payload_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+            raw_payload=raw,
+            normalizer_version="r4-test",
+            capability_verification_run_id="unverified-experimental",
+            created_at=now,
+        )
+
+    common = {
+        "exchange": "hyperliquid",
+        "symbol": "BTC",
+        "received_at": datetime.now(UTC).isoformat(),
+        "available_at": datetime.now(UTC).isoformat(),
+    }
+    events = (
+        certification_event(
+            "funding_current",
+            {
+                **common,
+                "rate": "0.0001",
+                "next_funding_at": datetime.now(UTC).isoformat(),
+                "funding_interval_seconds": 3600,
+                "funding_schedule_source": "test_contract",
+            },
+        ),
+        certification_event(
+            "funding_history",
+            {
+                **common,
+                "rate": "0.0001",
+                "next_funding_at": datetime.now(UTC).isoformat(),
+                "funding_interval_seconds": 3600,
+                "funding_schedule_source": "test_contract",
+            },
+        ),
+        certification_event("mark_price", {**common, "mid": "100"}),
+        certification_event("index_price", {**common, "mid": "100"}),
+        certification_event("open_interest", {**common, "value": "1000", "unit": "base"}),
+        certification_event(
+            "trade",
+            {**common, "trade_id": "t-1", "price": "100", "quantity": "1", "side": "buy"},
+        ),
+        certification_event(
+            "ohlcv",
+            {
+                **common,
+                "open": "99",
+                "high": "101",
+                "low": "98",
+                "close": "100",
+                "volume": "10",
+            },
+        ),
+    )
+
+    async def collect(collector: object, *, duration_seconds: float) -> None:
+        assert duration_seconds == pytest.approx(0.6)
+        for item in events:
+            collected_at = datetime.now(UTC)
+            collector.repository.add_experimental_event(
+                replace(
+                    item,
+                    exchange_timestamp=collected_at,
+                    received_at=collected_at,
+                    available_at=collected_at,
+                    created_at=collected_at,
+                ),
+                "implemented",
+            )
+
+    monkeypatch.setattr(cli, "_settings_from_yaml", lambda _: configured)
+    monkeypatch.setattr(cli, "Settings", lambda: configured)
+    monkeypatch.setattr(cli, "build_engine", lambda _: engine)
+    monkeypatch.setattr(
+        cli, "_require_nonproduction_database_isolation", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli, "_research_data_adapter", lambda venue: Adapter(venue))
+    monkeypatch.setattr(cli, "_run_certification_collection", collect)
+    monkeypatch.setattr(cli, "_certification_normalization_test_passed", lambda _: True)
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "a" * 40)
+
+    result = runner.invoke(
+        app,
+        [
+            "run-market-data-certification",
+            "--config",
+            str(config),
+            "--run-id",
+            "certification-cli",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "certifications=56" in result.output and "promoted=0" in result.output
+    identifier = "certification-cli-hyperliquid-BTC-funding_current"
+    verified = runner.invoke(
+        app,
+        ["verify-market-data-certification", "--certification-id", identifier],
+    )
+    assert verified.exit_code == 0, verified.output
+    status = runner.invoke(app, ["capability-certification-status"])
+    assert status.exit_code == 0 and identifier in status.output
