@@ -1559,7 +1559,11 @@ def run_market_data_certification(
                     if stored is None:
                         raise RuntimeError("certification repository lost a committed record")
                     promotion = None
-                    if certification.verdict.value == "pass" and audit is not None:
+                    if (
+                        certification.verdict.value == "pass"
+                        and audit is not None
+                        and stored[1].live_smoke_passed
+                    ):
                         promotion = promotion_service.promote(certification)
                         promoted += 1
                         gate = ProductionEventCertificationGate()

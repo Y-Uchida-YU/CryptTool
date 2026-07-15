@@ -419,6 +419,7 @@ def test_historical_ohlcv_can_pass_contract_while_research_is_insufficient() -> 
     assert certification.verdict is CertificationVerdict.PASS
     assert evidence.capability_contract is not None
     assert all(vars(evidence.capability_contract).values())
+    assert evidence.live_smoke_passed is False
     assert evidence.historical_research_usability is not None
     assert (
         evidence.historical_research_usability.verdict is CertificationVerdict.INSUFFICIENT_EVIDENCE

@@ -607,7 +607,11 @@ class MarketDataCertificationService:
         reconciliation_passed = not reconciliation_missing and not any(
             "cross-source" in item for item in failures
         )
-        live_passed = bool(normalized) and not event_failures
+        live_passed = (
+            bool(normalized)
+            and not event_failures
+            and spec.timestamp_semantic not in HISTORICAL_TIMESTAMP_SEMANTICS
+        )
         if failures:
             verdict = CertificationVerdict.FAIL
         elif not normalized or insufficiencies:
