@@ -25,6 +25,13 @@ class Example(Enum):
     VALUE = "value"
 
 
+@pytest.fixture(autouse=True)
+def clear_application_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CI runtime settings from replacing each test's isolated database."""
+    for key in ("APP_DATABASE_URL", "APP_LIVE_TRADING", "APP_LIVE__ENABLED"):
+        monkeypatch.delenv(key, raising=False)
+
+
 def config(tmp_path: Path, **overrides: object) -> Path:
     database = tmp_path / "certification.sqlite"
     engine = create_engine(f"sqlite+pysqlite:///{database}")
