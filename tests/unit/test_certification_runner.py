@@ -6,13 +6,15 @@ import plistlib
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from app.infrastructure.database.models import Base
 from app.services.research import certification_runner as runner
+from app.services.research.certification_lifecycle import CertificationLifecycle
 
 
 def spec(tmp_path: Path, *, executable: str = "python") -> runner.LaunchAgentSpec:
@@ -135,3 +137,222 @@ def test_normal_launch_completes_and_unloads_service(
     assert runner.unload(value, grace_seconds=0) == "SIGTERM"
     assert ("kill", "SIGTERM", value.service) in calls
     assert ("bootout", f"gui/{value.uid}", str(value.plist_path)) in calls
+
+
+def test_run_preflight_uses_direct_python_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    captured: dict[str, object] = {}
+
+    def completed(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(arguments=arguments, **kwargs)
+        return subprocess.CompletedProcess(arguments, 0, '{"status":"PASS"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", completed)
+    result = runner.run_preflight(value)
+    assert result.returncode == 0
+    assert captured["arguments"] == [
+        str(value.python_executable),
+        "-m",
+        "app",
+        "certification-preflight",
+        "--config",
+        str(value.config_path),
+    ]
+    assert captured["cwd"] == value.repository_root
+    assert captured["env"] == value.environment
+    assert captured["stdin"] is subprocess.DEVNULL
+
+
+def test_bootstrap_writes_plist_after_successful_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    preflight = subprocess.CompletedProcess([], 0, "PASS", "")
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "run_preflight", lambda _: preflight)
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *arguments, **_kwargs: (
+            calls.append(arguments) or subprocess.CompletedProcess(arguments, 0, "", "")
+        ),
+    )
+    assert runner.preflight_and_bootstrap(value) is preflight
+    assert value.plist_path.is_file()
+    assert calls == [("bootstrap", f"gui/{value.uid}", str(value.plist_path))]
+
+
+def test_service_pid_and_application_command_detection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "state = running\n\tpid = 42\n", ""
+        ),
+    )
+    assert runner.service_pid(value) == 42
+    monkeypatch.setattr(
+        runner,
+        "process_command",
+        lambda _: f"{value.python_executable} -m app run-market-data-certification",
+    )
+    assert runner.application_process_exists(value, 42)
+    assert not runner.application_process_exists(value, None)
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 113, "", "missing"),
+    )
+    assert runner.service_pid(value) is None
+
+
+def test_application_started_from_structured_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    value.stdout_path.parent.mkdir(parents=True)
+    value.stdout_path.write_text('{"stage":"PROCESS_STARTED"}\n')
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(runner, "application_process_exists", lambda *_args, **_kwargs: True)
+    assert runner.application_started(value, engine, pid=9)
+    monkeypatch.setattr(runner, "application_process_exists", lambda *_args, **_kwargs: False)
+    assert not runner.application_started(value, engine, pid=9)
+
+
+def test_process_tree_selects_descendants(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = (
+        "10 1 S 00:01 python -m app run-market-data-certification\n"
+        "11 10 S 00:01 child worker\n"
+        "12 11 S 00:01 grandchild worker\n"
+        "99 1 S 00:01 unrelated\n"
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, output, ""),
+    )
+    assert [row["pid"] for row in runner.process_tree(10)] == [10, 11, 12]
+    assert runner.process_tree(None) == []
+
+
+def test_unload_escalates_only_after_sigterm_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "service_pid", lambda _: 88)
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *arguments, **_kwargs: (
+            calls.append(arguments) or subprocess.CompletedProcess(arguments, 0, "", "")
+        ),
+    )
+    assert runner.unload(value, grace_seconds=0) == "SIGKILL_AFTER_TIMEOUT"
+    assert ("kill", "SIGTERM", value.service) in calls
+    assert ("kill", "SIGKILL", value.service) in calls
+
+
+def test_migration_and_environment_helpers(tmp_path: Path) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("create table alembic_version (version_num varchar(64))"))
+        connection.execute(
+            text("insert into alembic_version(version_num) values (:version)"),
+            {"version": runner.CURRENT_MIGRATION},
+        )
+    assert runner.migration_is_current(engine)
+    with engine.begin() as connection:
+        connection.execute(text("update alembic_version set version_num='old'"))
+    assert not runner.migration_is_current(engine)
+    assert runner.sanitized_environment({"HOME": "/tmp", "SECRET": "hidden"}) == {"HOME": "/tmp"}
+    value = spec(tmp_path)
+    assert runner.direct_python_command(value) == value.arguments
+
+
+def test_spec_rejects_relative_and_missing_paths(tmp_path: Path) -> None:
+    value = spec(tmp_path)
+    with pytest.raises(runner.LaunchAgentError, match="paths must be absolute"):
+        replace(value, repository_root=Path("relative")).validate()
+    with pytest.raises(runner.LaunchAgentError, match="does not exist"):
+        replace(value, python_executable=(tmp_path / "missing-python").resolve()).validate()
+
+
+def test_run_preflight_reports_subprocess_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 2, "", "bad config"),
+    )
+    with pytest.raises(runner.LaunchAgentError, match="bad config"):
+        runner.run_preflight(value)
+
+
+def test_process_command_and_malformed_service_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "python -m app\n", ""),
+    )
+    assert runner.process_command(10) == "python -m app"
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "pid = unknown\n", ""),
+    )
+    assert runner.service_pid(value) is None
+
+
+def test_application_started_from_registry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    value = spec(tmp_path)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    CertificationLifecycle(
+        run_id=value.run_id,
+        commit_sha="a" * 40,
+        config_path=value.config_path,
+        database_identity="sqlite:test",
+        artifact_directory=tmp_path / "lifecycle",
+        repository=runner.CertificationRunRepository(engine),
+    )
+    monkeypatch.setattr(runner, "application_process_exists", lambda *_args, **_kwargs: True)
+    assert runner.application_started(value, engine, pid=9)
+
+
+def test_watchdog_returns_real_application_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    monkeypatch.setattr(runner, "service_pid", lambda _: 909)
+    monkeypatch.setattr(runner, "application_started", lambda *_args, **_kwargs: True)
+    assert runner.watchdog(value, engine, timeout=1) == 909
+
+
+def test_unload_when_service_already_exited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    value = spec(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(runner, "service_pid", lambda _: None)
+    monkeypatch.setattr(
+        runner,
+        "_launchctl",
+        lambda *arguments, **_kwargs: (
+            calls.append(arguments) or subprocess.CompletedProcess(arguments, 0, "", "")
+        ),
+    )
+    assert runner.unload(value) == "ALREADY_EXITED"
+    assert calls == [("bootout", f"gui/{value.uid}", str(value.plist_path))]
