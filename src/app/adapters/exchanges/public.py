@@ -699,6 +699,7 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
             next_funding_at=next_hour,
             funding_interval_seconds=3600,
             funding_schedule_source="hyperliquid_documented_hourly_schedule",
+            is_finalized=False,
         )
 
     async def fetch_open_interest(
@@ -1031,6 +1032,7 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
             next_funding_at=_ms(item["nextUpdate"]),
             funding_interval_seconds=int(item["fundingRateInterval"]) * 3600,
             funding_schedule_source="exchange_payload",
+            is_finalized=False,
         )
 
     async def fetch_open_interest(

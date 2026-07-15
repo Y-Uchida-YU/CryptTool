@@ -28,6 +28,7 @@ from app.adapters.exchanges.websocket import (
 from app.domain.venues.models import CapabilitySupport
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.services.research.models import (
+    AvailabilityProvenance,
     CollectionCheckpoint,
     CollectionFailureEvent,
     DataSnapshotManifest,
@@ -35,6 +36,7 @@ from app.services.research.models import (
     InstrumentRuleSnapshot,
     RawMarketEvent,
     RuleVerificationStatus,
+    TimestampSemantic,
     canonical_sha256,
     utc,
 )
@@ -79,8 +81,8 @@ VENUE_SYMBOLS: dict[str, dict[str, str]] = {
 }
 
 EVENT_CAPABILITIES = {
-    "ohlcv": "trades",
-    "trade": "trades",
+    "ohlcv": "ohlcv",
+    "trade": "trade",
     "orderbook_snapshot": "orderbook_snapshot",
     "orderbook_delta": "orderbook_delta",
     "funding_current": "funding_current",
@@ -89,6 +91,104 @@ EVENT_CAPABILITIES = {
     "mark_price": "mark_price",
     "index_price": "index_price",
 }
+
+
+def _timing_semantics(
+    event_type: str, channel: str
+) -> tuple[TimestampSemantic, AvailabilityProvenance]:
+    if event_type == "funding_history":
+        return (
+            TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+            AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        )
+    if event_type == "ohlcv":
+        return (
+            TimestampSemantic.CANDLE_OPEN_TIME,
+            AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        )
+    if event_type == "trade" and channel not in {"trades", "websocket"}:
+        return (
+            TimestampSemantic.HISTORICAL_EFFECTIVE_TIME,
+            AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        )
+    if event_type in {
+        "trade",
+        "mark_price",
+        "index_price",
+        "orderbook_snapshot",
+        "orderbook_delta",
+    }:
+        return (
+            TimestampSemantic.REALTIME_EVENT,
+            AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        )
+    if event_type == "funding_current":
+        return (
+            TimestampSemantic.RECEIPT_ONLY,
+            AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        )
+    return TimestampSemantic.RECEIPT_ONLY, AvailabilityProvenance.UNKNOWN
+
+
+def canonical_market_event_identity(envelope: CollectedEnvelope, payload: dict[str, Any]) -> str:
+    if envelope.stable_event_key:
+        return canonical_sha256(
+            (envelope.venue, envelope.canonical_instrument_id, envelope.stable_event_key)
+        )
+    common = (envelope.venue, envelope.canonical_instrument_id, envelope.event_type)
+    if envelope.event_type == "funding_history":
+        if envelope.exchange_timestamp is None:
+            raise ValueError("funding history requires funding effective time")
+        identity: object = (*common, envelope.exchange_timestamp)
+    elif envelope.event_type == "ohlcv":
+        if envelope.exchange_timestamp is None or not envelope.timeframe:
+            raise ValueError("OHLCV requires candle open time and timeframe")
+        identity = (*common, envelope.timeframe, envelope.exchange_timestamp)
+    elif envelope.event_type == "trade":
+        if envelope.trade_id:
+            identity = (*common, envelope.trade_id)
+        else:
+            required = (
+                envelope.exchange_timestamp,
+                payload.get("price"),
+                payload.get("quantity"),
+            )
+            if any(item is None for item in required):
+                raise ValueError("trade without exchange id lacks canonical fallback fields")
+            identity = (*common, *required, payload.get("side"))
+    else:
+        identity = (
+            *common,
+            envelope.exchange_timestamp,
+            envelope.sequence,
+            hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+        )
+    return canonical_sha256(identity)
+
+
+def canonical_market_event_content(event: RawMarketEvent) -> str:
+    payload = event.payload()
+    keys = {
+        "funding_history": (
+            "rate",
+            "funding_rate",
+            "funding_interval_seconds",
+            "is_finalized",
+        ),
+        "ohlcv": ("open", "high", "low", "close", "volume", "closed", "timeframe"),
+        "trade": ("trade_id", "price", "quantity", "side"),
+    }.get(event.event_type)
+    if keys is None:
+        return event.payload_sha256
+    return canonical_sha256(
+        {
+            "venue": event.venue,
+            "instrument": event.canonical_instrument_id,
+            "event_type": event.event_type,
+            "exchange_timestamp": event.exchange_timestamp,
+            "values": {key: payload.get(key) for key in keys},
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -178,6 +278,10 @@ class CollectedEnvelope:
     recovery_completed_at: datetime | None = None
     last_recovery_failure: str | None = None
     logical_stream_event_type: str | None = None
+    timestamp_semantic: TimestampSemantic = TimestampSemantic.RECEIPT_ONLY
+    availability_provenance: AvailabilityProvenance = AvailabilityProvenance.UNKNOWN
+    exchange_server_time: datetime | None = None
+    timeframe: str | None = None
 
     @property
     def stream_identity(self) -> ResearchStreamIdentity:
@@ -250,6 +354,16 @@ class PublicAdapterCollectorSource:
         await response.aread()
         self._raw_responses.append(response.text)
 
+    async def _exchange_server_time(self) -> datetime | None:
+        loader = getattr(self.adapter, "fetch_server_time", None)
+        if loader is None:
+            return None
+        try:
+            value = await loader()
+        except Exception:
+            return None
+        return utc(value, "exchange_server_time")
+
     def rest_events(
         self,
         identity: ResearchStreamIdentity,
@@ -269,6 +383,7 @@ class PublicAdapterCollectorSource:
         if end <= start:
             raise ValueError("historical end must be after start")
         async with self._http_lock:
+            exchange_server_time = await self._exchange_server_time()
             self._raw_responses.clear()
             if identity.event_type == "ohlcv":
                 values: Sequence[Any] = await self.adapter.fetch_ohlcv(
@@ -289,7 +404,13 @@ class PublicAdapterCollectorSource:
                     f"historical {identity.event_type} is unavailable through the public adapter"
                 )
             return tuple(
-                self._envelope(identity, value, use_captured_response=True) for value in values
+                self._envelope(
+                    identity,
+                    value,
+                    use_captured_response=True,
+                    exchange_server_time=exchange_server_time,
+                )
+                for value in values
             )
 
     async def _rest_events(
@@ -298,6 +419,7 @@ class PublicAdapterCollectorSource:
         checkpoint: CollectionCheckpoint | None,
     ) -> AsyncIterator[CollectedEnvelope]:
         async with self._http_lock:
+            exchange_server_time = await self._exchange_server_time()
             self._raw_responses.clear()
             start = checkpoint.last_available_at if checkpoint else None
             if identity.event_type == "ohlcv":
@@ -330,7 +452,13 @@ class PublicAdapterCollectorSource:
             else:
                 raise CapabilityUnavailableError(identity.event_type)
             envelopes = tuple(
-                self._envelope(identity, value, use_captured_response=True) for value in values
+                self._envelope(
+                    identity,
+                    value,
+                    use_captured_response=True,
+                    exchange_server_time=exchange_server_time,
+                )
+                for value in values
             )
         for item in envelopes:
             yield item
@@ -449,6 +577,7 @@ class PublicAdapterCollectorSource:
         recovery_completed_at: datetime | None = None,
         last_recovery_failure: str | None = None,
         use_captured_response: bool = False,
+        exchange_server_time: datetime | None = None,
     ) -> CollectedEnvelope:
         now = datetime.now(UTC)
         normalized = json.dumps(_json_value(value), sort_keys=True, separators=(",", ":"))
@@ -467,11 +596,15 @@ class PublicAdapterCollectorSource:
             if use_captured_response and self._raw_responses
             else websocket_raw or normalized
         )
+        event_type_value = event_type or identity.event_type
+        timestamp_semantic, availability_provenance = _timing_semantics(
+            event_type_value, identity.channel
+        )
         return CollectedEnvelope(
             venue=identity.venue,
             canonical_instrument_id=identity.canonical_instrument_id,
             venue_symbol=identity.venue_symbol,
-            event_type=event_type or identity.event_type,
+            event_type=event_type_value,
             channel=identity.channel,
             source_endpoint=f"public-adapter:{type(self.adapter).__name__}:{identity.channel}",
             raw_payload=source_payload,
@@ -493,6 +626,10 @@ class PublicAdapterCollectorSource:
             recovery_started_at=recovery_started_at,
             recovery_completed_at=recovery_completed_at,
             last_recovery_failure=last_recovery_failure,
+            timestamp_semantic=timestamp_semantic,
+            availability_provenance=availability_provenance,
+            exchange_server_time=exchange_server_time,
+            timeframe=getattr(value, "timeframe", None),
         )
 
     @staticmethod
@@ -673,7 +810,14 @@ class CheckpointWriter:
                 else None
             ),
             last_funding_at=(
-                envelope.exchange_timestamp
+                max(
+                    item
+                    for item in (
+                        envelope.exchange_timestamp,
+                        previous.last_funding_at if previous else None,
+                    )
+                    if item is not None
+                )
                 if envelope.event_type == "funding_history"
                 else previous.last_funding_at
                 if previous
@@ -939,7 +1083,15 @@ class RawPersistenceConsumer:
             return
         invalid = self._invalid_reason(event)
         if not decision.production_eligible:
-            if self.repository.add_experimental_event(event, decision.support.value):
+            existing_experimental = self.repository.get_experimental_event(event.event_id)
+            if existing_experimental is not None:
+                if canonical_market_event_content(
+                    existing_experimental
+                ) != canonical_market_event_content(event):
+                    self._quarantine(event, "canonical event identity collision")
+                    return
+                self.metrics.duplicate_count += 1
+            elif self.repository.add_experimental_event(event, decision.support.value):
                 self.metrics.experimental_count += 1
                 self.metrics.experimental_by_venue[event.venue] += 1
             gap = self._sequence_gap(checkpoint, envelope)
@@ -1113,17 +1265,13 @@ class RawPersistenceConsumer:
         sequence = (
             envelope.delta_sequence if envelope.delta_sequence is not None else envelope.sequence
         )
-        stable = envelope.stable_event_key or canonical_sha256(
-            (
-                envelope.venue,
-                envelope.venue_symbol,
-                envelope.event_type,
-                envelope.exchange_timestamp,
-                sequence,
-                envelope.trade_id,
-                payload_hash,
-            )
-        )
+        if envelope.stable_event_key:
+            stable = envelope.stable_event_key
+        else:
+            payload = json.loads(normalized)
+            if not isinstance(payload, dict):
+                raise ValueError("normalized market event must be an object")
+            stable = canonical_market_event_identity(envelope, payload)
         return RawMarketEvent(
             event_id=f"{envelope.venue}-{stable}",
             venue=envelope.venue,
@@ -1145,6 +1293,10 @@ class RawPersistenceConsumer:
             snapshot_sequence=envelope.snapshot_sequence,
             delta_sequence=envelope.delta_sequence,
             connection_epoch=envelope.connection_epoch,
+            timestamp_semantic=envelope.timestamp_semantic,
+            availability_provenance=envelope.availability_provenance,
+            exchange_server_time=envelope.exchange_server_time,
+            timeframe=envelope.timeframe,
         )
 
     @staticmethod
@@ -1617,6 +1769,7 @@ class SnapshotEligibilityPolicy:
     require_complete_instrument_rules: bool = False
     minimum_venue_event_coverage_ratio: Decimal = Decimal("0")
     minimum_history_windows_per_venue_event: int = 0
+    require_point_in_time_availability: bool = False
 
 
 class DataSnapshotService:
@@ -1747,6 +1900,25 @@ class DataSnapshotService:
                 reasons.append(f"insufficient history windows: {','.join(incomplete)}")
         if unsynchronized_books:
             reasons.append("unsynchronized order-book events present")
+        if policy.require_point_in_time_availability:
+            unsupported = tuple(
+                item.event_id
+                for item in market
+                if item.timestamp_semantic
+                in {
+                    TimestampSemantic.HISTORICAL_EFFECTIVE_TIME,
+                    TimestampSemantic.CANDLE_OPEN_TIME,
+                    TimestampSemantic.CANDLE_CLOSE_TIME,
+                    TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+                }
+                and item.availability_provenance
+                not in {
+                    AvailabilityProvenance.HISTORICAL_EFFECTIVE_TIME,
+                    AvailabilityProvenance.EXCHANGE_PUBLISHED_TIME,
+                }
+            )
+            if unsupported:
+                reasons.append("historical availability is not point-in-time proven")
         gaps = sum(item.event_type == "sequence_gap" for item in source)
         stale = sum(item.event_type == "stale_stream" for item in source)
         denominator = Decimal(max(1, len(market)))

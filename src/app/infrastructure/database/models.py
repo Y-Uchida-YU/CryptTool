@@ -115,6 +115,10 @@ class RawMarketEventRow(Base):
     snapshot_sequence: Mapped[int | None] = mapped_column(BigInteger)
     delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
     connection_epoch: Mapped[int | None] = mapped_column(Integer)
+    timestamp_semantic: Mapped[str] = mapped_column(String(50), default="receipt_only")
+    availability_provenance: Mapped[str] = mapped_column(String(50), default="unknown")
+    exchange_server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timeframe: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -148,6 +152,10 @@ class ExperimentalMarketEventRow(Base):
     normalizer_version: Mapped[str] = mapped_column(String(120), default="unknown")
     channel: Mapped[str] = mapped_column(String(120), default="unknown")
     connection_epoch: Mapped[int | None] = mapped_column(Integer)
+    timestamp_semantic: Mapped[str] = mapped_column(String(50), default="receipt_only")
+    availability_provenance: Mapped[str] = mapped_column(String(50), default="unknown")
+    exchange_server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timeframe: Mapped[str | None] = mapped_column(String(20))
 
 
 class MarketDataQuarantineRow(Base):

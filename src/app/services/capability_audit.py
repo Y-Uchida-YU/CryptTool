@@ -27,6 +27,9 @@ class CapabilityAuditFinding:
     ci_run_id: str = ""
     audit_run_id: str = ""
     audited_at: datetime | None = None
+    adapter_version: str = ""
+    source_version: str = ""
+    contract_fixture_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,65 @@ class CapabilityContractAuditor:
             )
         self._test_results[test_id] = result
         return result[0], result[1] or None
+
+    def audit_certification_capabilities(
+        self,
+        adapter: MarketDataAdapter,
+        capabilities: tuple[str, ...],
+        *,
+        adapter_version: str,
+        source_version: str,
+    ) -> CapabilityAuditReport:
+        findings: list[CapabilityAuditFinding] = []
+        venue = str(getattr(adapter, "venue", ""))
+        for capability in capabilities:
+            reasons: list[str] = []
+            entry = self.entries.get((venue, capability))
+            test_id = ""
+            test_file_sha256 = ""
+            test_result = "not_run"
+            fixture_sha = ""
+            if entry is None:
+                reasons.append("evidence manifest entry is missing")
+            else:
+                method = str(entry.get("adapter_method", ""))
+                owner = self._implementation_owner(type(adapter), method)
+                if owner in {None, MarketDataAdapter, PublicRestAdapter}:
+                    reasons.append("adapter method resolves to an unavailable fallback owner")
+                fixture_data = entry.get("contract_fixture", {})
+                fixture = self.root / str(fixture_data.get("path", ""))
+                fixture_sha = str(fixture_data.get("sha256", ""))
+                if (
+                    not fixture.is_file()
+                    or hashlib.sha256(fixture.read_bytes()).hexdigest() != fixture_sha
+                ):
+                    reasons.append("contract fixture sha256 does not match")
+                test_id = str(entry.get("normalization_test", {}).get("test_id", ""))
+                test_path = self.root / test_id.partition("::")[0]
+                if "::" not in test_id or not test_path.is_file():
+                    reasons.append("normalization test evidence is missing")
+                else:
+                    test_file_sha256 = hashlib.sha256(test_path.read_bytes()).hexdigest()
+                    test_result, test_failure = self._verify_test_node(test_id)
+                    if test_failure:
+                        reasons.append(test_failure)
+            findings.append(
+                CapabilityAuditFinding(
+                    capability=capability,
+                    passed=not reasons,
+                    reasons=tuple(reasons),
+                    test_node_id=test_id,
+                    test_file_sha256=test_file_sha256,
+                    test_result=test_result,
+                    ci_run_id=self.ci_run_id,
+                    audit_run_id=self.audit_run_id,
+                    audited_at=self.now,
+                    adapter_version=adapter_version,
+                    source_version=source_version,
+                    contract_fixture_sha256=fixture_sha,
+                )
+            )
+        return CapabilityAuditReport(venue, self.now, tuple(findings))
 
     def _run_pytest(self, arguments: list[str]) -> int:
         import pytest

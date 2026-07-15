@@ -28,6 +28,7 @@ from app.infrastructure.database.models import (
     ResearchRunRow,
 )
 from app.services.research.models import (
+    AvailabilityProvenance,
     CollectionCheckpoint,
     CollectionFailureEvent,
     DataSnapshotManifest,
@@ -37,6 +38,7 @@ from app.services.research.models import (
     RawMarketEvent,
     ResearchRunIdentity,
     RuleVerificationStatus,
+    TimestampSemantic,
 )
 
 
@@ -48,6 +50,8 @@ class ResearchRepository(Protocol):
     def raw_events(self) -> tuple[RawMarketEvent, ...]: ...
 
     def add_experimental_event(self, event: RawMarketEvent, support: str) -> bool: ...
+
+    def get_experimental_event(self, event_id: str) -> RawMarketEvent | None: ...
 
     def experimental_event_count(self) -> int: ...
 
@@ -185,6 +189,10 @@ class InMemoryResearchRepository:
             return False
         self.experimental_events[event.event_id] = (event, support)
         return True
+
+    def get_experimental_event(self, event_id: str) -> RawMarketEvent | None:
+        value = self.experimental_events.get(event_id)
+        return value[0] if value is not None else None
 
     def experimental_event_count(self) -> int:
         return len(self.experimental_events)
@@ -391,6 +399,10 @@ class PostgreSQLResearchRepository:
             snapshot_sequence=event.snapshot_sequence,
             delta_sequence=event.delta_sequence,
             connection_epoch=event.connection_epoch,
+            timestamp_semantic=event.timestamp_semantic.value,
+            availability_provenance=event.availability_provenance.value,
+            exchange_server_time=event.exchange_server_time,
+            timeframe=event.timeframe,
             created_at=event.created_at,
         )
         with Session(self.engine) as session:
@@ -455,6 +467,10 @@ class PostgreSQLResearchRepository:
                         normalizer_version=event.normalizer_version,
                         channel=event.channel,
                         connection_epoch=event.connection_epoch,
+                        timestamp_semantic=event.timestamp_semantic.value,
+                        availability_provenance=event.availability_provenance.value,
+                        exchange_server_time=event.exchange_server_time,
+                        timeframe=event.timeframe,
                     )
                 )
                 session.commit()
@@ -462,6 +478,13 @@ class PostgreSQLResearchRepository:
             except IntegrityError:
                 session.rollback()
                 return False
+
+    def get_experimental_event(self, event_id: str) -> RawMarketEvent | None:
+        with Session(self.engine) as session:
+            row = session.get(ExperimentalMarketEventRow, event_id)
+            if row is None:
+                return None
+            return self._experimental_event(row)
 
     def experimental_event_count(self) -> int:
         with Session(self.engine) as session:
@@ -472,39 +495,7 @@ class PostgreSQLResearchRepository:
     def list_experimental_events(self) -> tuple[RawMarketEvent, ...]:
         with Session(self.engine) as session:
             rows = session.scalars(select(ExperimentalMarketEventRow)).all()
-            return tuple(
-                RawMarketEvent(
-                    event_id=row.event_id,
-                    venue=row.venue,
-                    canonical_instrument_id=row.canonical_instrument_id,
-                    venue_symbol=row.venue_symbol,
-                    event_type=row.event_type,
-                    exchange_timestamp=(
-                        self._aware(row.exchange_timestamp)
-                        if row.exchange_timestamp is not None
-                        else None
-                    ),
-                    received_at=self._aware(row.received_at),
-                    available_at=self._aware(row.available_at),
-                    sequence=row.sequence,
-                    connection_id=UUID(row.connection_id) if row.connection_id else None,
-                    reconciliation_state=(
-                        ReconciliationState(row.reconciliation_state)
-                        if row.reconciliation_state
-                        else None
-                    ),
-                    payload_sha256=row.payload_sha256,
-                    raw_payload=row.raw_payload,
-                    normalizer_version=row.normalizer_version,
-                    capability_verification_run_id=(
-                        row.capability_verification_run_id or "unverified-experimental"
-                    ),
-                    created_at=self._aware(row.received_at),
-                    channel=row.channel,
-                    connection_epoch=row.connection_epoch,
-                )
-                for row in rows
-            )
+            return tuple(self._experimental_event(row) for row in rows)
 
     def save_raw_payload(
         self,
@@ -1026,4 +1017,45 @@ class PostgreSQLResearchRepository:
             snapshot_sequence=row.snapshot_sequence,
             delta_sequence=row.delta_sequence,
             connection_epoch=row.connection_epoch,
+            timestamp_semantic=TimestampSemantic(row.timestamp_semantic),
+            availability_provenance=AvailabilityProvenance(row.availability_provenance),
+            exchange_server_time=(
+                aware(row.exchange_server_time) if row.exchange_server_time else None
+            ),
+            timeframe=row.timeframe,
+        )
+
+    @classmethod
+    def _experimental_event(cls, row: ExperimentalMarketEventRow) -> RawMarketEvent:
+        return RawMarketEvent(
+            event_id=row.event_id,
+            venue=row.venue,
+            canonical_instrument_id=row.canonical_instrument_id,
+            venue_symbol=row.venue_symbol,
+            event_type=row.event_type,
+            exchange_timestamp=(
+                cls._aware(row.exchange_timestamp) if row.exchange_timestamp is not None else None
+            ),
+            received_at=cls._aware(row.received_at),
+            available_at=cls._aware(row.available_at),
+            sequence=row.sequence,
+            connection_id=UUID(row.connection_id) if row.connection_id else None,
+            reconciliation_state=(
+                ReconciliationState(row.reconciliation_state) if row.reconciliation_state else None
+            ),
+            payload_sha256=row.payload_sha256,
+            raw_payload=row.raw_payload,
+            normalizer_version=row.normalizer_version,
+            capability_verification_run_id=(
+                row.capability_verification_run_id or "unverified-experimental"
+            ),
+            created_at=cls._aware(row.received_at),
+            channel=row.channel,
+            connection_epoch=row.connection_epoch,
+            timestamp_semantic=TimestampSemantic(row.timestamp_semantic),
+            availability_provenance=AvailabilityProvenance(row.availability_provenance),
+            exchange_server_time=(
+                cls._aware(row.exchange_server_time) if row.exchange_server_time else None
+            ),
+            timeframe=row.timeframe,
         )

@@ -197,6 +197,7 @@ class MarketDataCertificationSettings(BaseModel):
     source_version: str = "r4-contract-v1"
     certification_ttl_hours: int = Field(24, ge=1, le=168)
     artifact_root: str = "artifacts/certification"
+    capability_audit_artifact_directory: str = "artifacts/capability-audit"
 
 
 class Settings(BaseSettings):

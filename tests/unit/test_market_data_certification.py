@@ -18,6 +18,7 @@ from app.domain.venues.trusted_capabilities import TrustedCapabilityRecord
 from app.infrastructure.database.models import Base
 from app.services.research.certification import (
     FUNDING_CARRY_REQUIREMENT,
+    CapabilityAuditArtifactResolver,
     CapabilityPromotionService,
     CertificationVerdict,
     ContractValidationSpec,
@@ -27,7 +28,10 @@ from app.services.research.certification import (
     SQLCertificationRepository,
     StrategySnapshotService,
     StrictPaperReadiness,
+    analyze_funding_intervals,
+    certification_metrics,
     evaluate_strict_paper_readiness,
+    event_timing_metrics,
     funding_payment_direction,
     normalize_exchange_timestamp,
     normalize_funding_rate,
@@ -38,7 +42,11 @@ from app.services.research.certification import (
     validate_order_book_events,
     write_certification_artifacts,
 )
-from app.services.research.models import RawMarketEvent
+from app.services.research.models import (
+    AvailabilityProvenance,
+    RawMarketEvent,
+    TimestampSemantic,
+)
 from app.services.research.repository import (
     InMemoryResearchRepository,
     PostgreSQLResearchRepository,
@@ -83,6 +91,11 @@ def event(
     available_at: datetime = NOW,
 ) -> RawMarketEvent:
     raw = json.dumps(payload_for(capability), sort_keys=True, separators=(",", ":"))
+    semantics = {
+        "funding_history": TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+        "ohlcv": TimestampSemantic.CANDLE_OPEN_TIME,
+        "trade": TimestampSemantic.REALTIME_EVENT,
+    }
     return RawMarketEvent(
         event_id=event_id or f"{venue}-{instrument}-{capability}",
         venue=venue,
@@ -100,6 +113,14 @@ def event(
         normalizer_version="test-r4",
         capability_verification_run_id="unverified-experimental",
         created_at=NOW,
+        timestamp_semantic=semantics.get(capability, TimestampSemantic.RECEIPT_ONLY),
+        availability_provenance=(
+            AvailabilityProvenance.EXCHANGE_PUBLISHED_TIME
+            if capability in {"funding_history", "ohlcv"}
+            else AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME
+        ),
+        exchange_server_time=NOW - timedelta(milliseconds=20),
+        timeframe="1m" if capability == "ohlcv" else None,
     )
 
 
@@ -111,6 +132,11 @@ def spec(
 ) -> ContractValidationSpec:
     fixture = ROOT / f"tests/contracts/{venue}/public.json"
     fields = tuple(payload_for(capability))
+    semantics = {
+        "funding_history": TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+        "ohlcv": TimestampSemantic.CANDLE_OPEN_TIME,
+        "trade": TimestampSemantic.REALTIME_EVENT,
+    }
     return ContractValidationSpec(
         venue=venue,
         capability=capability,
@@ -144,6 +170,7 @@ def spec(
         minimum_event_count=1,
         minimum_coverage_ratio=Decimal("0.01"),
         maximum_stale_ratio=Decimal("1"),
+        timestamp_semantic=semantics.get(capability, TimestampSemantic.RECEIPT_ONLY),
     )
 
 
@@ -168,8 +195,169 @@ def certified(
         audit_passed=True,
         audit_run_id="audit-1",
         ci_run_id="ci-1",
+        audit_artifact_sha256="f" * 64,
     )
     return repository, item
+
+
+def test_old_historical_funding_is_event_age_not_clock_skew() -> None:
+    old = replace(
+        event("funding_history"),
+        exchange_timestamp=NOW - timedelta(days=30),
+        exchange_server_time=NOW - timedelta(milliseconds=25),
+    )
+    timing = event_timing_metrics(old)
+    assert timing.event_age_seconds == Decimal(str(timedelta(days=30).total_seconds()))
+    assert timing.transport_latency_seconds is None
+    assert timing.clock_skew_seconds == Decimal("0.025")
+
+
+def test_old_ohlcv_candle_is_not_clock_skew() -> None:
+    old = replace(
+        event("ohlcv"),
+        exchange_timestamp=NOW - timedelta(days=7),
+        exchange_server_time=NOW,
+    )
+    metrics = certification_metrics((old,), spec("ohlcv"), NOW - timedelta(minutes=1), NOW, ())
+    assert metrics.maximum_clock_skew_ms == Decimal("0")
+    assert metrics.timing[0].event_age_seconds == Decimal(str(timedelta(days=7).total_seconds()))
+
+
+def test_exchange_server_time_drives_clock_skew_and_missing_is_unknown() -> None:
+    realtime = event("trade")
+    measured = event_timing_metrics(realtime)
+    assert measured.clock_skew_seconds == Decimal("0.02")
+    unknown = event_timing_metrics(replace(realtime, exchange_server_time=None))
+    assert unknown.clock_skew_seconds is None
+
+
+def test_descending_historical_history_is_not_live_out_of_order() -> None:
+    first = replace(
+        event("funding_history", event_id="new"),
+        exchange_timestamp=NOW - timedelta(hours=1),
+    )
+    second = replace(
+        event("funding_history", event_id="old"),
+        exchange_timestamp=NOW - timedelta(hours=2),
+    )
+    metrics = certification_metrics(
+        (first, second), spec("funding_history"), NOW - timedelta(minutes=1), NOW, ()
+    )
+    assert metrics.live_out_of_order_count == 0
+    assert metrics.historical_source_order_reversed == 1
+
+
+def test_duplicate_funding_does_not_cause_interval_mismatch() -> None:
+    older = replace(
+        event("funding_history", event_id="older"),
+        exchange_timestamp=NOW - timedelta(hours=2),
+    )
+    newer = replace(
+        event("funding_history", event_id="newer"),
+        exchange_timestamp=NOW - timedelta(hours=1),
+    )
+    duplicate = replace(newer, event_id="overlap")
+    result = analyze_funding_intervals((newer, duplicate, older), spec("funding_history"))
+    assert result.duplicate_count == 1
+    assert result.violations == ()
+
+
+def test_missing_funding_window_is_insufficient_evidence() -> None:
+    older = replace(
+        event("funding_history", event_id="older"),
+        exchange_timestamp=NOW - timedelta(hours=3),
+    )
+    newer = replace(
+        event("funding_history", event_id="newer"),
+        exchange_timestamp=NOW - timedelta(hours=1),
+    )
+    result = analyze_funding_intervals((older, newer), spec("funding_history"))
+    assert result.violations == ()
+    assert result.missing_window_count == 1
+    assert "funding history has missing windows" in result.insufficiencies
+
+
+def test_historical_and_live_trade_have_different_order_rules() -> None:
+    newer = event("trade", event_id="newer")
+    older = replace(newer, event_id="older", exchange_timestamp=NOW - timedelta(seconds=2))
+    live = certification_metrics((newer, older), spec("trade"), NOW - timedelta(minutes=1), NOW, ())
+    historical_spec = replace(
+        spec("trade"), timestamp_semantic=TimestampSemantic.HISTORICAL_EFFECTIVE_TIME
+    )
+    historical = certification_metrics(
+        (
+            replace(newer, timestamp_semantic=TimestampSemantic.HISTORICAL_EFFECTIVE_TIME),
+            replace(older, timestamp_semantic=TimestampSemantic.HISTORICAL_EFFECTIVE_TIME),
+        ),
+        historical_spec,
+        NOW - timedelta(minutes=1),
+        NOW,
+        (),
+    )
+    assert live.live_out_of_order_count == 1
+    assert historical.live_out_of_order_count == 0
+
+
+def test_audit_artifact_mismatch_blocks_and_valid_artifact_allows(tmp_path: Path) -> None:
+    report = {
+        "findings": [
+            {
+                "venue": "hyperliquid",
+                "capability": "funding_history",
+                "adapter_version": "adapter-v1",
+                "source_version": "source-v1",
+                "contract_fixture_sha256": "f" * 64,
+                "passed": True,
+                "test_result": "passed",
+                "audit_run_id": "audit-1",
+                "ci_run_id": "ci-1",
+            }
+        ]
+    }
+    report_bytes = json.dumps(report).encode()
+    (tmp_path / "report.json").write_bytes(report_bytes)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "commit_sha": COMMIT,
+                "report_file": "report.json",
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            }
+        )
+    )
+    resolver = CapabilityAuditArtifactResolver(tmp_path)
+    arguments = {
+        "venue": "hyperliquid",
+        "capability": "funding_history",
+        "commit_sha": COMMIT,
+        "adapter_version": "adapter-v1",
+        "source_version": "source-v1",
+        "fixture_sha256": "f" * 64,
+    }
+    assert resolver.resolve(**arguments) is not None
+    assert resolver.resolve(**{**arguments, "adapter_version": "forged"}) is None
+
+
+def test_historical_availability_provenance_blocks_unsupported_research() -> None:
+    repository = InMemoryResearchRepository()
+    unsupported = replace(
+        event("funding_history"),
+        availability_provenance=AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        capability_verification_run_id="verified-certification",
+    )
+    assert repository.add_raw_event(unsupported)
+    manifest = StrategySnapshotService(repository).finalize(
+        requirement=replace(
+            FUNDING_CARRY_REQUIREMENT,
+            required_capabilities=("funding_history",),
+            required_venues=("hyperliquid",),
+            minimum_coverage_ratio=Decimal("1"),
+            minimum_history_windows=1,
+        ),
+        cutoff_at=NOW,
+    )
+    assert manifest.eligibility_status == "FINALIZED_NOT_ELIGIBLE"
+    assert "historical availability is not point-in-time proven" in manifest.eligibility_reasons
 
 
 def test_funding_decimal_unit_normalization() -> None:

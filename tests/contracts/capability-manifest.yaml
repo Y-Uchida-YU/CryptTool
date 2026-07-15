@@ -483,3 +483,68 @@ entries:
   live_smoke:
     verification_run_id: null
     verified_at: null
+- venue: hyperliquid
+  capability: funding_current
+  adapter_method: fetch_current_funding_rate
+  contract_fixture: &r4_hl_fixture
+    path: tests/contracts/hyperliquid/public.json
+    sha256: a0384643e03eaa970e4dcce5c72a9738c258fc99a092ed4b98180a85abb5faef
+  normalization_test: &r4_normalization
+    test_id: tests/unit/test_market_data_certification.py::test_contract_fixture_is_bound_to_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: hyperliquid
+  capability: mark_price
+  adapter_method: stream_ticker
+  contract_fixture: *r4_hl_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: hyperliquid
+  capability: index_price
+  adapter_method: stream_ticker
+  contract_fixture: *r4_hl_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: hyperliquid
+  capability: trade
+  adapter_method: stream_trades
+  contract_fixture: *r4_hl_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: hyperliquid
+  capability: ohlcv
+  adapter_method: fetch_ohlcv
+  contract_fixture: *r4_hl_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: bitget
+  capability: funding_current
+  adapter_method: fetch_current_funding_rate
+  contract_fixture: &r4_bitget_fixture
+    path: tests/contracts/bitget/public.json
+    sha256: 6791e0c35ad2c5bd4f12c6dc3c3240e9413d89ab0707d17a09c6dfbec959e438
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: bitget
+  capability: mark_price
+  adapter_method: stream_ticker
+  contract_fixture: *r4_bitget_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: bitget
+  capability: index_price
+  adapter_method: stream_ticker
+  contract_fixture: *r4_bitget_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: bitget
+  capability: trade
+  adapter_method: stream_trades
+  contract_fixture: *r4_bitget_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}
+- venue: bitget
+  capability: ohlcv
+  adapter_method: fetch_ohlcv
+  contract_fixture: *r4_bitget_fixture
+  normalization_test: *r4_normalization
+  live_smoke: {verification_run_id: null, verified_at: null}

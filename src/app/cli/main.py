@@ -82,8 +82,11 @@ from app.services.research.accelerated_validation import (
 )
 from app.services.research.certification import (
     TIER_ONE_CAPABILITIES,
+    CapabilityAuditArtifactResolver,
+    CapabilityPromotionService,
     ContractValidationSpec,
     MarketDataCertificationService,
+    ProductionEventCertificationGate,
     SQLCertificationRepository,
     write_certification_artifacts,
 )
@@ -103,7 +106,12 @@ from app.services.research.data_operations import (
     write_collector_health_report,
     write_snapshot_manifest,
 )
-from app.services.research.models import RawMarketEvent, ResearchRunResult, canonical_sha256
+from app.services.research.models import (
+    RawMarketEvent,
+    ResearchRunResult,
+    TimestampSemantic,
+    canonical_sha256,
+)
 from app.services.research.pipeline import ResearchPipeline
 from app.services.research.report import ResearchArtifactWriter
 from app.services.research.repository import (
@@ -1015,6 +1023,13 @@ def _certification_contract_spec(
         "ohlcv": ("exchange", "symbol", "open", "high", "low", "close", "volume"),
     }[capability]
     symbol = instrument if venue == "hyperliquid" else f"{instrument}USDT"
+    semantics = {
+        "funding_history": TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+        "ohlcv": TimestampSemantic.CANDLE_OPEN_TIME,
+        "trade": TimestampSemantic.REALTIME_EVENT,
+        "mark_price": TimestampSemantic.REALTIME_EVENT,
+        "index_price": TimestampSemantic.REALTIME_EVENT,
+    }
     return ContractValidationSpec(
         venue=venue,
         capability=capability,
@@ -1053,6 +1068,7 @@ def _certification_contract_spec(
         minimum_coverage_ratio=Decimal("0.80"),
         maximum_stale_ratio=Decimal("0.05"),
         maximum_absolute_error=(Decimal("0.001") if capability == "funding_current" else None),
+        timestamp_semantic=semantics.get(capability, TimestampSemantic.RECEIPT_ONLY),
     )
 
 
@@ -1209,8 +1225,18 @@ def run_market_data_certification(
             certification_ttl=timedelta(hours=certification_settings.certification_ttl_hours),
         )
         normalization_test_passed = _certification_normalization_test_passed(Path.cwd())
+        audit_resolver = CapabilityAuditArtifactResolver(
+            Path(certification_settings.capability_audit_artifact_directory)
+        )
+        promotion_service = CapabilityPromotionService(
+            certification_repository,
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+        )
         events = repository.list_experimental_events()
         certifications = []
+        promoted = 0
+        production_market_events = 0
         for venue in certification_settings.venues:
             for instrument in certification_settings.instruments:
                 for capability in certification_settings.capabilities:
@@ -1228,6 +1254,14 @@ def run_market_data_certification(
                         )
                         if observed_interval is not None:
                             spec = replace(spec, funding_interval_seconds=observed_interval)
+                    audit = audit_resolver.resolve(
+                        venue=venue,
+                        capability=capability,
+                        commit_sha=_current_commit_sha(),
+                        adapter_version=certification_settings.adapter_version,
+                        source_version=certification_settings.source_version,
+                        fixture_sha256=spec.fixture_sha256,
+                    )
                     certification = service.certify(
                         certification_id=certification_id,
                         spec=spec,
@@ -1240,19 +1274,50 @@ def run_market_data_certification(
                             instrument=instrument,
                             capability=capability,
                         ),
-                        audit_passed=False,
-                        audit_run_id="",
-                        ci_run_id="",
+                        audit_passed=audit is not None,
+                        audit_run_id=audit.audit_run_id if audit else "",
+                        ci_run_id=audit.ci_run_id if audit else "",
+                        audit_artifact_sha256=audit.audit_artifact_sha256 if audit else "",
                     )
                     stored = certification_repository.get(certification_id)
                     if stored is None:
                         raise RuntimeError("certification repository lost a committed record")
+                    promotion = None
+                    if certification.verdict.value == "pass" and audit is not None:
+                        promotion = promotion_service.promote(certification)
+                        promoted += 1
+                        gate = ProductionEventCertificationGate()
+                        for event in events:
+                            if not (
+                                event.venue == venue
+                                and event.canonical_instrument_id == instrument
+                                and event.event_type == capability
+                                and started_at <= event.received_at <= ended_at
+                            ):
+                                continue
+                            gate.require(
+                                event=event,
+                                certification=certification,
+                                trusted_record=promotion,
+                                adapter_version=certification_settings.adapter_version,
+                                now=ended_at,
+                            )
+                            production_event = replace(
+                                event,
+                                event_id=f"certified-{certification_id}-{event.event_id}",
+                                capability_verification_run_id=certification_id,
+                                created_at=ended_at,
+                            )
+                            production_market_events += int(
+                                repository.add_raw_event(production_event)
+                            )
                     write_certification_artifacts(
                         root=artifact_root,
                         certification=certification,
                         evidence=stored[1],
                         contract=spec,
                         events=events,
+                        promotion=promotion,
                     )
                     certifications.append(certification)
         run_directory = artifact_root / resolved_run_id
@@ -1262,7 +1327,8 @@ def run_market_data_certification(
             "started_at": started_at,
             "ended_at": ended_at,
             "certifications": [asdict(item) for item in certifications],
-            "promoted_capability_count": 0,
+            "promoted_capability_count": promoted,
+            "production_market_event_count": production_market_events,
             "live_execution": "OFF",
         }
         (run_directory / "manifest.json").write_text(
@@ -1271,7 +1337,8 @@ def run_market_data_certification(
         )
         typer.echo(
             f"run_id={resolved_run_id} certifications={len(certifications)} "
-            "promoted=0 live_execution=OFF"
+            f"promoted={promoted} production_events={production_market_events} "
+            "live_execution=OFF"
         )
     finally:
         engine.dispose()
@@ -2580,6 +2647,18 @@ def audit_capabilities() -> None:
             if not finding.passed:
                 failed = True
                 typer.echo(f"  {finding.capability}: {'; '.join(finding.reasons)}")
+    for adapter in (adapters[0], adapters[2]):
+        report = auditor.audit_certification_capabilities(
+            adapter,
+            TIER_ONE_CAPABILITIES,
+            adapter_version="public-adapters-r4",
+            source_version="r4-contract-v1",
+        )
+        reports.append(report)
+        for finding in report.findings:
+            if not finding.passed:
+                failed = True
+                typer.echo(f"  {report.venue}:{finding.capability}: {'; '.join(finding.reasons)}")
     auditor.write_artifact(tuple(reports))
 
     async def close() -> None:
