@@ -535,6 +535,7 @@ def test_market_data_certification_cli_runs_isolated_evidence_path(
     monkeypatch.setattr(cli, "_run_certification_collection", collect)
     monkeypatch.setattr(cli, "_certification_normalization_test_passed", lambda _: True)
     monkeypatch.setattr(cli, "_current_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(cli, "verify_capability_audit", lambda *_args, **_kwargs: None)
 
     result = runner.invoke(
         app,

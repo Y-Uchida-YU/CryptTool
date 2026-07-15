@@ -262,6 +262,29 @@ def test_duplicate_funding_does_not_cause_interval_mismatch() -> None:
     assert result.violations == ()
 
 
+def test_null_payload_funding_interval_uses_contract_schedule() -> None:
+    raw = json.dumps(
+        {**payload_for("funding_history"), "funding_interval_seconds": None},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    older = replace(
+        event("funding_history", event_id="older-null-interval"),
+        exchange_timestamp=NOW - timedelta(hours=2),
+        raw_payload=raw,
+        payload_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+    )
+    newer = replace(
+        event("funding_history", event_id="newer-null-interval"),
+        exchange_timestamp=NOW - timedelta(hours=1),
+        raw_payload=raw,
+        payload_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+    )
+    result = analyze_funding_intervals((older, newer), spec("funding_history"))
+    assert result.violations == ()
+    assert result.observations[0].expected_interval_seconds == 3600
+
+
 def test_missing_funding_window_is_insufficient_evidence() -> None:
     older = replace(
         event("funding_history", event_id="older"),

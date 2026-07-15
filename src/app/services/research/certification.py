@@ -1049,15 +1049,11 @@ def analyze_funding_intervals(
     for previous, current in pairwise(timestamps):
         previous_payload = finalized[previous].payload()
         current_payload = finalized[current].payload()
-        expected = int(
-            current_payload.get(
-                "funding_interval_seconds",
-                previous_payload.get("funding_interval_seconds", spec.funding_interval_seconds),
-            )
+        previous_expected = int(
+            previous_payload.get("funding_interval_seconds") or spec.funding_interval_seconds
         )
-        changed = expected != int(
-            previous_payload.get("funding_interval_seconds", spec.funding_interval_seconds)
-        )
+        expected = int(current_payload.get("funding_interval_seconds") or previous_expected)
+        changed = expected != previous_expected
         schedule_changes += int(changed)
         actual = int((current - previous).total_seconds())
         difference = actual - expected

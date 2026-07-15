@@ -24,7 +24,7 @@ import typer
 import yaml  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from app.adapters.exchanges.dex import (
@@ -53,6 +53,7 @@ from app.infrastructure.database.session import build_engine
 from app.services.backtest.engine import BacktestEngine
 from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
 from app.services.capability_audit import CapabilityContractAuditor
+from app.services.capability_audit_artifact import verify_capability_audit
 from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 from app.services.operations.collector_health import summarize_collector_health
@@ -89,6 +90,14 @@ from app.services.research.certification import (
     ProductionEventCertificationGate,
     SQLCertificationRepository,
     write_certification_artifacts,
+)
+from app.services.research.certification_lifecycle import (
+    CertificationCanceled,
+    CertificationLifecycle,
+    CertificationRunRepository,
+    CertificationStage,
+    install_shutdown_signal_handlers,
+    restore_signal_handlers,
 )
 from app.services.research.collector_runs import (
     CollectorLeaseConflict,
@@ -1195,12 +1204,63 @@ def run_market_data_certification(
         f"artifact={artifact_root / resolved_run_id} live_execution=OFF"
     )
     engine = build_engine(settings.database_url)
+    lifecycle: CertificationLifecycle | None = None
+    lease_repository: SQLCollectorLeaseRepository | None = None
+    lease_group: str | None = None
+    lease_owner = f"{resolved_run_id}:{os.getpid()}"
+    previous_handlers = install_shutdown_signal_handlers()
     try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            inspector = inspect(engine)
+            migration = (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                if inspector.has_table("alembic_version")
+                else "0017_certification_run_registry"
+                if inspector.has_table("certification_runs")
+                else "missing"
+            )
+        if migration != "0017_certification_run_registry":
+            raise RuntimeError(f"certification database migration is stale: {migration}")
+        lifecycle = CertificationLifecycle(
+            run_id=resolved_run_id,
+            commit_sha=_current_commit_sha(),
+            config_path=config,
+            database_identity=_redact_database_url(settings.database_url),
+            artifact_directory=artifact_root / resolved_run_id,
+            repository=CertificationRunRepository(engine),
+            now=started_at,
+        )
+        lifecycle.stage(CertificationStage.CONFIG_LOADED)
+        lifecycle.stage(CertificationStage.DB_CONNECTION_VERIFIED)
+        lifecycle.stage(CertificationStage.MIGRATION_VERIFIED)
+        verify_capability_audit(
+            Path(certification_settings.capability_audit_artifact_directory),
+            _current_commit_sha(),
+        )
+        lifecycle.stage(CertificationStage.AUDIT_ARTIFACT_VERIFIED)
         repository = PostgreSQLResearchRepository(engine)
         namespaced = NamespacedResearchRepository(
             repository, checkpoint_namespace=f"certification:{resolved_run_id}"
         )
         adapters = tuple(_research_data_adapter(name) for name in certification_settings.venues)
+        lifecycle.stage(CertificationStage.ADAPTERS_CREATED)
+        lease_repository = SQLCollectorLeaseRepository(engine)
+        lease_group = collector_group_key(
+            database_identity=_redact_database_url(settings.database_url),
+            schema_name="public",
+            venue="+".join(certification_settings.venues),
+            instrument="+".join(certification_settings.instruments),
+            event_type="+".join(certification_settings.capabilities),
+            channel="certification",
+        )
+        lease_repository.acquire(
+            lease_group,
+            resolved_run_id,
+            lease_owner,
+            started_at + timedelta(minutes=duration + 5),
+        )
+        lifecycle.stage(CertificationStage.LEASE_ACQUIRED)
         collector = ResearchMarketDataCollector(
             repository=namespaced,
             sources=tuple(
@@ -1213,8 +1273,12 @@ def run_market_data_certification(
             poll_interval_seconds=settings.research_collection.poll_interval_seconds,
             stale_after_seconds=settings.research_collection.stale_after_seconds,
         )
+        lifecycle.stage(CertificationStage.COLLECTOR_STARTED)
+        lifecycle.stage(CertificationStage.CERTIFICATION_WINDOW_STARTED)
         asyncio.run(_run_certification_collection(collector, duration_seconds=duration * 60))
         ended_at = datetime.now(UTC)
+        lifecycle.stage(CertificationStage.FIRST_EVENT_RECEIVED)
+        lifecycle.stage(CertificationStage.FINALIZATION_STARTED)
         certification_repository = SQLCertificationRepository(engine)
         service = MarketDataCertificationService(
             certification_repository,
@@ -1335,12 +1399,39 @@ def run_market_data_certification(
             json.dumps(summary, default=_json_default, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
+        lifecycle.stage(CertificationStage.ARTIFACT_WRITTEN)
+        lifecycle.stage(CertificationStage.PROCESS_COMPLETED)
         typer.echo(
             f"run_id={resolved_run_id} certifications={len(certifications)} "
             f"promoted={promoted} production_events={production_market_events} "
             "live_execution=OFF"
         )
+    except CertificationCanceled as exc:
+        if lifecycle is not None:
+            lifecycle.fail(
+                exc,
+                exit_code=128 + exc.signal_number,
+                signal_number=exc.signal_number,
+                canceled=True,
+            )
+        raise typer.Exit(128 + exc.signal_number) from None
+    except KeyboardInterrupt as exc:
+        if lifecycle is not None:
+            lifecycle.fail(exc, exit_code=130, signal_number=signal.SIGINT, canceled=True)
+        raise typer.Exit(130) from None
+    except BaseException as exc:
+        if lifecycle is not None:
+            signal_number = (
+                -exc.code
+                if isinstance(exc, SystemExit) and isinstance(exc.code, int) and exc.code < 0
+                else None
+            )
+            lifecycle.fail(exc, signal_number=signal_number)
+        raise
     finally:
+        restore_signal_handlers(previous_handlers)
+        if lease_repository is not None and lease_group is not None:
+            lease_repository.release(lease_group, resolved_run_id, lease_owner)
         engine.dispose()
 
 
@@ -1616,14 +1707,17 @@ def _require_nonproduction_database_isolation(settings: Settings, *, run_mode: s
         raise typer.BadParameter(
             f"{run_mode} requires an explicit production_database_url for isolation"
         )
-    run_engine = build_engine(settings.database_url)
-    production_engine = build_engine(settings.production_database_url)
-    try:
-        run_identity = _database_identity(run_engine)
-        production_identity = _database_identity(production_engine)
-    finally:
-        run_engine.dispose()
-        production_engine.dispose()
+
+    def configured_identity(value: str) -> tuple[str, str]:
+        url = make_url(value)
+        if url.get_backend_name() == "sqlite":
+            database = Path(str(url.database)).expanduser().resolve()
+            return f"sqlite:///{database}", "main"
+        schema = str(url.query.get("schema", "public"))
+        return url.render_as_string(hide_password=True), schema
+
+    run_identity = configured_identity(settings.database_url)
+    production_identity = configured_identity(settings.production_database_url)
     if run_identity == production_identity:
         raise typer.BadParameter(
             f"{run_mode} database/schema must be isolated from the production database"

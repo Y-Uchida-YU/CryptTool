@@ -391,6 +391,31 @@ class MarketDataCertificationRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class CertificationRunRow(Base):
+    __tablename__ = "certification_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('STARTING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELED')",
+            name="ck_certification_runs_status",
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    last_stage: Mapped[str] = mapped_column(String(80))
+    failure_reason: Mapped[str | None] = mapped_column(String(2000))
+    commit_sha: Mapped[str] = mapped_column(String(40))
+    config_path: Mapped[str] = mapped_column(String(1000))
+    database_identity: Mapped[str] = mapped_column(String(1000))
+    artifact_directory: Mapped[str] = mapped_column(String(1000))
+    pid: Mapped[int] = mapped_column(Integer)
+    parent_pid: Mapped[int] = mapped_column(Integer)
+    signal_number: Mapped[int | None] = mapped_column(Integer)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    exception_type: Mapped[str | None] = mapped_column(String(300))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class CapabilityPromotionRow(Base):
     __tablename__ = "capability_promotions"
     certification_id: Mapped[str] = mapped_column(
