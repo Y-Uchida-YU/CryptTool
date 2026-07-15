@@ -1,0 +1,6 @@
+{
+  "research_skip_reason": "snapshot was FINALIZED_NOT_ELIGIBLE because market capabilities were not LIVE_VERIFIED",
+  "research_status": "skipped_snapshot_ineligible",
+  "research_run_ids": [],
+  "run_id": "paper-operation-20260715T-r3-sample-v3"
+}

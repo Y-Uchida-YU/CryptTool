@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -49,6 +49,8 @@ class ResearchRepository(Protocol):
 
     def add_experimental_event(self, event: RawMarketEvent, support: str) -> bool: ...
 
+    def experimental_event_count(self) -> int: ...
+
     def save_raw_payload(
         self,
         *,
@@ -89,6 +91,10 @@ class ResearchRepository(Protocol):
     def get_checkpoint(
         self, venue: str, stream_key: str, checkpoint_namespace: str = "production"
     ) -> CollectionCheckpoint | None: ...
+
+    def list_checkpoints(
+        self, checkpoint_namespace: str = "production"
+    ) -> tuple[CollectionCheckpoint, ...]: ...
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None: ...
 
@@ -138,6 +144,12 @@ class NamespacedResearchRepository:
             venue, stream_key, checkpoint_namespace=self.checkpoint_namespace
         )
 
+    def list_checkpoints(
+        self, checkpoint_namespace: str = "production"
+    ) -> tuple[CollectionCheckpoint, ...]:
+        del checkpoint_namespace
+        return self.repository.list_checkpoints(self.checkpoint_namespace)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self.repository, name)
 
@@ -171,6 +183,9 @@ class InMemoryResearchRepository:
             return False
         self.experimental_events[event.event_id] = (event, support)
         return True
+
+    def experimental_event_count(self) -> int:
+        return len(self.experimental_events)
 
     def save_raw_payload(
         self,
@@ -284,6 +299,15 @@ class InMemoryResearchRepository:
         self, venue: str, stream_key: str, checkpoint_namespace: str = "production"
     ) -> CollectionCheckpoint | None:
         return self.checkpoints.get((checkpoint_namespace, venue, stream_key))
+
+    def list_checkpoints(
+        self, checkpoint_namespace: str = "production"
+    ) -> tuple[CollectionCheckpoint, ...]:
+        return tuple(
+            checkpoint
+            for (namespace, _, _), checkpoint in self.checkpoints.items()
+            if namespace == checkpoint_namespace
+        )
 
     def save_instrument_rule(self, rule: InstrumentRuleSnapshot) -> None:
         current = self.rules.get(rule.rule_snapshot_id)
@@ -421,6 +445,12 @@ class PostgreSQLResearchRepository:
             except IntegrityError:
                 session.rollback()
                 return False
+
+    def experimental_event_count(self) -> int:
+        with Session(self.engine) as session:
+            return int(
+                session.scalar(select(func.count()).select_from(ExperimentalMarketEventRow)) or 0
+            )
 
     def save_raw_payload(
         self,
@@ -723,6 +753,25 @@ class PostgreSQLResearchRepository:
                 last_recovery_failure=row.last_recovery_failure,
                 checkpoint_namespace=row.checkpoint_namespace,
             )
+
+    def list_checkpoints(
+        self, checkpoint_namespace: str = "production"
+    ) -> tuple[CollectionCheckpoint, ...]:
+        with Session(self.engine) as session:
+            rows = session.scalars(
+                select(MarketDataCheckpointRow).where(
+                    MarketDataCheckpointRow.checkpoint_namespace == checkpoint_namespace
+                )
+            ).all()
+        output: list[CollectionCheckpoint] = []
+        for row in rows:
+            stream_key = row.stream_key
+            if checkpoint_namespace != "production" and "::" in stream_key:
+                stream_key = stream_key.split("::", 1)[1]
+            checkpoint = self.get_checkpoint(row.venue, stream_key, checkpoint_namespace)
+            if checkpoint is not None:
+                output.append(checkpoint)
+        return tuple(output)
 
     @staticmethod
     def _checkpoint_storage_key(stream_key: str, checkpoint_namespace: str) -> str:

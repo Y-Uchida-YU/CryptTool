@@ -1,0 +1,38 @@
+[
+  {
+    "data_snapshot_id": "snapshot-20260714T172059Z-4f53cda18c2b",
+    "evaluated_at": "2026-07-14 17:22:01.453088+00:00",
+    "expires_at": "2026-07-15 18:22:01.453088+00:00",
+    "reasons": [
+      "research evidence is incomplete"
+    ],
+    "research_run_id": "UNAVAILABLE",
+    "status": "insufficient_evidence",
+    "strategy_id": "btc_sol_relative_strength",
+    "strategy_version": "1"
+  },
+  {
+    "data_snapshot_id": "snapshot-20260714T172059Z-4f53cda18c2b",
+    "evaluated_at": "2026-07-14 17:22:01.451501+00:00",
+    "expires_at": "2026-07-15 18:22:01.451501+00:00",
+    "reasons": [
+      "research evidence is incomplete"
+    ],
+    "research_run_id": "UNAVAILABLE",
+    "status": "insufficient_evidence",
+    "strategy_id": "cross_venue_basis",
+    "strategy_version": "1"
+  },
+  {
+    "data_snapshot_id": "snapshot-20260714T172059Z-4f53cda18c2b",
+    "evaluated_at": "2026-07-14 17:22:01.449563+00:00",
+    "expires_at": "2026-07-15 18:22:01.449563+00:00",
+    "reasons": [
+      "research evidence is incomplete"
+    ],
+    "research_run_id": "UNAVAILABLE",
+    "status": "insufficient_evidence",
+    "strategy_id": "funding_carry",
+    "strategy_version": "1"
+  }
+]

@@ -1,11 +1,25 @@
+import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
+from sqlalchemy import create_engine
 from typer.testing import CliRunner
 
+import app.cli.main as cli
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.cli.main import app
+from app.config.settings import Settings
+from app.infrastructure.database.models import Base
+from app.services.research.collector_runs import CollectorRunRecord, CollectorRunStatus
+from app.services.research.models import RawMarketEvent
+from app.services.research.repository import PostgreSQLResearchRepository
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 runner = CliRunner()
@@ -166,3 +180,230 @@ def test_collector_health_report_cli(tmp_path: Path, monkeypatch: pytest.MonkeyP
     summary = (directory / "summary.md").read_text(encoding="utf-8")
     assert "Live execution: OFF" in summary
     assert "Checkpoint lag seconds: 0.1" in summary
+
+
+def test_start_paper_operation_binds_r2_collector_and_r3_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'operation.db'}")
+    Base.metadata.create_all(engine)
+    research_repository = PostgreSQLResearchRepository(engine)
+    for venue, payload in (
+        (
+            "hyperliquid",
+            {"bids": [{"px": "99", "sz": "2"}], "asks": [{"px": "100", "sz": "3"}]},
+        ),
+        ("bitget", {"levels": [[["99", "2"]], [["100", "3"]]]}),
+    ):
+        raw_payload = json.dumps(payload)
+        now = datetime.now(UTC)
+        research_repository.add_raw_event(
+            RawMarketEvent(
+                event_id=f"{venue}-book",
+                venue=venue,
+                canonical_instrument_id="BTC",
+                venue_symbol="BTC",
+                event_type="orderbook_snapshot",
+                exchange_timestamp=now,
+                received_at=now,
+                available_at=now,
+                sequence=1,
+                connection_id=uuid4(),
+                reconciliation_state=ReconciliationState.SYNCHRONIZED,
+                payload_sha256=hashlib.sha256(raw_payload.encode()).hexdigest(),
+                raw_payload=raw_payload,
+                normalizer_version="test",
+                capability_verification_run_id="verified",
+                created_at=now,
+            )
+        )
+    config = tmp_path / "operation.yaml"
+    config.write_text("continuous_paper: {enabled: true}\n", encoding="utf-8")
+    token = tmp_path / "run.token"
+    token.write_text("opaque", encoding="utf-8")
+    configured = Settings(
+        database_url="postgresql+psycopg://localhost/cryptbot",
+        paper_trading=True,
+        live_trading=False,
+        paper={"enabled": True},
+        live={"enabled": False},
+        continuous_paper={"enabled": True, "observation_only": True},
+        research_collection={
+            "collection_enabled": True,
+            "venues": ("hyperliquid", "bitget"),
+            "instruments": ("BTC", "ETH", "SOL", "HYPE"),
+            "event_types": ("orderbook_snapshot",),
+            "require_complete_instrument_rules": False,
+        },
+    )
+
+    class Adapter:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+            self.capabilities = ()
+
+    captured: dict[str, object] = {}
+
+    async def run_once(**kwargs: object) -> None:
+        service = kwargs["service"]
+        captured["service"] = service
+        captured["duration_seconds"] = kwargs["duration_seconds"]
+        snapshot = service.snapshot_action(datetime.now(UTC))
+        assert snapshot.snapshot_id.startswith("snapshot-")
+        captured["snapshot_id"] = snapshot.snapshot_id
+
+    class Capital:
+        evidence_complete = True
+
+        @staticmethod
+        def feasible_at(_amount: object) -> bool:
+            return True
+
+    class Pipeline:
+        def __init__(self, _repository: object) -> None:
+            pass
+
+        @staticmethod
+        def run(config: dict[str, object]) -> SimpleNamespace:
+            return SimpleNamespace(
+                identity=SimpleNamespace(run_id=f"research-{config['strategy_id']}"),
+                acceptance_result=SimpleNamespace(
+                    verdict=SimpleNamespace(value="PASS"), capital_feasibility=Capital()
+                ),
+                data_quality=SimpleNamespace(passed=True),
+                cost_stress_result=SimpleNamespace(evidence_complete=True),
+                overfitting_result=SimpleNamespace(evidence_complete=True),
+            )
+
+    monkeypatch.setattr(cli, "_settings_from_yaml", lambda _: configured)
+    monkeypatch.setattr(cli, "build_engine", lambda _: engine)
+    monkeypatch.setattr(cli, "_research_data_adapter", lambda venue: Adapter(venue))
+    monkeypatch.setattr(
+        cli.TrustedCapabilityRegistry, "from_artifacts", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(cli, "_database_identity", lambda _: ("db", "main"))
+    monkeypatch.setattr(cli, "_process_identity", lambda _: (datetime.now(UTC), "c" * 64))
+    monkeypatch.setattr(cli, "_create_collector_run_token", lambda _: (token, "d" * 64))
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(cli, "_run_continuous_operation", run_once)
+    monkeypatch.setattr(cli, "ResearchPipeline", Pipeline)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "start-paper-operation",
+            "--config",
+            str(config),
+            "--run-id",
+            "operation-r3",
+            "--duration-minutes",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "live_execution=false" in result.output
+    assert captured["service"] is not None
+    assert captured["duration_seconds"] == 1800
+    live_events = captured["service"].market_event_action()
+    assert len(live_events) == 2
+    assert all(item.reconciliation_state == "synchronized" for item in live_events)
+    outcomes = captured["service"].research_action(captured["snapshot_id"])
+    assert len(outcomes) == 3 and all(item.research_verdict == "PASS" for item in outcomes)
+    assert not token.exists()
+
+
+@pytest.mark.asyncio
+async def test_continuous_operation_duration_stops_and_persists_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+
+    class Service:
+        def __init__(self) -> None:
+            self.stop_event = stop_event
+
+        async def run(self) -> None:
+            await self.stop_event.wait()
+
+        def request_stop(self) -> None:
+            self.stop_event.set()
+
+        def set_collector_health(self, *_args: object) -> None:
+            raise AssertionError("duration timer must stop the service first")
+
+    class Collector:
+        stopped = False
+
+        def shutdown(self) -> None:
+            self.stopped = True
+
+    started_at = datetime.now(UTC)
+    run = CollectorRunRecord(
+        run_id="duration-run",
+        collector_group="group",
+        owner_id="host:1",
+        commit_sha="a" * 40,
+        config_path="/tmp/config.yaml",
+        database_identity="db",
+        schema_name="public",
+        checkpoint_namespace="production",
+        artifact_namespace="artifacts/operations/duration-run",
+        venues=("hyperliquid", "bitget"),
+        instruments=("BTC",),
+        event_types=("orderbook_snapshot",),
+        duration_seconds=0.001,
+        pid=1,
+        process_started_at=started_at,
+        hostname="host",
+        command_sha256="b" * 64,
+        run_token_sha256="c" * 64,
+        status=CollectorRunStatus.RUNNING,
+        started_at=started_at,
+        heartbeat_at=started_at,
+    )
+
+    class Leases:
+        saved = run
+
+        def get_run(self, _run_id: str) -> CollectorRunRecord:
+            return self.saved
+
+        def save_run(self, value: CollectorRunRecord) -> None:
+            self.saved = value
+
+    async def run_collector(**kwargs: object) -> None:
+        await kwargs["stop_request"].wait()
+
+    monkeypatch.setattr(cli, "_run_collector_with_lease", run_collector)
+    collector = Collector()
+    leases = Leases()
+    await cli._run_continuous_operation(
+        service=Service(),
+        collector=collector,
+        lease_repository=leases,
+        groups=("group",),
+        collector_run=run,
+        duration_seconds=0.001,
+    )
+
+    assert collector.stopped
+    assert leases.saved.status is CollectorRunStatus.COMPLETED
+    assert leases.saved.stopped_at is not None
+
+
+def test_yaml_settings_honor_runtime_database_and_live_safety_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "settings.yaml"
+    config.write_text(
+        "database_url: sqlite:///ignored.db\nlive_trading: false\nlive: {enabled: false}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APP_DATABASE_URL", "postgresql+psycopg://runtime/cryptbot")
+    monkeypatch.setenv("APP_LIVE_TRADING", "true")
+    monkeypatch.setenv("APP_LIVE__ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="live mode requires"):
+        cli._settings_from_yaml(config)

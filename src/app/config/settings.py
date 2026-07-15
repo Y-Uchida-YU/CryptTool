@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -145,6 +146,39 @@ class ResearchCollectionSettings(BaseModel):
     require_complete_instrument_rules: bool = True
 
 
+class ContinuousPaperSettings(BaseModel):
+    enabled: bool = False
+    observation_only: bool = True
+    venues: tuple[str, ...] = ("hyperliquid", "bitget")
+    instruments: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE")
+    strategies: tuple[str, ...] = (
+        "funding_carry",
+        "cross_venue_basis",
+        "btc_sol_relative_strength",
+    )
+    operational_snapshot_interval_seconds: int = Field(3600, ge=60)
+    daily_snapshot_hour_utc: int = Field(0, ge=0, le=23)
+    daily_snapshot_minute_utc: int = Field(5, ge=0, le=59)
+    daily_report_hour_utc: int = Field(0, ge=0, le=23)
+    daily_report_minute_utc: int = Field(30, ge=0, le=59)
+    signal_interval_seconds: int = Field(30, ge=1)
+    risk_interval_seconds: int = Field(10, ge=1)
+    eligibility_ttl_seconds: int = Field(90000, ge=60)
+    source_event_max_age_seconds: int = Field(30, ge=1, le=3600)
+    minimum_data_quality: float = Field(0.90, ge=0.8, le=1)
+    initial_capitals: tuple[Decimal, ...] = (
+        Decimal("100"),
+        Decimal("300"),
+        Decimal("1000"),
+    )
+    maximum_single_trade_risk: Decimal = Field(Decimal("0.0025"), gt=0, le=0.01)
+    maximum_venue_exposure: Decimal = Field(Decimal("0.50"), gt=0, le=1)
+    maximum_instrument_exposure: Decimal = Field(Decimal("0.40"), gt=0, le=1)
+    maximum_daily_loss: Decimal = Field(Decimal("0.02"), gt=0, le=0.05)
+    maximum_drawdown: Decimal = Field(Decimal("0.05"), gt=0, le=0.20)
+    discord_webhook_url: SecretStr | None = None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="APP_",
@@ -174,6 +208,9 @@ class Settings(BaseSettings):
     live: LiveTradingSettings = Field(default_factory=LiveTradingSettings)  # type: ignore[arg-type]
     research_collection: ResearchCollectionSettings = Field(
         default_factory=ResearchCollectionSettings  # type: ignore[arg-type]
+    )
+    continuous_paper: ContinuousPaperSettings = Field(
+        default_factory=ContinuousPaperSettings  # type: ignore[arg-type]
     )
     exchanges: tuple[ExchangeSettings, ...] = (
         ExchangeSettings(name="bybit_public", data_enabled=False),

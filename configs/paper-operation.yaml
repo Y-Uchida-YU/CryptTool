@@ -1,0 +1,39 @@
+environment: production
+database_url: postgresql+psycopg://localhost:5432/cryptbot
+paper_trading: true
+live_trading: false
+dry_run: true
+symbols: [BTC, ETH, SOL, HYPE]
+paper:
+  enabled: true
+live:
+  enabled: false
+  adapter_name: disabled
+  allowed_symbols: [BTC, ETH, SOL, HYPE]
+continuous_paper:
+  enabled: true
+  observation_only: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC, ETH, SOL, HYPE]
+  strategies: [funding_carry, cross_venue_basis, btc_sol_relative_strength]
+research_collection:
+  collection_enabled: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC, ETH, SOL, HYPE]
+venues:
+  hyperliquid:
+    data_enabled: true
+    execution_enabled: false
+    eligibility_status: data_only
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    api_market_data_available: true
+    reason: public data only
+  bitget:
+    data_enabled: true
+    execution_enabled: false
+    eligibility_status: data_only
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    api_market_data_available: true
+    reason: public data only

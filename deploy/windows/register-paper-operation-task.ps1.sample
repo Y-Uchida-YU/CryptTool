@@ -1,0 +1,35 @@
+param(
+    [Parameter(Mandatory = $true)] [string] $ProjectDirectory,
+    [Parameter(Mandatory = $true)] [string] $DatabaseUrl
+)
+
+$ErrorActionPreference = "Stop"
+$app = Join-Path $ProjectDirectory ".venv\Scripts\app.exe"
+$config = Join-Path $ProjectDirectory "configs\paper-operation.yaml"
+$arguments = "start-paper-operation --config `"$config`""
+
+$action = New-ScheduledTaskAction `
+    -Execute $app `
+    -Argument $arguments `
+    -WorkingDirectory $ProjectDirectory
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType S4U `
+    -RunLevel Limited
+
+[Environment]::SetEnvironmentVariable("APP_DATABASE_URL", $DatabaseUrl, "User")
+[Environment]::SetEnvironmentVariable("APP_LIVE_TRADING", "false", "User")
+[Environment]::SetEnvironmentVariable("APP_LIVE__ENABLED", "false", "User")
+
+Register-ScheduledTask `
+    -TaskName "CryptTool Paper Operation" `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -Principal $principal `
+    -Force

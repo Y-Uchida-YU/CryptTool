@@ -1,0 +1,90 @@
+{
+  "run_id": "paper-operation-20260715T-r3-sample-v3",
+  "commit_sha": "b212f7520227a3b40c9352f739d36f29cb296d4b",
+  "mode": "observation_only",
+  "start_time": "2026-07-14T17:20:59.392445+00:00",
+  "end_time": "2026-07-14T18:22:32.005576+00:00",
+  "actual_duration_seconds": 3692.613131,
+  "collector_run_status": "COMPLETED",
+  "operational_run_status": "stopped",
+  "collector_health_status": "insufficient_evidence",
+  "remaining_lease_count": 0,
+  "checkpoint_count": 90,
+  "synchronized_checkpoint_count": 86,
+  "shutdown_disconnected_checkpoint_count": 4,
+  "checkpoint_flush_completed_at": "2026-07-14T18:22:30.969407+00:00",
+  "production_event_count": 84,
+  "production_market_event_count": 0,
+  "production_control_event_count": 84,
+  "experimental_event_count": 301260,
+  "quarantine_count": 0,
+  "collection_failure_count": 77,
+  "collection_failure_classification": {
+    "status": "insufficient_evidence",
+    "by_venue": {
+      "bitget": 36,
+      "hyperliquid": 41
+    },
+    "by_event_type": {
+      "funding_current": 19,
+      "funding_history": 17,
+      "ohlcv": 26,
+      "open_interest": 15
+    },
+    "by_error_type": {
+      "historical_error_type_not_persisted": 77
+    },
+    "reason": "the historical run did not persist error type or instrument breakdown; no failures are assumed to be expected skips"
+  },
+  "events_by_venue": {
+    "bitget": {
+      "production": 51,
+      "experimental": 259067
+    },
+    "hyperliquid": {
+      "production": 33,
+      "experimental": 42193
+    }
+  },
+  "experimental_events_by_instrument": {
+    "bitget": {
+      "BTC": 82540,
+      "ETH": 57510,
+      "SOL": 62435,
+      "HYPE": 56582
+    },
+    "hyperliquid": {
+      "BTC": 13836,
+      "ETH": 8205,
+      "SOL": 5092,
+      "HYPE": 15060
+    }
+  },
+  "snapshot_id": "snapshot-20260714T172059Z-4f53cda18c2b",
+  "snapshot_manifest_sha256": "14b0526bb6f1d88e945c475ec88ec594e2f15dbb2ca659f55b78bca610205968",
+  "snapshot_eligibility": "FINALIZED_NOT_ELIGIBLE",
+  "snapshot_eligibility_reason": "market capabilities were not LIVE_VERIFIED and remained experimental",
+  "research_run_ids": [],
+  "research_status": "skipped_snapshot_ineligible",
+  "research_skip_reason": "market capabilities were not LIVE_VERIFIED and remained experimental",
+  "strategy_eligibility": {
+    "funding_carry": "insufficient_evidence",
+    "cross_venue_basis": "insufficient_evidence",
+    "btc_sol_relative_strength": "insufficient_evidence"
+  },
+  "signal_count": 0,
+  "candidate_signal_reason": "historical service stopped SignalScheduler before eligibility; fixed implementation now persists rejected candidates",
+  "paper_order_count": 0,
+  "paper_fill_count": 0,
+  "paper_pnl": "0",
+  "implementation_shortfall": "0",
+  "portfolio_results": {
+    "100_USD": "insufficient_evidence",
+    "300_USD": "insufficient_evidence",
+    "1000_USD": "insufficient_evidence"
+  },
+  "promotion_verdict": "not_ready",
+  "live_execution": "OFF",
+  "execution_credentials_loaded": false,
+  "verdict": "PASS_WITH_INSUFFICIENT_RESEARCH_EVIDENCE"
+}
