@@ -53,11 +53,17 @@ from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
 from app.services.capability_audit import CapabilityContractAuditor
 from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
-from app.services.operations.models import LiveSignalInput, OperationalRunStatus
+from app.services.operations.collector_health import summarize_collector_health
+from app.services.operations.models import (
+    CollectorHealthSummary,
+    LiveSignalInput,
+    OperationalRunStatus,
+)
 from app.services.operations.repository import PostgreSQLOperationalRepository
 from app.services.operations.service import (
     ContinuousResearchPaperService,
     ScheduledResearchOutcome,
+    ScheduledSnapshotOutcome,
 )
 from app.services.paper_trading.broker import PaperBroker
 from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
@@ -1663,6 +1669,7 @@ def paper_trade(
 def start_paper_operation(
     config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
     run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    duration_minutes: Annotated[float | None, typer.Option("--duration-minutes", min=0.1)] = None,
 ) -> None:
     """Start durable R3 observation/paper workers; never contacts an execution API."""
     settings = _settings_from_yaml(config)
@@ -1712,7 +1719,7 @@ def start_paper_operation(
             venues=collection.venues,
             instruments=collection.instruments,
             event_types=collection.event_types,
-            duration_seconds=None,
+            duration_seconds=duration_minutes * 60 if duration_minutes is not None else None,
             pid=os.getpid(),
             process_started_at=process_started_at,
             hostname=socket.gethostname(),
@@ -1749,7 +1756,7 @@ def start_paper_operation(
             stale_after_seconds=collection.stale_after_seconds,
         )
 
-        def finalize_snapshot(cutoff_at: datetime) -> str:
+        def finalize_snapshot(cutoff_at: datetime) -> ScheduledSnapshotOutcome:
             manifest = DataSnapshotService(research_repository).finalize(
                 cutoff_at=cutoff_at,
                 eligibility_policy=SnapshotEligibilityPolicy(
@@ -1765,7 +1772,11 @@ def start_paper_operation(
                 Path("artifacts/data-snapshots") / manifest.snapshot_id / "manifest.json",
                 manifest,
             )
-            return manifest.snapshot_id
+            return ScheduledSnapshotOutcome(
+                snapshot_id=manifest.snapshot_id,
+                research_eligible=(manifest.eligibility_status == "FINALIZED_RESEARCH_ELIGIBLE"),
+                eligibility_reasons=manifest.eligibility_reasons,
+            )
 
         def run_research(snapshot_id: str) -> tuple[ScheduledResearchOutcome, ...]:
             manifest = research_repository.snapshot_manifest(snapshot_id)
@@ -1892,6 +1903,27 @@ def start_paper_operation(
                 )
             return tuple(events)
 
+        def collector_health() -> CollectorHealthSummary:
+            raw_events = research_repository.raw_events()
+            control_types = {
+                "venue_health",
+                "websocket_disconnect",
+                "sequence_gap",
+                "stale_stream",
+            }
+            return summarize_collector_health(
+                failures=research_repository.collection_failures(),
+                checkpoints=research_repository.list_checkpoints(),
+                now=datetime.now(UTC),
+                production_market_event_count=sum(
+                    item.event_type not in control_types for item in raw_events
+                ),
+                production_control_event_count=sum(
+                    item.event_type in control_types for item in raw_events
+                ),
+                experimental_market_event_count=(research_repository.experimental_event_count()),
+            )
+
         service = ContinuousResearchPaperService(
             repository=PostgreSQLOperationalRepository(engine),
             settings=settings,
@@ -1901,6 +1933,7 @@ def start_paper_operation(
             snapshot_action=finalize_snapshot,
             research_action=run_research,
             market_event_action=live_market_events,
+            collector_health_action=collector_health,
         )
         service.set_collector_health(True)
         typer.echo(f"run_id={resolved_run_id} mode={service.mode.value} live_execution=false")
@@ -1911,6 +1944,7 @@ def start_paper_operation(
                 lease_repository=lease_repository,
                 groups=groups,
                 collector_run=collector_run,
+                duration_seconds=(duration_minutes * 60 if duration_minutes is not None else None),
             )
         )
     finally:
@@ -1926,6 +1960,7 @@ async def _run_continuous_operation(
     lease_repository: SQLCollectorLeaseRepository,
     groups: tuple[str, ...],
     collector_run: CollectorRunRecord,
+    duration_seconds: float | None = None,
 ) -> None:
     """Bind the R2 collector lifecycle to R3; either side stopping stops both."""
     collector_task = asyncio.create_task(
@@ -1940,9 +1975,18 @@ async def _run_continuous_operation(
         name="continuous-r2-collector",
     )
     service_task = asyncio.create_task(service.run(), name="continuous-paper-service")
-    done, _ = await asyncio.wait(
-        {collector_task, service_task}, return_when=asyncio.FIRST_COMPLETED
+    timer_task = (
+        asyncio.create_task(asyncio.sleep(duration_seconds), name="continuous-operation-timer")
+        if duration_seconds is not None
+        else None
     )
+    monitored = {collector_task, service_task}
+    if timer_task is not None:
+        monitored.add(timer_task)
+    done, _ = await asyncio.wait(monitored, return_when=asyncio.FIRST_COMPLETED)
+    if timer_task is not None and timer_task in done:
+        service.request_stop()
+        collector.shutdown()
     if collector_task in done and not service.stop_event.is_set():
         service.set_collector_health(False, "collector_stopped")
         service.request_stop()
@@ -1950,6 +1994,9 @@ async def _run_continuous_operation(
         service.stop_event.set()
         collector.shutdown()
     results = await asyncio.gather(collector_task, service_task, return_exceptions=True)
+    if timer_task is not None and not timer_task.done():
+        timer_task.cancel()
+        await asyncio.gather(timer_task, return_exceptions=True)
     failures = [item for item in results if isinstance(item, BaseException)]
     if failures:
         raise failures[0]

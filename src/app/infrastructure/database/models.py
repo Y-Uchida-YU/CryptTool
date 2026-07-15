@@ -363,6 +363,8 @@ class OperationalRunRow(Base):
     last_research_run_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     signals_paused_reason: Mapped[str | None] = mapped_column(String(500))
     failure_reason: Mapped[str | None] = mapped_column(String(1000))
+    research_status: Mapped[str] = mapped_column(String(50), default="not_scheduled")
+    research_skip_reason: Mapped[str | None] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -379,6 +381,7 @@ class StrategyEligibilityRow(Base):
     evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     reasons_json: Mapped[str] = mapped_column(Text)
+    capital_feasibility_status: Mapped[str] = mapped_column(String(40), default="not_evaluated")
     commit_sha: Mapped[str] = mapped_column(String(80))
     config_sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -396,6 +399,7 @@ class PaperSignalRow(Base):
     instrument: Mapped[str] = mapped_column(String(100), index=True)
     payload_json: Mapped[str] = mapped_column(Text)
     rejection_reason: Mapped[str | None] = mapped_column(String(1000))
+    disposition: Mapped[str] = mapped_column(String(50), default="candidate", index=True)
     signal_hash: Mapped[str] = mapped_column(String(64))
     commit_sha: Mapped[str] = mapped_column(String(80))
     config_sha256: Mapped[str] = mapped_column(String(64))

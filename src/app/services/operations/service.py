@@ -15,6 +15,9 @@ from app.adapters.notifications.base import NotificationAdapter, NullNotificatio
 from app.config.settings import ContinuousPaperSettings, Settings
 from app.domain.market_data.models import Side
 from app.services.operations.models import (
+    CapitalFeasibilityStatus,
+    CollectorHealthStatus,
+    CollectorHealthSummary,
     DailyOperationReport,
     LiveSignalInput,
     OperationalIdentity,
@@ -32,6 +35,8 @@ from app.services.operations.models import (
     PaperRiskEvent,
     PaperSignal,
     PortfolioState,
+    ResearchExecutionStatus,
+    SignalDisposition,
     StrategyEligibilityRecord,
     StrategyEligibilityStatus,
     canonical_sha256,
@@ -97,6 +102,13 @@ class ScheduledResearchOutcome:
     evidence_complete: bool
 
 
+@dataclass(frozen=True)
+class ScheduledSnapshotOutcome:
+    snapshot_id: str
+    research_eligible: bool
+    eligibility_reasons: tuple[str, ...] = ()
+
+
 class ContinuousResearchPaperService:
     """Durable orchestration for collection-to-paper operation.
 
@@ -116,9 +128,10 @@ class ContinuousResearchPaperService:
         local_smoke: bool = False,
         artifact_root: Path = Path("artifacts/operations"),
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
-        snapshot_action: Callable[[datetime], str] | None = None,
+        snapshot_action: Callable[[datetime], str | ScheduledSnapshotOutcome] | None = None,
         research_action: Callable[[str], Sequence[ScheduledResearchOutcome]] | None = None,
         market_event_action: Callable[[], Sequence[LiveSignalInput]] | None = None,
+        collector_health_action: Callable[[], CollectorHealthSummary] | None = None,
     ) -> None:
         self.repository = repository
         self.settings = settings
@@ -138,7 +151,24 @@ class ContinuousResearchPaperService:
         self.snapshot_action = snapshot_action
         self.research_action = research_action
         self.market_event_action = market_event_action
+        self.collector_health_action = collector_health_action
         self.stop_event = asyncio.Event()
+        self._collector_health = CollectorHealthSummary(
+            status=CollectorHealthStatus.INSUFFICIENT_EVIDENCE,
+            total_failures=0,
+            fatal_failures=0,
+            degraded_failures=0,
+            expected_skips=0,
+            failures_by_venue={},
+            failures_by_instrument={},
+            failures_by_event_type={},
+            failures_by_error_type={},
+            permanently_degraded_streams=0,
+            recovery_required_streams=0,
+            checkpoint_lag_max_seconds=None,
+            last_healthy_at=None,
+            reasons=("health summary not yet evaluated",),
+        )
         self._latest_events: dict[tuple[str, str, str], LiveSignalInput] = {}
         self._portfolio_states: dict[str, PortfolioState] = {}
         self._validate_startup()
@@ -285,6 +315,14 @@ class ContinuousResearchPaperService:
                 updated_at=self.now(),
             )
         )
+        if self.collector_health_action is None:
+            self._collector_health = replace(
+                self._collector_health,
+                status=(
+                    CollectorHealthStatus.HEALTHY if healthy else CollectorHealthStatus.UNHEALTHY
+                ),
+                reasons=() if healthy else (pause or "collector_unhealthy",),
+            )
 
     def bind_snapshot(self, snapshot_id: str, research_run_ids: Sequence[str] = ()) -> None:
         if not snapshot_id:
@@ -295,6 +333,8 @@ class ContinuousResearchPaperService:
                 run,
                 last_snapshot_id=snapshot_id,
                 last_research_run_ids=tuple(research_run_ids),
+                research_status=ResearchExecutionStatus.NOT_SCHEDULED,
+                research_skip_reason=None,
                 signals_paused_reason=None if run.collector_healthy else run.signals_paused_reason,
                 updated_at=self.now(),
             )
@@ -322,18 +362,23 @@ class ContinuousResearchPaperService:
         reasons: list[str] = []
         if not evidence_complete:
             status = StrategyEligibilityStatus.INSUFFICIENT_EVIDENCE
+            capital_status = CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE
             reasons.append("research evidence is incomplete")
         elif not data_quality_passed:
             status = StrategyEligibilityStatus.DATA_QUALITY_FAILED
+            capital_status = CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE
             reasons.append("data quality gate failed")
         elif research_verdict != "PASS":
             status = StrategyEligibilityStatus.RESEARCH_FAILED
+            capital_status = CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE
             reasons.append(f"research verdict={research_verdict}")
         elif not capital_feasible:
             status = StrategyEligibilityStatus.CAPITAL_INFEASIBLE
+            capital_status = CapitalFeasibilityStatus.INFEASIBLE
             reasons.append("capital feasibility gate failed")
         else:
             status = StrategyEligibilityStatus.ELIGIBLE
+            capital_status = CapitalFeasibilityStatus.FEASIBLE
         record = StrategyEligibilityRecord(
             strategy_id=strategy_id,
             strategy_version=strategy_version,
@@ -343,6 +388,7 @@ class ContinuousResearchPaperService:
             evaluated_at=now,
             expires_at=now + timedelta(seconds=self.operation_settings.eligibility_ttl_seconds),
             reasons=tuple(reasons),
+            capital_feasibility_status=capital_status,
         )
         self.repository.save_eligibility(
             self.run_id,
@@ -384,6 +430,7 @@ class ContinuousResearchPaperService:
             None,
         )
         rejection = self._signal_rejection(run, eligibility, events, instrument, decision_time)
+        disposition = self._signal_disposition(rejection, eligibility)
         snapshot_id = (
             eligibility.data_snapshot_id if eligibility else run.last_snapshot_id or "UNASSIGNED"
         )
@@ -429,6 +476,7 @@ class ContinuousResearchPaperService:
             expected_impact=expected_impact,
             required_capabilities=required_capabilities,
             source_event_ids=tuple(item.event_id for item in events),
+            disposition=disposition,
             rejection_reason=rejection,
         )
         self.repository.add_signal(signal)
@@ -456,6 +504,8 @@ class ContinuousResearchPaperService:
             return f"eligibility_{eligibility.status.value}_or_expired"
         if not events:
             return "missing_source_events"
+        if len({event.venue for event in events}) < 2:
+            return "missing_cross_venue_leg"
         if len({event.event_id for event in events}) != len(events):
             return "duplicate_source_event"
         maximum_age = timedelta(seconds=self.operation_settings.source_event_max_age_seconds)
@@ -475,6 +525,30 @@ class ContinuousResearchPaperService:
             ):
                 return "orderbook_unsynchronized"
         return None
+
+    @staticmethod
+    def _signal_disposition(
+        rejection: str | None,
+        eligibility: StrategyEligibilityRecord | None,
+    ) -> SignalDisposition:
+        if rejection is None:
+            return SignalDisposition.ELIGIBLE
+        if rejection in {"missing_source_events", "missing_cross_venue_leg"}:
+            return SignalDisposition.CANDIDATE
+        if "capability" in rejection:
+            return SignalDisposition.REJECTED_CAPABILITY
+        if rejection == "eligibility_capital_infeasible_or_expired" or (
+            eligibility is not None
+            and eligibility.status is StrategyEligibilityStatus.CAPITAL_INFEASIBLE
+        ):
+            return SignalDisposition.REJECTED_CAPITAL
+        if rejection.startswith("eligibility_") or rejection in {
+            "missing_strategy_eligibility",
+            "eligibility_snapshot_mismatch",
+            "no_current_snapshot",
+        }:
+            return SignalDisposition.REJECTED_RESEARCH
+        return SignalDisposition.REJECTED_DATA_QUALITY
 
     def execute_signal(
         self,
@@ -943,12 +1017,14 @@ class ContinuousResearchPaperService:
             self.repository.save_daily_metric(metric)
             metrics.append(metric)
         attribution = self.compute_attribution(report_date)
+        eligibility = self.repository.eligibility(self.run_id)
+        capital_status = self._capital_feasibility_status(eligibility, signals)
         report = DailyOperationReport(
             run_id=self.run_id,
             report_date=report_date,
             snapshot_id=run.last_snapshot_id,
             research_run_ids=run.last_research_run_ids,
-            eligibility=self.repository.eligibility(self.run_id),
+            eligibility=eligibility,
             signal_count=len(signals),
             rejected_signal_count=sum(item.rejection_reason is not None for item in signals),
             paper_order_count=len(self.repository.orders(self.run_id)),
@@ -957,15 +1033,42 @@ class ContinuousResearchPaperService:
             attribution=attribution,
             risk_events=self.repository.risk_events(self.run_id),
             promotion_verdict=self.promotion_verdict(),
-            collector_healthy=run.collector_healthy,
+            collector_health=self._collector_health,
+            research_status=run.research_status,
+            research_skip_reason=run.research_skip_reason,
+            capital_feasibility={
+                state.portfolio_id: capital_status for state in self._portfolio_states.values()
+            },
         )
         self._write_report(report)
         return report
+
+    @staticmethod
+    def _capital_feasibility_status(
+        eligibility: Sequence[StrategyEligibilityRecord],
+        signals: Sequence[PaperSignal],
+    ) -> CapitalFeasibilityStatus:
+        if not eligibility:
+            return CapitalFeasibilityStatus.NOT_EVALUATED
+        if any(
+            item.capital_feasibility_status is CapitalFeasibilityStatus.INFEASIBLE
+            for item in eligibility
+        ):
+            return CapitalFeasibilityStatus.INFEASIBLE
+        if not signals:
+            return CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE
+        if any(item.disposition is SignalDisposition.ELIGIBLE for item in signals) and any(
+            item.capital_feasibility_status is CapitalFeasibilityStatus.FEASIBLE
+            for item in eligibility
+        ):
+            return CapitalFeasibilityStatus.FEASIBLE
+        return CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE
 
     def _write_report(self, report: DailyOperationReport) -> None:
         directory = self.artifact_root / report.report_date.isoformat()
         directory.mkdir(parents=True, exist_ok=True)
         fills = self.repository.fills(self.run_id)
+        signals = self.repository.signals(self.run_id)
         pnl_by_strategy: dict[str, Decimal] = {}
         cost_by_venue: dict[str, Decimal] = {}
         cost_by_instrument: dict[str, Decimal] = {}
@@ -979,10 +1082,15 @@ class ContinuousResearchPaperService:
                 cost_by_instrument.get(fill.instrument, Decimal("0")) + net_cost
             )
         payloads = {
-            "collector-health.json": {"run_id": self.run_id, "healthy": report.collector_healthy},
+            "collector-health.json": {
+                "run_id": self.run_id,
+                **asdict(report.collector_health),
+            },
             "snapshot-summary.json": {"run_id": self.run_id, "snapshot_id": report.snapshot_id},
             "research-summary.json": {
                 "run_id": self.run_id,
+                "research_status": report.research_status.value,
+                "research_skip_reason": report.research_skip_reason,
                 "research_run_ids": report.research_run_ids,
             },
             "strategy-eligibility.json": [asdict(item) for item in report.eligibility],
@@ -990,6 +1098,19 @@ class ContinuousResearchPaperService:
                 "run_id": self.run_id,
                 "signal_count": report.signal_count,
                 "rejected_signal_count": report.rejected_signal_count,
+                "signals_by_disposition": {
+                    disposition.value: sum(
+                        item.disposition is disposition
+                        for item in self.repository.signals(self.run_id)
+                    )
+                    for disposition in SignalDisposition
+                },
+                "rejection_reasons": {
+                    reason: sum(item.rejection_reason == reason for item in signals)
+                    for reason in sorted(
+                        {item.rejection_reason for item in signals if item.rejection_reason}
+                    )
+                },
                 "paper_order_count": report.paper_order_count,
                 "paper_fill_count": report.paper_fill_count,
                 "metrics": [asdict(item) for item in report.metrics],
@@ -997,9 +1118,7 @@ class ContinuousResearchPaperService:
                 "cost_by_venue": cost_by_venue,
                 "cost_by_instrument": cost_by_instrument,
                 "capital_feasibility": {
-                    item.portfolio_id: not item.portfolio_id.endswith("100")
-                    or item.ending_equity >= Decimal("100")
-                    for item in report.metrics
+                    key: value.value for key, value in report.capital_feasibility.items()
                 },
                 "promotion_verdict": report.promotion_verdict.value,
             },
@@ -1018,7 +1137,8 @@ class ContinuousResearchPaperService:
             f"# Daily Paper Operation — {report.report_date.isoformat()}\n\n"
             f"- Run ID: `{report.run_id}`\n"
             f"- Snapshot ID: `{report.snapshot_id}`\n"
-            f"- Collector health: {'PASS' if report.collector_healthy else 'FAIL'}\n"
+            f"- Collector health: {report.collector_health.status.value}\n"
+            f"- Research status: {report.research_status.value}\n"
             f"- Signals: {report.signal_count} ({report.rejected_signal_count} rejected)\n"
             f"- Paper orders/fills: {report.paper_order_count}/{report.paper_fill_count}\n"
             f"- Promotion verdict: **{report.promotion_verdict.value}**\n"
@@ -1085,6 +1205,14 @@ class ContinuousResearchPaperService:
         if run.status is OperationalRunStatus.STOP_REQUESTED:
             self.stop_event.set()
             return
+        if self.collector_health_action is not None:
+            self._collector_health = await asyncio.to_thread(self.collector_health_action)
+            healthy = self._collector_health.status is CollectorHealthStatus.HEALTHY
+            self.set_collector_health(
+                healthy,
+                None if healthy else f"collector_health_{self._collector_health.status.value}",
+            )
+            run = self._require_run()
         if not run.collector_healthy:
             await self.notifier.send("Collector stopped", self.run_id, "error")
             return
@@ -1095,8 +1223,23 @@ class ContinuousResearchPaperService:
     async def _snapshot_tick(self) -> None:
         if self.snapshot_action is not None:
             try:
-                snapshot_id = await asyncio.to_thread(self.snapshot_action, self.now())
-                self.bind_snapshot(snapshot_id)
+                outcome = await asyncio.to_thread(self.snapshot_action, self.now())
+                if isinstance(outcome, ScheduledSnapshotOutcome):
+                    self.bind_snapshot(outcome.snapshot_id)
+                    if not outcome.research_eligible:
+                        run = self._require_run()
+                        self.repository.save_run(
+                            replace(
+                                run,
+                                research_status=(
+                                    ResearchExecutionStatus.SKIPPED_SNAPSHOT_INELIGIBLE
+                                ),
+                                research_skip_reason="; ".join(outcome.eligibility_reasons),
+                                updated_at=self.now(),
+                            )
+                        )
+                else:
+                    self.bind_snapshot(outcome)
             except Exception as exc:
                 self.snapshot_failed(f"{type(exc).__name__}: {exc}")
                 await self.notifier.send(
@@ -1109,6 +1252,9 @@ class ContinuousResearchPaperService:
     async def _research_tick(self) -> None:
         run = self._require_run()
         if run.last_snapshot_id is None:
+            return
+        snapshot_id = run.last_snapshot_id
+        if run.research_status is ResearchExecutionStatus.SKIPPED_SNAPSHOT_INELIGIBLE:
             return
         if self.research_action is not None:
             current = {
@@ -1127,17 +1273,46 @@ class ContinuousResearchPaperService:
                         strategy_id=outcome.strategy_id,
                         strategy_version=outcome.strategy_version,
                         research_run_id=outcome.research_run_id,
-                        data_snapshot_id=run.last_snapshot_id,
+                        data_snapshot_id=snapshot_id,
                         research_verdict=outcome.research_verdict,
                         data_quality_passed=outcome.data_quality_passed,
                         capital_feasible=outcome.capital_feasible,
                         evidence_complete=outcome.evidence_complete,
                     )
             except Exception as exc:
+                run = self._require_run()
+                self.repository.save_run(
+                    replace(
+                        run,
+                        research_status=ResearchExecutionStatus.FAILED,
+                        research_skip_reason=f"{type(exc).__name__}: {exc}",
+                        updated_at=self.now(),
+                    )
+                )
                 await self.notifier.send("Research Pipeline failed", type(exc).__name__, "error")
                 outcomes = ()
             if outcomes:
+                run = self._require_run()
+                self.repository.save_run(
+                    replace(
+                        run,
+                        last_research_run_ids=tuple(item.research_run_id for item in outcomes),
+                        research_status=ResearchExecutionStatus.COMPLETED,
+                        research_skip_reason=None,
+                        updated_at=self.now(),
+                    )
+                )
                 return
+            run = self._require_run()
+            if run.research_status is not ResearchExecutionStatus.FAILED:
+                self.repository.save_run(
+                    replace(
+                        run,
+                        research_status=ResearchExecutionStatus.FAILED,
+                        research_skip_reason="research pipeline returned no outcomes",
+                        updated_at=self.now(),
+                    )
+                )
         existing = {item.strategy_id for item in self.repository.eligibility(self.run_id)}
         for strategy_id in self.operation_settings.strategies:
             if strategy_id in existing:
@@ -1146,7 +1321,7 @@ class ContinuousResearchPaperService:
                 strategy_id=strategy_id,
                 strategy_version="1",
                 research_run_id="UNAVAILABLE",
-                data_snapshot_id=run.last_snapshot_id,
+                data_snapshot_id=snapshot_id,
                 research_verdict="INSUFFICIENT_EVIDENCE",
                 data_quality_passed=False,
                 capital_feasible=False,
@@ -1163,8 +1338,6 @@ class ContinuousResearchPaperService:
                 and saved_instrument == instrument
                 and event_type.startswith("orderbook")
             )
-            if len({item.venue for item in books}) < 2:
-                continue
             for strategy_id in ("funding_carry", "cross_venue_basis"):
                 if strategy_id not in self.operation_settings.strategies:
                     continue
@@ -1179,6 +1352,25 @@ class ContinuousResearchPaperService:
                     required_capabilities=("orderbook_snapshot",),
                     decision_time=now,
                 )
+        if "btc_sol_relative_strength" in self.operation_settings.strategies:
+            relative_events = tuple(
+                event
+                for (_, instrument, event_type), event in self._latest_events.items()
+                if instrument in {"BTC", "SOL"} and event_type.startswith("orderbook")
+            )
+            if {event.instrument for event in relative_events} != {"BTC", "SOL"}:
+                relative_events = ()
+            self.generate_signal(
+                strategy_id="btc_sol_relative_strength",
+                strategy_version="1",
+                instrument="BTC",
+                side=Side.BUY,
+                quantity=Decimal("0.001"),
+                events=relative_events,
+                expected_gross_edge=Decimal("0"),
+                required_capabilities=("orderbook_snapshot",),
+                decision_time=now,
+            )
 
     async def _paper_execution_tick(self) -> None:
         if self.mode is OperationMode.OBSERVATION_ONLY:

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine
 
+from app.adapters.exchanges.websocket import ReconciliationState
 from app.config.settings import Settings
 from app.domain.market_data.models import Side
 from app.infrastructure.database.models import Base
+from app.services.operations.collector_health import summarize_collector_health
 from app.services.operations.models import (
+    CapitalFeasibilityStatus,
+    CollectorHealthStatus,
     LiveSignalInput,
     OperationalIdentity,
     OperationMode,
@@ -21,6 +27,8 @@ from app.services.operations.models import (
     PaperFundingLedgerEntry,
     PaperPromotionVerdict,
     PaperRiskEvent,
+    ResearchExecutionStatus,
+    SignalDisposition,
     StrategyEligibilityStatus,
 )
 from app.services.operations.repository import (
@@ -30,7 +38,9 @@ from app.services.operations.repository import (
 from app.services.operations.service import (
     ContinuousResearchPaperService,
     ScheduledResearchOutcome,
+    ScheduledSnapshotOutcome,
 )
+from app.services.research.models import CollectionCheckpoint, CollectionFailureEvent
 
 NOW = datetime(2026, 7, 15, 1, 0, tzinfo=UTC)
 
@@ -109,6 +119,43 @@ def quote(
     )
 
 
+def collection_failure(error_type: str = "ExpectedSkip") -> CollectionFailureEvent:
+    return CollectionFailureEvent(
+        venue="bitget",
+        stream_key="bitget:funding:HYPE:rest",
+        instrument="HYPE",
+        event_type="funding_history",
+        endpoint="public:funding",
+        error_type=error_type,
+        error_message="instrument is not listed" if error_type == "ExpectedSkip" else "failure",
+        occurred_at=NOW,
+        retry_count=1,
+    )
+
+
+def checkpoint(
+    *,
+    state: ReconciliationState = ReconciliationState.SYNCHRONIZED,
+    recovery_required: bool = False,
+    recovery_failure: str | None = None,
+) -> CollectionCheckpoint:
+    return CollectionCheckpoint(
+        venue="bitget",
+        stream_key="bitget:orderbook:BTC:orderbook",
+        connection_id=uuid4(),
+        last_sequence=10,
+        last_event_id="book-10",
+        reconciliation_state=state,
+        checkpointed_at=NOW,
+        canonical_instrument_id="BTC",
+        venue_symbol="BTCUSDT",
+        event_type="orderbook",
+        channel="orderbook",
+        recovery_required=recovery_required,
+        last_recovery_failure=recovery_failure,
+    )
+
+
 def signal(
     operation: ContinuousResearchPaperService,
     events: tuple[LiveSignalInput, ...] | None = None,
@@ -126,6 +173,57 @@ def signal(
         required_capabilities=("orderbook_snapshot",),
         decision_time=NOW,
     )
+
+
+def test_77_expected_skips_do_not_make_collector_unhealthy() -> None:
+    result = summarize_collector_health(
+        failures=(collection_failure(),) * 77,
+        checkpoints=(checkpoint(),),
+        now=NOW,
+    )
+    assert result.status is CollectorHealthStatus.HEALTHY
+    assert result.expected_skips == 77
+    assert result.fatal_failures == result.degraded_failures == 0
+
+
+def test_fatal_collection_failure_makes_collector_unhealthy() -> None:
+    result = summarize_collector_health(
+        failures=(collection_failure("AuthenticationError"),),
+        checkpoints=(checkpoint(),),
+        now=NOW,
+    )
+    assert result.status is CollectorHealthStatus.UNHEALTHY
+    assert result.fatal_failures == 1
+
+
+def test_degraded_stream_makes_collector_degraded() -> None:
+    result = summarize_collector_health(
+        failures=(),
+        checkpoints=(
+            checkpoint(
+                state=ReconciliationState.DEGRADED,
+                recovery_required=True,
+                recovery_failure="snapshot failed",
+            ),
+        ),
+        now=NOW,
+    )
+    assert result.status is CollectorHealthStatus.DEGRADED
+    assert result.permanently_degraded_streams == result.recovery_required_streams == 1
+
+
+def test_control_events_are_separated_from_market_events() -> None:
+    result = summarize_collector_health(
+        failures=(),
+        checkpoints=(checkpoint(),),
+        now=NOW,
+        production_market_event_count=12,
+        production_control_event_count=4,
+        experimental_market_event_count=30,
+    )
+    assert result.production_market_event_count == 12
+    assert result.production_control_event_count == 4
+    assert result.experimental_market_event_count == 30
 
 
 def test_restart_restores_paper_positions_and_cash_ledger() -> None:
@@ -444,8 +542,198 @@ def test_observation_only_records_candidate_without_orders() -> None:
     operation = service(observation_only=True)
     item = signal(operation)
     assert item.rejection_reason is None
+    assert item.disposition is SignalDisposition.ELIGIBLE
     assert operation.execute_signal(item, quotes=(quote("hyperliquid"), quote("bitget"))) == ()
     assert len(operation.repository.signals(operation.run_id)) == 1
+    assert operation.repository.orders(operation.run_id) == ()
+
+
+def test_rejected_capability_reason_and_disposition_are_persisted() -> None:
+    operation = service(observation_only=True)
+    item = signal(
+        operation,
+        events=(
+            quote("hyperliquid", support="experimental"),
+            quote("bitget"),
+        ),
+    )
+    stored = operation.repository.signals(operation.run_id)[0]
+    assert item.disposition is SignalDisposition.REJECTED_CAPABILITY
+    assert stored.rejection_reason == "capability_not_live_verified"
+
+
+@pytest.mark.asyncio
+async def test_research_skipped_status_is_explicit() -> None:
+    operation = ContinuousResearchPaperService(
+        repository=InMemoryOperationalRepository(),
+        settings=settings(observation_only=True),
+        run_id="research-skipped",
+        commit_sha="a" * 40,
+        config_sha256="b" * 64,
+        mode=OperationMode.OBSERVATION_ONLY,
+        local_smoke=True,
+        now=lambda: NOW,
+        snapshot_action=lambda _: ScheduledSnapshotOutcome(
+            snapshot_id="snapshot-ineligible",
+            research_eligible=False,
+            eligibility_reasons=("production market event count below threshold",),
+        ),
+    )
+    operation.set_collector_health(True)
+
+    await operation._snapshot_tick()
+    await operation._research_tick()
+
+    run = operation.repository.get_run(operation.run_id)
+    assert run is not None
+    assert run.research_status is ResearchExecutionStatus.SKIPPED_SNAPSHOT_INELIGIBLE
+    assert run.research_skip_reason == "production market event count below threshold"
+
+
+@pytest.mark.asyncio
+async def test_observation_end_to_end_verified_fixture_stops_before_order() -> None:
+    operation = ContinuousResearchPaperService(
+        repository=InMemoryOperationalRepository(),
+        settings=settings(observation_only=True),
+        run_id="observation-e2e",
+        commit_sha="a" * 40,
+        config_sha256="b" * 64,
+        mode=OperationMode.OBSERVATION_ONLY,
+        local_smoke=True,
+        now=lambda: NOW,
+        snapshot_action=lambda _: ScheduledSnapshotOutcome(
+            snapshot_id="snapshot-verified",
+            research_eligible=True,
+        ),
+        research_action=lambda _: tuple(
+            ScheduledResearchOutcome(
+                strategy_id=strategy_id,
+                strategy_version="1",
+                research_run_id=f"research-{strategy_id}",
+                research_verdict="PASS",
+                data_quality_passed=True,
+                capital_feasible=True,
+                evidence_complete=True,
+            )
+            for strategy_id in (
+                "funding_carry",
+                "cross_venue_basis",
+                "btc_sol_relative_strength",
+            )
+        ),
+    )
+    operation.set_collector_health(True)
+    await operation._snapshot_tick()
+    await operation._research_tick()
+    operation.record_market_event(quote("hyperliquid"))
+    operation.record_market_event(quote("bitget"))
+    await operation._signal_tick()
+    await operation._paper_execution_tick()
+
+    run = operation.repository.get_run(operation.run_id)
+    signals = operation.repository.signals(operation.run_id)
+    assert run is not None and run.research_status is ResearchExecutionStatus.COMPLETED
+    assert len(run.last_research_run_ids) == 3
+    assert any(item.disposition is SignalDisposition.ELIGIBLE for item in signals)
+    assert operation.repository.orders(operation.run_id) == ()
+
+
+def test_capital_feasibility_is_not_true_without_signal_evidence(tmp_path: Path) -> None:
+    operation = service(artifact_root=tmp_path)
+    operation.generate_daily_report(NOW.date())
+    payload = json.loads((tmp_path / NOW.date().isoformat() / "paper-performance.json").read_text())
+    assert set(payload["capital_feasibility"].values()) == {
+        CapitalFeasibilityStatus.INSUFFICIENT_EVIDENCE.value
+    }
+
+
+@pytest.mark.asyncio
+async def test_strict_paper_end_to_end_and_restart_restores_state(tmp_path: Path) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    repository = PostgreSQLOperationalRepository(engine)
+    operation = ContinuousResearchPaperService(
+        repository=repository,
+        settings=settings(),
+        run_id="strict-e2e",
+        commit_sha="a" * 40,
+        config_sha256="b" * 64,
+        mode=OperationMode.STRICT_PAPER,
+        local_smoke=True,
+        artifact_root=tmp_path,
+        now=lambda: NOW,
+        snapshot_action=lambda _: ScheduledSnapshotOutcome(
+            snapshot_id="snapshot-verified",
+            research_eligible=True,
+        ),
+        research_action=lambda _: (
+            ScheduledResearchOutcome(
+                strategy_id="cross_venue_basis",
+                strategy_version="1",
+                research_run_id="research-basis-pass",
+                research_verdict="PASS",
+                data_quality_passed=True,
+                capital_feasible=True,
+                evidence_complete=True,
+            ),
+        ),
+    )
+    operation.set_collector_health(True)
+    await operation._snapshot_tick()
+    await operation._research_tick()
+    candidate = signal(operation, quantity=Decimal("0.8"))
+    assert candidate.disposition is SignalDisposition.ELIGIBLE
+    orders = operation.execute_signal(
+        candidate,
+        quotes=(
+            quote("hyperliquid", depth=Decimal("5")),
+            quote("bitget", depth=Decimal("0")),
+        ),
+        maker=True,
+        maker_rebate_rate=Decimal("0.0001"),
+        minimum_notional=Decimal("0"),
+    )
+    assert any(item.status == "partially_filled" for item in orders)
+    assert any(item.status == "open" for item in orders)
+    fills = repository.fills(operation.run_id)
+    assert fills and all(item.fee_paid > 0 and item.rebate_received > 0 for item in fills)
+    funding = operation.settle_funding(
+        portfolio_id="usd-1000",
+        venue="hyperliquid",
+        instrument="BTC",
+        rate=Decimal("0.001"),
+        mark_price=Decimal("100"),
+    )
+    assert funding < 0
+    positions_before = repository.positions(operation.run_id)
+    cash_before = repository.cash_entries(operation.run_id)
+    open_before = tuple(
+        item for item in repository.orders(operation.run_id) if item.status == "open"
+    )
+
+    restarted = ContinuousResearchPaperService(
+        repository=repository,
+        settings=settings(),
+        run_id=operation.run_id,
+        commit_sha="a" * 40,
+        config_sha256="b" * 64,
+        mode=OperationMode.STRICT_PAPER,
+        local_smoke=True,
+        artifact_root=tmp_path,
+        now=lambda: NOW,
+    )
+    restarted.set_collector_health(True)
+    report = restarted.generate_daily_report(NOW.date())
+
+    assert repository.positions(operation.run_id) == positions_before
+    assert repository.cash_entries(operation.run_id) == cash_before
+    assert tuple(item for item in repository.orders(operation.run_id) if item.status == "open") == (
+        open_before
+    )
+    assert report.metrics and report.attribution
+    assert repository.daily_metrics(operation.run_id)
+    assert repository.attributions(operation.run_id)
+    assert report.promotion_verdict is PaperPromotionVerdict.NOT_READY
 
 
 def test_daily_report_is_reproducible(tmp_path: Path) -> None:

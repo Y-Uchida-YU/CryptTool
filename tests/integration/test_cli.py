@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from app.adapters.exchanges.websocket import ReconciliationState
 from app.cli.main import app
 from app.config.settings import Settings
 from app.infrastructure.database.models import Base
+from app.services.research.collector_runs import CollectorRunRecord, CollectorRunStatus
 from app.services.research.models import RawMarketEvent
 from app.services.research.repository import PostgreSQLResearchRepository
 
@@ -245,9 +247,10 @@ def test_start_paper_operation_binds_r2_collector_and_r3_service(
     async def run_once(**kwargs: object) -> None:
         service = kwargs["service"]
         captured["service"] = service
-        snapshot_id = service.snapshot_action(datetime.now(UTC))
-        assert snapshot_id.startswith("snapshot-")
-        captured["snapshot_id"] = snapshot_id
+        captured["duration_seconds"] = kwargs["duration_seconds"]
+        snapshot = service.snapshot_action(datetime.now(UTC))
+        assert snapshot.snapshot_id.startswith("snapshot-")
+        captured["snapshot_id"] = snapshot.snapshot_id
 
     class Capital:
         evidence_complete = True
@@ -288,17 +291,106 @@ def test_start_paper_operation_binds_r2_collector_and_r3_service(
 
     result = runner.invoke(
         app,
-        ["start-paper-operation", "--config", str(config), "--run-id", "operation-r3"],
+        [
+            "start-paper-operation",
+            "--config",
+            str(config),
+            "--run-id",
+            "operation-r3",
+            "--duration-minutes",
+            "30",
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert "live_execution=false" in result.output
+    assert captured["service"] is not None
+    assert captured["duration_seconds"] == 1800
     live_events = captured["service"].market_event_action()
     assert len(live_events) == 2
     assert all(item.reconciliation_state == "synchronized" for item in live_events)
     outcomes = captured["service"].research_action(captured["snapshot_id"])
     assert len(outcomes) == 3 and all(item.research_verdict == "PASS" for item in outcomes)
     assert not token.exists()
+
+
+@pytest.mark.asyncio
+async def test_continuous_operation_duration_stops_and_persists_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+
+    class Service:
+        def __init__(self) -> None:
+            self.stop_event = stop_event
+
+        async def run(self) -> None:
+            await self.stop_event.wait()
+
+        def request_stop(self) -> None:
+            self.stop_event.set()
+
+        def set_collector_health(self, *_args: object) -> None:
+            raise AssertionError("duration timer must stop the service first")
+
+    class Collector:
+        stopped = False
+
+        def shutdown(self) -> None:
+            self.stopped = True
+
+    started_at = datetime.now(UTC)
+    run = CollectorRunRecord(
+        run_id="duration-run",
+        collector_group="group",
+        owner_id="host:1",
+        commit_sha="a" * 40,
+        config_path="/tmp/config.yaml",
+        database_identity="db",
+        schema_name="public",
+        checkpoint_namespace="production",
+        artifact_namespace="artifacts/operations/duration-run",
+        venues=("hyperliquid", "bitget"),
+        instruments=("BTC",),
+        event_types=("orderbook_snapshot",),
+        duration_seconds=0.001,
+        pid=1,
+        process_started_at=started_at,
+        hostname="host",
+        command_sha256="b" * 64,
+        run_token_sha256="c" * 64,
+        status=CollectorRunStatus.RUNNING,
+        started_at=started_at,
+        heartbeat_at=started_at,
+    )
+
+    class Leases:
+        saved = run
+
+        def get_run(self, _run_id: str) -> CollectorRunRecord:
+            return self.saved
+
+        def save_run(self, value: CollectorRunRecord) -> None:
+            self.saved = value
+
+    async def run_collector(**kwargs: object) -> None:
+        await kwargs["stop_request"].wait()
+
+    monkeypatch.setattr(cli, "_run_collector_with_lease", run_collector)
+    collector = Collector()
+    leases = Leases()
+    await cli._run_continuous_operation(
+        service=Service(),
+        collector=collector,
+        lease_repository=leases,
+        groups=("group",),
+        collector_run=run,
+        duration_seconds=0.001,
+    )
+
+    assert collector.stopped
+    assert leases.saved.status is CollectorRunStatus.COMPLETED
+    assert leases.saved.stopped_at is not None
 
 
 def test_yaml_settings_honor_runtime_database_and_live_safety_overrides(

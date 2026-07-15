@@ -44,6 +44,58 @@ class PaperPromotionVerdict(StrEnum):
     ELIGIBLE_FOR_MICRO_LIVE_REVIEW = "eligible_for_micro_live_review"
 
 
+class CollectorHealthStatus(StrEnum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class SignalDisposition(StrEnum):
+    CANDIDATE = "candidate"
+    REJECTED_CAPABILITY = "rejected_capability"
+    REJECTED_DATA_QUALITY = "rejected_data_quality"
+    REJECTED_RESEARCH = "rejected_research"
+    REJECTED_CAPITAL = "rejected_capital"
+    REJECTED_RISK = "rejected_risk"
+    ELIGIBLE = "eligible"
+
+
+class ResearchExecutionStatus(StrEnum):
+    NOT_SCHEDULED = "not_scheduled"
+    SKIPPED_SNAPSHOT_INELIGIBLE = "skipped_snapshot_ineligible"
+    FAILED = "failed"
+    COMPLETED = "completed"
+
+
+class CapitalFeasibilityStatus(StrEnum):
+    NOT_EVALUATED = "not_evaluated"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    FEASIBLE = "feasible"
+    INFEASIBLE = "infeasible"
+
+
+@dataclass(frozen=True)
+class CollectorHealthSummary:
+    status: CollectorHealthStatus
+    total_failures: int
+    fatal_failures: int
+    degraded_failures: int
+    expected_skips: int
+    failures_by_venue: dict[str, int]
+    failures_by_instrument: dict[str, int]
+    failures_by_event_type: dict[str, int]
+    failures_by_error_type: dict[str, int]
+    permanently_degraded_streams: int
+    recovery_required_streams: int
+    checkpoint_lag_max_seconds: Decimal | None
+    last_healthy_at: datetime | None
+    reasons: tuple[str, ...]
+    production_market_event_count: int = 0
+    production_control_event_count: int = 0
+    experimental_market_event_count: int = 0
+
+
 @dataclass(frozen=True)
 class OperationalIdentity:
     run_id: str
@@ -86,6 +138,8 @@ class OperationalRun:
     collector_healthy: bool = False
     signals_paused_reason: str | None = None
     failure_reason: str | None = None
+    research_status: ResearchExecutionStatus = ResearchExecutionStatus.NOT_SCHEDULED
+    research_skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +152,7 @@ class StrategyEligibilityRecord:
     evaluated_at: datetime
     expires_at: datetime
     reasons: tuple[str, ...]
+    capital_feasibility_status: CapitalFeasibilityStatus = CapitalFeasibilityStatus.NOT_EVALUATED
 
     def valid_at(self, now: datetime) -> bool:
         return (
@@ -141,6 +196,7 @@ class PaperSignal:
     expected_impact: Decimal
     required_capabilities: tuple[str, ...]
     source_event_ids: tuple[str, ...]
+    disposition: SignalDisposition = SignalDisposition.CANDIDATE
     rejection_reason: str | None = None
     full_signal_hash: str = field(init=False)
 
@@ -168,6 +224,7 @@ class PaperSignal:
                     "expected_impact": self.expected_impact,
                     "required_capabilities": self.required_capabilities,
                     "source_event_ids": self.source_event_ids,
+                    "disposition": self.disposition,
                     "rejection_reason": self.rejection_reason,
                 }
             ),
@@ -333,4 +390,7 @@ class DailyOperationReport:
     attribution: tuple[PaperAttribution, ...]
     risk_events: tuple[PaperRiskEvent, ...]
     promotion_verdict: PaperPromotionVerdict
-    collector_healthy: bool
+    collector_health: CollectorHealthSummary
+    research_status: ResearchExecutionStatus
+    research_skip_reason: str | None
+    capital_feasibility: dict[str, CapitalFeasibilityStatus]

@@ -1,8 +1,8 @@
 {
   "capital_feasibility": {
-    "usd-100": true,
-    "usd-1000": true,
-    "usd-300": true
+    "usd-100": "insufficient_evidence",
+    "usd-1000": "insufficient_evidence",
+    "usd-300": "insufficient_evidence"
   },
   "cost_by_instrument": {},
   "cost_by_venue": {},
@@ -88,6 +88,8 @@
   ],
   "paper_fill_count": 0,
   "paper_order_count": 0,
+  "signal_dispositions": {},
+  "signal_rejection_reasons": {},
   "pnl_by_strategy": {},
   "promotion_verdict": "not_ready",
   "rejected_signal_count": 0,

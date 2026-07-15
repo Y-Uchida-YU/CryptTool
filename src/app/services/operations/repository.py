@@ -25,6 +25,7 @@ from app.infrastructure.database.models import (
     StrategyEligibilityRow,
 )
 from app.services.operations.models import (
+    CapitalFeasibilityStatus,
     OperationalIdentity,
     OperationalRun,
     OperationalRunStatus,
@@ -38,6 +39,8 @@ from app.services.operations.models import (
     PaperPositionRecord,
     PaperRiskEvent,
     PaperSignal,
+    ResearchExecutionStatus,
+    SignalDisposition,
     StrategyEligibilityRecord,
     StrategyEligibilityStatus,
 )
@@ -229,6 +232,8 @@ class PostgreSQLOperationalRepository:
                 "last_research_run_ids_json": _json(run.last_research_run_ids),
                 "signals_paused_reason": run.signals_paused_reason,
                 "failure_reason": run.failure_reason,
+                "research_status": run.research_status.value,
+                "research_skip_reason": run.research_skip_reason,
                 "created_at": run.started_at,
             }
             if row is None:
@@ -262,6 +267,8 @@ class PostgreSQLOperationalRepository:
             collector_healthy=row.collector_healthy,
             signals_paused_reason=row.signals_paused_reason,
             failure_reason=row.failure_reason,
+            research_status=ResearchExecutionStatus(row.research_status),
+            research_skip_reason=row.research_skip_reason,
         )
 
     def save_eligibility(
@@ -287,6 +294,7 @@ class PostgreSQLOperationalRepository:
                 evaluated_at=record.evaluated_at,
                 expires_at=record.expires_at,
                 reasons_json=_json(record.reasons),
+                capital_feasibility_status=record.capital_feasibility_status.value,
                 commit_sha=commit_sha,
                 config_sha256=config_sha256,
                 created_at=record.evaluated_at,
@@ -319,6 +327,9 @@ class PostgreSQLOperationalRepository:
                     evaluated_at=_utc(row.evaluated_at),
                     expires_at=_utc(row.expires_at),
                     reasons=tuple(json.loads(row.reasons_json)),
+                    capital_feasibility_status=CapitalFeasibilityStatus(
+                        row.capital_feasibility_status
+                    ),
                 )
                 for row in rows
             )
@@ -340,6 +351,7 @@ class PostgreSQLOperationalRepository:
                     instrument=signal.instrument,
                     payload_json=_json(asdict(signal)),
                     rejection_reason=signal.rejection_reason,
+                    disposition=signal.disposition.value,
                     signal_hash=signal.full_signal_hash,
                     commit_sha=identity.commit_sha,
                     config_sha256=identity.config_sha256,
@@ -386,6 +398,7 @@ class PostgreSQLOperationalRepository:
             expected_impact=Decimal(data["expected_impact"]),
             required_capabilities=tuple(data["required_capabilities"]),
             source_event_ids=tuple(data["source_event_ids"]),
+            disposition=SignalDisposition(row.disposition),
             rejection_reason=row.rejection_reason,
         )
 

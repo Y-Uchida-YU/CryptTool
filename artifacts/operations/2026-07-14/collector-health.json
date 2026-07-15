@@ -1,4 +1,35 @@
 {
-  "healthy": true,
-  "run_id": "paper-operation-20260715T-r3-sample-v3"
+  "checkpoint_lag_max_seconds": null,
+  "degraded_failures": 77,
+  "expected_skips": 0,
+  "experimental_market_event_count": 301260,
+  "failures_by_error_type": {
+    "historical_error_type_not_persisted": 77
+  },
+  "failures_by_event_type": {
+    "funding_current": 19,
+    "funding_history": 17,
+    "ohlcv": 26,
+    "open_interest": 15
+  },
+  "failures_by_instrument": {
+    "historical_instrument_breakdown_not_persisted": 77
+  },
+  "failures_by_venue": {
+    "bitget": 36,
+    "hyperliquid": 41
+  },
+  "fatal_failures": 0,
+  "last_healthy_at": "2026-07-14T18:22:30.969407+00:00",
+  "permanently_degraded_streams": 0,
+  "production_control_event_count": 84,
+  "production_market_event_count": 0,
+  "reasons": [
+    "historical sample persisted aggregate failures but not error type or instrument identity",
+    "failure classification is insufficient evidence; no failures were reclassified as expected skips"
+  ],
+  "recovery_required_streams": 0,
+  "run_id": "paper-operation-20260715T-r3-sample-v3",
+  "status": "insufficient_evidence",
+  "total_failures": 77
 }
