@@ -148,6 +148,8 @@ def test_launch_spec_uses_repository_venv_and_absolute_paths(
     root = tmp_path / "checkout"
     (root / ".venv" / "bin").mkdir(parents=True)
     (root / ".venv" / "bin" / "python").write_text("python\n")
+    monkeypatch.setenv("CRYPTTOOL_APPLICATION_DIR", str(root))
+    monkeypatch.setenv("CRYPTTOOL_PYTHON_EXECUTABLE", str(root / ".venv/bin/python"))
     monkeypatch.chdir(root)
     value, _ = cli._certification_launch_spec(
         config=path, run_id="absolute-run", duration_minutes=15

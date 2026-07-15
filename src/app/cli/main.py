@@ -334,9 +334,24 @@ def diagnose_funding_history_command(
 def _certification_launch_spec(
     *, config: Path, run_id: str, duration_minutes: float
 ) -> tuple[LaunchAgentSpec, Settings]:
-    root = Path.cwd().resolve()
-    python = root / ".venv" / "bin" / "python"
     state_dir = configured_state_dir()
+    application_value = os.environ.get("CRYPTTOOL_APPLICATION_DIR")
+    python_value = os.environ.get("CRYPTTOOL_PYTHON_EXECUTABLE")
+    if not application_value or not python_value:
+        raise typer.BadParameter(
+            "CRYPTTOOL_APPLICATION_DIR and CRYPTTOOL_PYTHON_EXECUTABLE are required "
+            "for durable LaunchAgent execution"
+        )
+    root = require_durable_path(
+        Path(application_value),
+        purpose="LaunchAgent WorkingDirectory",
+        executable_checkout=True,
+    )
+    python = require_durable_path(
+        Path(python_value),
+        purpose="LaunchAgent Python executable",
+        executable_checkout=True,
+    )
     workspace = workspace_for(run_id, state_dir)
     workspace.initialize()
     source_config = config.resolve(strict=True)
