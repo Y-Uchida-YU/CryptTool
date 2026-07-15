@@ -99,6 +99,23 @@ from app.services.research.certification_lifecycle import (
     install_shutdown_signal_handlers,
     restore_signal_handlers,
 )
+from app.services.research.certification_runner import (
+    LaunchAgentError,
+    LaunchAgentSpec,
+    migration_is_current,
+)
+from app.services.research.certification_runner import (
+    preflight_and_bootstrap as preflight_and_bootstrap_certification_launch_agent,
+)
+from app.services.research.certification_runner import (
+    service_pid as certification_service_pid,
+)
+from app.services.research.certification_runner import (
+    unload as unload_certification_launch_agent,
+)
+from app.services.research.certification_runner import (
+    watchdog as certification_launch_watchdog,
+)
 from app.services.research.collector_runs import (
     CollectorLeaseConflict,
     CollectorRunRecord,
@@ -181,6 +198,155 @@ def _settings_from_yaml(path: Path) -> Settings:
         live["enabled"] = live_enabled.lower() in {"1", "true", "yes", "on"}
         payload["live"] = live
     return Settings(**payload)
+
+
+def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], Settings]:
+    """Validate everything needed before registering a certification LaunchAgent."""
+    resolved_config = config.resolve(strict=True)
+    settings = _settings_from_yaml(resolved_config)
+    certification = settings.market_data_certification
+    if not certification.enabled:
+        raise typer.BadParameter("market_data_certification.enabled=true is required")
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("market-data certification requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("market-data certification refuses execution credentials")
+    _require_nonproduction_database_isolation(settings, run_mode="certification")
+    if settings.production_database_url is None:
+        raise typer.BadParameter("certification requires production_database_url")
+    database_url = make_url(settings.database_url)
+    production_url = make_url(settings.production_database_url)
+    artifact_root = Path(certification.artifact_root)
+    if not artifact_root.is_absolute():
+        raise typer.BadParameter("market_data_certification.artifact_root must be absolute")
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    probe = artifact_root / f".preflight-{os.getpid()}"
+    probe.write_text("writable\n", encoding="utf-8")
+    probe.unlink()
+    engine = build_engine(settings.database_url)
+    try:
+        if not migration_is_current(engine):
+            raise typer.BadParameter("certification database migration is stale")
+    finally:
+        engine.dispose()
+    return (
+        {
+            "status": "PASS",
+            "python_executable": sys.executable,
+            "python_executable_exists": "PASS",
+            "python_version": sys.version.split()[0],
+            "app_import": "PASS",
+            "config": str(resolved_config),
+            "config_load": "PASS",
+            "database_url_parse": database_url.render_as_string(hide_password=True),
+            "certification_database_connection": "PASS",
+            "production_database_identity": production_url.render_as_string(hide_password=True),
+            "database_identity_comparison": "PASS_DISTINCT",
+            "migration_current": "PASS",
+            "artifact_directory": str(artifact_root),
+            "artifact_directory_writable": "PASS",
+            "live_execution": "OFF",
+        },
+        settings,
+    )
+
+
+@app.command("certification-preflight")
+def certification_preflight(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+) -> None:
+    """Fail closed before a market-data certification LaunchAgent is registered."""
+    payload, _ = _certification_preflight_payload(config)
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
+def _certification_launch_spec(
+    *, config: Path, run_id: str, duration_minutes: float
+) -> tuple[LaunchAgentSpec, Settings]:
+    _, settings = _certification_preflight_payload(config)
+    root = Path.cwd().resolve()
+    python = root / ".venv" / "bin" / "python"
+    artifact_root = Path(settings.market_data_certification.artifact_root).resolve()
+    log_root = (artifact_root / "runner-logs").resolve()
+    plist_root = (artifact_root / "launch-agents").resolve()
+    return (
+        LaunchAgentSpec(
+            run_id=run_id,
+            python_executable=python,
+            repository_root=root,
+            config_path=config.resolve(strict=True),
+            artifact_root=artifact_root,
+            stdout_path=log_root / f"{run_id}.stdout.log",
+            stderr_path=log_root / f"{run_id}.stderr.log",
+            plist_path=plist_root / f"com.crypttool.{run_id}.plist",
+            duration_minutes=duration_minutes,
+            uid=os.getuid(),
+        ),
+        settings,
+    )
+
+
+@app.command("launch-market-data-certification")
+def launch_market_data_certification(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+    duration_minutes: Annotated[float, typer.Option("--duration-minutes", min=0.01)],
+    wait: Annotated[bool, typer.Option("--wait/--no-wait")] = False,
+    watchdog_seconds: Annotated[float, typer.Option("--watchdog-seconds", min=0.1)] = 60,
+) -> None:
+    """Preflight, register and watch a direct-Python certification LaunchAgent."""
+    spec, settings = _certification_launch_spec(
+        config=config, run_id=run_id, duration_minutes=duration_minutes
+    )
+    engine = build_engine(settings.database_url)
+    registered = False
+    try:
+        preflight = preflight_and_bootstrap_certification_launch_agent(spec)
+        typer.echo(preflight.stdout.strip())
+        registered = True
+        pid = certification_launch_watchdog(spec, engine, timeout=watchdog_seconds)
+        started = datetime.now(UTC)
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "pid": pid,
+                    "service": spec.service,
+                    "python_executable": str(spec.python_executable),
+                    "started_at": started,
+                    "expected_end": started + timedelta(minutes=duration_minutes),
+                    "config": str(spec.config_path),
+                    "database": _redact_database_url(settings.database_url),
+                    "artifact": str(spec.artifact_root / run_id),
+                    "run_registry_status": "STARTING_OR_RUNNING",
+                    "live_execution": "OFF",
+                },
+                default=_json_default,
+                sort_keys=True,
+            )
+        )
+        if not wait:
+            registered = False
+            return
+        deadline = time.monotonic() + duration_minutes * 60 + 180
+        repository = CertificationRunRepository(engine)
+        while time.monotonic() < deadline:
+            record = repository.get(run_id)
+            running_pid = certification_service_pid(spec)
+            if record is not None and record.status.value in {"FAILED", "CANCELED"}:
+                raise LaunchAgentError(
+                    f"certification ended with {record.status.value}: {record.failure_reason}"
+                )
+            if record is not None and record.status.value == "COMPLETED" and running_pid is None:
+                typer.echo(f"run_id={run_id} status=COMPLETED exit_code=0 live_execution=OFF")
+                return
+            time.sleep(1)
+        raise LaunchAgentError("certification LaunchAgent did not complete before its deadline")
+    finally:
+        engine.dispose()
+        if registered:
+            termination = unload_certification_launch_agent(spec)
+            typer.echo(f"service={spec.service} unloaded=true termination={termination}")
 
 
 @app.command("validate-config")

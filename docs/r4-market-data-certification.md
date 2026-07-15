@@ -45,5 +45,23 @@ app verify-market-data-certification --certification-id ID
 app capability-certification-status
 ```
 
+## macOS LaunchAgent runner
+
+Use the repository virtual environment directly; the runner never uses `uv run`, a shell, or a
+PATH-resolved Python executable. The configuration's certification artifact root must be absolute.
+
+```console
+/absolute/path/to/CryptTool/.venv/bin/python -m app certification-preflight \
+  --config /absolute/path/to/config.yaml
+/absolute/path/to/CryptTool/.venv/bin/python -m app launch-market-data-certification \
+  --config /absolute/path/to/config.yaml --run-id RUN_ID --duration-minutes 15 --no-wait
+```
+
+Preflight verifies the direct interpreter, application import, configuration, isolated database
+identity, current migration, and writable artifact directory before registration. The runner then
+requires a real Python application process plus either a STARTING/RUNNING registry row or a
+`PROCESS_STARTED` lifecycle log within 60 seconds. Failure sends SIGTERM, unloads the service, and
+writes `runner-failure.json`. LaunchAgent plist files contain no API keys or database credentials.
+
 The 30-minute command is intentionally a long-running process. Start it once, record its Run ID
 and PID, and inspect it only after the operator asks for completion review.
