@@ -415,7 +415,8 @@ def test_market_data_certification_cli_runs_isolated_evidence_path(
 ) -> None:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'certification.db'}")
     Base.metadata.create_all(engine)
-    artifact_root = tmp_path / "certification"
+    state_dir = tmp_path / "state"
+    artifact_root = state_dir / "certification-runs"
     config = tmp_path / "certification.yaml"
     config.write_text("market_data_certification: {enabled: true}\n", encoding="utf-8")
     configured = Settings(
@@ -526,6 +527,8 @@ def test_market_data_certification_cli_runs_isolated_evidence_path(
             )
 
     monkeypatch.setattr(cli, "_settings_from_yaml", lambda _: configured)
+    monkeypatch.setenv("CRYPTTOOL_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("CRYPTTOOL_ALLOW_TEST_STORAGE", "1")
     monkeypatch.setattr(cli, "Settings", lambda: configured)
     monkeypatch.setattr(cli, "build_engine", lambda _: engine)
     monkeypatch.setattr(

@@ -17,6 +17,11 @@ from app.services.research import certification_runner as runner
 from app.services.research.certification_lifecycle import CertificationLifecycle
 
 
+@pytest.fixture(autouse=True)
+def allow_isolated_test_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CRYPTTOOL_ALLOW_TEST_STORAGE", "1")
+
+
 def spec(tmp_path: Path, *, executable: str = "python") -> runner.LaunchAgentSpec:
     root = tmp_path / "repo"
     python = root / ".venv" / "bin" / executable
@@ -33,6 +38,7 @@ def spec(tmp_path: Path, *, executable: str = "python") -> runner.LaunchAgentSpe
         stdout_path=(tmp_path / "logs" / "stdout.log").resolve(),
         stderr_path=(tmp_path / "logs" / "stderr.log").resolve(),
         plist_path=(tmp_path / "agents" / "agent.plist").resolve(),
+        state_dir=(tmp_path / "state").resolve(),
         duration_minutes=3,
         uid=os.getuid(),
     )

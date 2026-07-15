@@ -116,6 +116,16 @@ from app.services.research.certification_runner import (
 from app.services.research.certification_runner import (
     watchdog as certification_launch_watchdog,
 )
+from app.services.research.certification_storage import (
+    DurableStorageError,
+    configured_state_dir,
+    export_completed_run,
+    named_postgres_volume_configured,
+    reconstruct_from_artifacts,
+    require_durable_path,
+    verify_run,
+    workspace_for,
+)
 from app.services.research.collector_runs import (
     CollectorLeaseConflict,
     CollectorRunRecord,
@@ -204,6 +214,12 @@ def _settings_from_yaml(path: Path) -> Settings:
 def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], Settings]:
     """Validate everything needed before registering a certification LaunchAgent."""
     resolved_config = config.resolve(strict=True)
+    state_dir = configured_state_dir()
+    require_durable_path(resolved_config, purpose="resolved certification config")
+    require_durable_path(
+        Path(sys.executable), purpose="Python executable", executable_checkout=True
+    )
+    require_durable_path(Path.cwd(), purpose="WorkingDirectory", executable_checkout=True)
     settings = _settings_from_yaml(resolved_config)
     certification = settings.market_data_certification
     if not certification.enabled:
@@ -220,6 +236,19 @@ def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], S
     artifact_root = Path(certification.artifact_root)
     if not artifact_root.is_absolute():
         raise typer.BadParameter("market_data_certification.artifact_root must be absolute")
+    artifact_root = require_durable_path(artifact_root, purpose="certification artifact root")
+    if state_dir != artifact_root and state_dir not in artifact_root.parents:
+        raise typer.BadParameter("certification artifact_root must be inside CRYPTTOOL_STATE_DIR")
+    test_override = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get(
+        "CRYPTTOOL_ALLOW_TEST_STORAGE"
+    ) == "1"
+    if not test_override and database_url.get_backend_name() != "postgresql":
+        raise typer.BadParameter("certification database must be durable PostgreSQL")
+    compose_path = Path.cwd() / "docker-compose.yml"
+    if not test_override and not named_postgres_volume_configured(compose_path):
+        raise typer.BadParameter(
+            "named PostgreSQL volume crypttool_certification_pgdata is required"
+        )
     artifact_root.mkdir(parents=True, exist_ok=True)
     probe = artifact_root / f".preflight-{os.getpid()}"
     probe.write_text("writable\n", encoding="utf-8")
@@ -247,6 +276,8 @@ def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], S
             "artifact_directory": str(artifact_root),
             "artifact_directory_writable": "PASS",
             "live_execution": "OFF",
+            "state_dir": str(state_dir),
+            "named_postgresql_volume": "PASS",
         },
         settings,
     )
@@ -303,25 +334,35 @@ def diagnose_funding_history_command(
 def _certification_launch_spec(
     *, config: Path, run_id: str, duration_minutes: float
 ) -> tuple[LaunchAgentSpec, Settings]:
-    _, settings = _certification_preflight_payload(config)
     root = Path.cwd().resolve()
     python = root / ".venv" / "bin" / "python"
-    artifact_root = Path(settings.market_data_certification.artifact_root).resolve()
-    log_root = (artifact_root / "runner-logs").resolve()
-    plist_root = (artifact_root / "launch-agents").resolve()
+    state_dir = configured_state_dir()
+    workspace = workspace_for(run_id, state_dir)
+    workspace.initialize()
+    source_config = config.resolve(strict=True)
+    source_settings = _settings_from_yaml(source_config)
+    resolved_config = workspace.persist_resolved_config(
+        source_config,
+        resolved_payload=source_settings.model_dump(mode="json"),
+    )
+    _, settings = _certification_preflight_payload(resolved_config)
+    artifact_root = (state_dir / "certification-runs").resolve()
+    spec = LaunchAgentSpec(
+        run_id=run_id,
+        python_executable=python,
+        repository_root=root,
+        config_path=resolved_config,
+        artifact_root=artifact_root,
+        stdout_path=workspace.stdout_path,
+        stderr_path=workspace.stderr_path,
+        plist_path=workspace.plist_path,
+        state_dir=state_dir,
+        duration_minutes=duration_minutes,
+        uid=os.getuid(),
+    )
+    workspace.persist_environment(spec.environment)
     return (
-        LaunchAgentSpec(
-            run_id=run_id,
-            python_executable=python,
-            repository_root=root,
-            config_path=config.resolve(strict=True),
-            artifact_root=artifact_root,
-            stdout_path=log_root / f"{run_id}.stdout.log",
-            stderr_path=log_root / f"{run_id}.stderr.log",
-            plist_path=plist_root / f"com.crypttool.{run_id}.plist",
-            duration_minutes=duration_minutes,
-            uid=os.getuid(),
-        ),
+        spec,
         settings,
     )
 
@@ -357,7 +398,7 @@ def launch_market_data_certification(
                     "expected_end": started + timedelta(minutes=duration_minutes),
                     "config": str(spec.config_path),
                     "database": _redact_database_url(settings.database_url),
-                    "artifact": str(spec.artifact_root / run_id),
+                    "artifact": str(workspace_for(run_id, spec.state_dir).root),
                     "run_registry_status": "STARTING_OR_RUNNING",
                     "live_execution": "OFF",
                 },
@@ -1392,7 +1433,7 @@ def run_market_data_certification(
     duration_minutes: Annotated[float | None, typer.Option("--duration-minutes", min=0.01)] = None,
 ) -> None:
     """Collect isolated public evidence and issue no certificate without measured PASS evidence."""
-    settings = _settings_from_yaml(config)
+    _, settings = _certification_preflight_payload(config)
     certification_settings = settings.market_data_certification
     if not certification_settings.enabled:
         raise typer.BadParameter("market_data_certification.enabled=true is required")
@@ -1408,12 +1449,30 @@ def run_market_data_certification(
     resolved_run_id = run_id or f"certification-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     started_at = datetime.now(UTC)
     duration = duration_minutes or float(certification_settings.duration_minutes)
-    artifact_root = Path(certification_settings.artifact_root)
+    state_dir = configured_state_dir()
+    workspace = workspace_for(resolved_run_id, state_dir)
+    workspace.initialize()
+    if config.resolve() != workspace.config_path.resolve():
+        workspace.persist_resolved_config(
+            config.resolve(strict=True),
+            resolved_payload=settings.model_dump(mode="json"),
+        )
+    workspace.persist_environment(
+        {
+            "HOME": str(Path.home().resolve()),
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONUNBUFFERED": os.environ.get("PYTHONUNBUFFERED", "1"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", str(Path.cwd() / "src")),
+            "TMPDIR": str(state_dir / "tmp"),
+            "CRYPTTOOL_STATE_DIR": str(state_dir),
+        }
+    )
+    artifact_root = workspace.certifications
     typer.echo(
         f"run_id={resolved_run_id} pid={os.getpid()} started_at={started_at.isoformat()} "
         f"expected_end={(started_at + timedelta(minutes=duration)).isoformat()} "
         f"database={_redact_database_url(settings.database_url)} "
-        f"artifact={artifact_root / resolved_run_id} live_execution=OFF"
+        f"artifact={workspace.root} live_execution=OFF"
     )
     engine = build_engine(settings.database_url)
     lifecycle: CertificationLifecycle | None = None
@@ -1439,7 +1498,7 @@ def run_market_data_certification(
             commit_sha=_current_commit_sha(),
             config_path=config,
             database_identity=_redact_database_url(settings.database_url),
-            artifact_directory=artifact_root / resolved_run_id,
+            artifact_directory=workspace.root,
             repository=CertificationRunRepository(engine),
             now=started_at,
         )
@@ -1602,23 +1661,17 @@ def run_market_data_certification(
                         promotion=promotion,
                     )
                     certifications.append(certification)
-        run_directory = artifact_root / resolved_run_id
-        run_directory.mkdir(parents=True, exist_ok=True)
-        summary = {
-            "run_id": resolved_run_id,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "certifications": [asdict(item) for item in certifications],
-            "promoted_capability_count": promoted,
-            "production_market_event_count": production_market_events,
-            "live_execution": "OFF",
-        }
-        (run_directory / "manifest.json").write_text(
-            json.dumps(summary, default=_json_default, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        if lease_repository is not None and lease_group is not None:
+            lease_repository.release(lease_group, resolved_run_id, lease_owner)
+            lease_group = None
         lifecycle.stage(CertificationStage.ARTIFACT_WRITTEN)
         lifecycle.stage(CertificationStage.PROCESS_COMPLETED)
+        export_completed_run(
+            engine=engine,
+            workspace=workspace,
+            adapter_version=certification_settings.adapter_version,
+            database_identity=_redact_database_url(settings.database_url),
+        )
         typer.echo(
             f"run_id={resolved_run_id} certifications={len(certifications)} "
             f"promoted={promoted} production_events={production_market_events} "
@@ -1653,6 +1706,81 @@ def run_market_data_certification(
         engine.dispose()
 
 
+def _durable_run_settings(run_id: str) -> tuple[Any, Settings]:
+    workspace = workspace_for(run_id)
+    if not workspace.config_path.is_file():
+        raise typer.BadParameter(f"durable resolved config is missing for run {run_id}")
+    return workspace, _settings_from_yaml(workspace.config_path)
+
+
+@app.command("certification-run-status")
+def certification_run_status(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Report durable artifact state and query the Run Registry without guessing."""
+    workspace, settings = _durable_run_settings(run_id)
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "artifact_directory": str(workspace.root),
+        "live_execution": "OFF",
+    }
+    try:
+        payload["artifact"] = reconstruct_from_artifacts(workspace)
+    except DurableStorageError as exc:
+        payload["artifact_status"] = "NOT_COMPLETED"
+        payload["artifact_reason"] = str(exc)
+    engine = build_engine(settings.database_url)
+    try:
+        record = CertificationRunRepository(engine).get(run_id)
+        payload["database_connection"] = "PASS"
+        payload["run_registry"] = asdict(record) if record is not None else None
+    except Exception as exc:
+        payload["database_connection"] = "FAILED"
+        payload["database_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(payload, default=_json_default, sort_keys=True))
+
+
+@app.command("export-certification-run")
+def export_certification_run_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Re-export a completed Run Registry record into its durable workspace."""
+    workspace, settings = _durable_run_settings(run_id)
+    engine = build_engine(settings.database_url)
+    try:
+        result = export_completed_run(
+            engine=engine,
+            workspace=workspace,
+            adapter_version=settings.market_data_certification.adapter_version,
+            database_identity=_redact_database_url(settings.database_url),
+        )
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+
+
+@app.command("verify-certification-run")
+def verify_certification_run_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Reconnect to the DB and verify Registry, evidence, hashes, audit and leases."""
+    workspace, settings = _durable_run_settings(run_id)
+    engine = build_engine(settings.database_url)
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        result = verify_run(engine, workspace)
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+
+
 @app.command("verify-market-data-certification")
 def verify_market_data_certification(
     certification_id: Annotated[str, typer.Option("--certification-id", min=1)],
@@ -1667,7 +1795,15 @@ def verify_market_data_certification(
         certification, evidence = stored
         if evidence.manifest_sha256 != certification.evidence_manifest_sha256:
             raise typer.BadParameter("certification evidence manifest mismatch")
-        directory = Path(settings.market_data_certification.artifact_root) / certification_id
+        artifact_root = Path(settings.market_data_certification.artifact_root)
+        durable_matches = tuple(
+            artifact_root.glob(f"*/certifications/{certification_id}")
+        )
+        directory = (
+            durable_matches[0]
+            if len(durable_matches) == 1
+            else artifact_root / certification_id
+        )
         manifest_path = directory / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         for relative, expected in manifest["files"].items():

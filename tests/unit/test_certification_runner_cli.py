@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -30,9 +31,11 @@ def clear_application_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep CI runtime settings from replacing each test's isolated database."""
     for key in ("APP_DATABASE_URL", "APP_LIVE_TRADING", "APP_LIVE__ENABLED"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CRYPTTOOL_ALLOW_TEST_STORAGE", "1")
 
 
 def config(tmp_path: Path, **overrides: object) -> Path:
+    os.environ["CRYPTTOOL_STATE_DIR"] = str((tmp_path / "state").resolve())
     database = tmp_path / "certification.sqlite"
     engine = create_engine(f"sqlite+pysqlite:///{database}")
     Base.metadata.create_all(engine)
@@ -50,7 +53,7 @@ def config(tmp_path: Path, **overrides: object) -> Path:
             "venues": ["hyperliquid", "bitget"],
             "instruments": ["BTC"],
             "capabilities": ["trade"],
-            "artifact_root": str((tmp_path / "artifacts").resolve()),
+            "artifact_root": str((tmp_path / "state" / "certification-runs").resolve()),
         },
     }
     payload.update(overrides)
@@ -73,6 +76,7 @@ def launch_spec(tmp_path: Path, config_path: Path) -> LaunchAgentSpec:
         stdout_path=(tmp_path / "logs" / "stdout.log").resolve(),
         stderr_path=(tmp_path / "logs" / "stderr.log").resolve(),
         plist_path=(tmp_path / "agents" / "agent.plist").resolve(),
+        state_dir=(tmp_path / "state").resolve(),
         duration_minutes=3,
         uid=501,
     )

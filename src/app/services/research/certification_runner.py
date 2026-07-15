@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import plistlib
 import subprocess  # nosec B404
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -21,9 +19,17 @@ from app.services.research.certification_lifecycle import (
     CertificationRunStatus,
     CertificationStage,
 )
+from app.services.research.certification_storage import require_durable_path
 
 CURRENT_MIGRATION = "0017_certification_run_registry"
-SAFE_ENVIRONMENT_KEYS = ("HOME", "PATH", "PYTHONUNBUFFERED", "PYTHONPATH", "TMPDIR")
+SAFE_ENVIRONMENT_KEYS = (
+    "HOME",
+    "PATH",
+    "PYTHONUNBUFFERED",
+    "PYTHONPATH",
+    "TMPDIR",
+    "CRYPTTOOL_STATE_DIR",
+)
 
 
 class LaunchAgentError(RuntimeError):
@@ -40,6 +46,7 @@ class LaunchAgentSpec:
     stdout_path: Path
     stderr_path: Path
     plist_path: Path
+    state_dir: Path
     duration_minutes: float
     uid: int
 
@@ -69,12 +76,15 @@ class LaunchAgentSpec:
     @property
     def environment(self) -> dict[str, str]:
         home = Path.home().resolve()
+        temporary = (self.state_dir / "tmp").resolve()
+        temporary.mkdir(parents=True, exist_ok=True)
         return {
             "HOME": str(home),
             "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": str((self.repository_root / "src").resolve()),
-            "TMPDIR": str(Path(os.environ.get("TMPDIR", tempfile.gettempdir())).resolve()),
+            "TMPDIR": str(temporary),
+            "CRYPTTOOL_STATE_DIR": str(self.state_dir.resolve()),
         }
 
     def validate(self) -> None:
@@ -86,10 +96,26 @@ class LaunchAgentSpec:
             "stdout": self.stdout_path,
             "stderr": self.stderr_path,
             "plist": self.plist_path,
+            "state directory": self.state_dir,
         }
         relative = [name for name, path in paths.items() if not path.is_absolute()]
         if relative:
             raise LaunchAgentError(f"LaunchAgent paths must be absolute: {', '.join(relative)}")
+        try:
+            require_durable_path(
+                self.python_executable,
+                purpose="Python executable",
+                executable_checkout=True,
+            )
+            require_durable_path(
+                self.repository_root,
+                purpose="WorkingDirectory",
+                executable_checkout=True,
+            )
+            for name, path in paths.items():
+                require_durable_path(path, purpose=name)
+        except RuntimeError as exc:
+            raise LaunchAgentError(str(exc)) from exc
         if not self.python_executable.is_file():
             raise LaunchAgentError(f"Python executable does not exist: {self.python_executable}")
         if self.python_executable.name == "uv" or "uv" in self.arguments[:3]:
