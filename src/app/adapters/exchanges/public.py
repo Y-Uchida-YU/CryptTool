@@ -663,25 +663,40 @@ class HyperliquidMarketDataAdapter(PublicRestAdapter):
         self, symbol: str, start: datetime | None = None, end: datetime | None = None
     ) -> Sequence[FundingRate]:
         now = datetime.now(UTC)
-        payload: dict[str, object] = {
-            "type": "fundingHistory",
-            "coin": symbol,
-            "startTime": int((start or now.replace(hour=0)).timestamp() * 1000),
-        }
-        if end:
-            payload["endTime"] = int(end.timestamp() * 1000)
-        data = await self._info(payload)
-        return tuple(
-            FundingRate(
-                exchange=self.venue,
-                symbol=symbol,
-                timestamp=_ms(item["time"]),
-                rate=item["fundingRate"],
-                funding_interval_seconds=3600,
-                funding_schedule_source="hyperliquid_documented_hourly_schedule",
+        requested_end = end or now
+        cursor = start or requested_end - timedelta(days=7)
+        by_effective_time: dict[datetime, FundingRate] = {}
+        for _ in range(20):
+            payload: dict[str, object] = {
+                "type": "fundingHistory",
+                "coin": symbol,
+                "startTime": int(cursor.timestamp() * 1000),
+                "endTime": int(requested_end.timestamp() * 1000),
+            }
+            data = await self._info(payload)
+            page = tuple(
+                FundingRate(
+                    exchange=self.venue,
+                    symbol=symbol,
+                    timestamp=_ms(item["time"]),
+                    rate=item["fundingRate"],
+                    funding_interval_seconds=3600,
+                    funding_schedule_source="hyperliquid_documented_hourly_schedule",
+                )
+                for item in data
             )
-            for item in data
-        )
+            for item in page:
+                if item.exchange_timestamp is not None:
+                    by_effective_time[item.exchange_timestamp] = item
+            if len(page) < 500:
+                break
+            newest = max(
+                item.exchange_timestamp for item in page if item.exchange_timestamp is not None
+            )
+            if newest >= requested_end:
+                break
+            cursor = newest + timedelta(milliseconds=1)
+        return tuple(by_effective_time[key] for key in sorted(by_effective_time))
 
     async def fetch_current_funding_rate(self, symbol: str) -> FundingRate:
         meta, contexts = await self._info({"type": "metaAndAssetCtxs"})
@@ -995,21 +1010,43 @@ class BitgetMarketDataAdapter(PublicRestAdapter):
     async def fetch_funding_rates(
         self, symbol: str, start: datetime | None = None, end: datetime | None = None
     ) -> Sequence[FundingRate]:
-        del start, end
-        response = await self.client.get(
-            "/api/v2/mix/market/history-fund-rate",
-            params={"symbol": symbol, "productType": "USDT-FUTURES", "pageSize": 100},
-        )
-        response.raise_for_status()
-        return tuple(
-            FundingRate(
-                exchange=self.venue,
-                symbol=symbol,
-                timestamp=_ms(item["fundingTime"]),
-                rate=item["fundingRate"],
+        requested_end = end or datetime.now(UTC)
+        requested_start = start or requested_end - timedelta(days=30)
+        by_effective_time: dict[datetime, FundingRate] = {}
+        for page_number in range(1, 21):
+            response = await self.client.get(
+                "/api/v2/mix/market/history-fund-rate",
+                params={
+                    "symbol": symbol,
+                    "productType": "USDT-FUTURES",
+                    "pageSize": 100,
+                    "pageNo": page_number,
+                },
             )
-            for item in response.json()["data"]
-        )
+            response.raise_for_status()
+            rows = response.json()["data"]
+            page = tuple(
+                FundingRate(
+                    exchange=self.venue,
+                    symbol=symbol,
+                    timestamp=_ms(item["fundingTime"]),
+                    rate=item["fundingRate"],
+                    funding_interval_seconds=28800,
+                    funding_schedule_source="bitget_documented_eight_hour_schedule",
+                )
+                for item in rows
+            )
+            for item in page:
+                timestamp = item.exchange_timestamp
+                if timestamp is not None and requested_start <= timestamp <= requested_end:
+                    by_effective_time[timestamp] = item
+            if len(rows) < 100 or (
+                page
+                and min(item.exchange_timestamp for item in page if item.exchange_timestamp)
+                <= requested_start
+            ):
+                break
+        return tuple(by_effective_time[key] for key in sorted(by_effective_time))
 
     async def fetch_current_funding_rate(self, symbol: str) -> FundingRate:
         response = await self.client.get(

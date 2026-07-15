@@ -79,6 +79,23 @@ class StrictPaperReadiness(StrEnum):
 
 
 @dataclass(frozen=True)
+class CapabilityContractVerdict:
+    schema_valid: bool
+    units_valid: bool
+    timestamp_semantic_valid: bool
+    value_domain_valid: bool
+    source_identity_valid: bool
+
+
+@dataclass(frozen=True)
+class HistoricalResearchUsability:
+    point_in_time_available: bool | None
+    availability_provenance: AvailabilityProvenance
+    verdict: CertificationVerdict
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class EventTimingMetrics:
     exchange_timestamp: datetime | None
     received_at: datetime
@@ -105,10 +122,11 @@ class FundingIntervalObservation:
 class FundingIntervalResult:
     observations: tuple[FundingIntervalObservation, ...]
     duplicate_count: int
-    missing_window_count: int
+    missing_window_count: int | None
     schedule_change_count: int
     violations: tuple[str, ...]
     insufficiencies: tuple[str, ...]
+    window_assessment: str = "EVALUATED"
 
 
 @dataclass(frozen=True)
@@ -235,6 +253,9 @@ class CertificationMetrics:
     historical_duplicate_count: int = 0
     historical_timestamp_collision_count: int = 0
     clock_skew_unknown_count: int = 0
+    candle_interval_alignment_violation_count: int = 0
+    candle_missing_count: int = 0
+    future_timestamp_count: int = 0
     timing: tuple[EventTimingMetrics, ...] = ()
 
 
@@ -313,6 +334,8 @@ class CertificationEvidence:
     manifest_sha256: str
     audit_artifact_sha256: str = ""
     funding_interval: FundingIntervalResult | None = None
+    capability_contract: CapabilityContractVerdict | None = None
+    historical_research_usability: HistoricalResearchUsability | None = None
 
 
 @dataclass(frozen=True)
@@ -528,13 +551,18 @@ class MarketDataCertificationService:
             insufficiencies.append("coverage ratio below threshold")
         if metrics.stale_ratio > spec.maximum_stale_ratio:
             insufficiencies.append("stale ratio above threshold")
-        if metrics.clock_skew_unknown_count:
-            insufficiencies.append("exchange server time unavailable; clock skew is UNKNOWN")
+        if metrics.clock_skew_unknown_count and spec.timestamp_semantic not in {
+            TimestampSemantic.CANDLE_OPEN_TIME,
+            TimestampSemantic.CANDLE_CLOSE_TIME,
+        }:
+            insufficiencies.append("exchange server time unavailable")
         if (
             metrics.maximum_clock_skew_ms is not None
             and metrics.maximum_clock_skew_ms > spec.maximum_clock_skew_ms
         ):
             failures.append("clock skew above threshold")
+        if metrics.live_out_of_order_count > 0:
+            failures.append("live out-of-order events detected")
         if (
             metrics.cross_source_relative_error is not None
             and metrics.cross_source_relative_error > spec.maximum_relative_error
@@ -557,6 +585,13 @@ class MarketDataCertificationService:
         if spec.capability in {"orderbook_snapshot", "orderbook_delta"}:
             failures.extend(validate_order_book_events(normalized, spec))
         reasons = tuple(dict.fromkeys((*failures, *insufficiencies)))
+        research_usability = historical_research_usability(normalized, spec)
+        contract_verdict = capability_contract_verdict(spec, failures)
+        validate_certification_reason_invariants(
+            reasons=reasons,
+            metrics=metrics,
+            funding_interval=funding_interval,
+        )
         manifest = tuple(sorted((item.event_id, item.payload_sha256) for item in normalized))
         manifest_hash = canonical_sha256(
             {
@@ -612,6 +647,8 @@ class MarketDataCertificationService:
             manifest_sha256=manifest_hash,
             audit_artifact_sha256=audit_artifact_sha256,
             funding_interval=funding_interval,
+            capability_contract=contract_verdict,
+            historical_research_usability=research_usability,
         )
         self.repository.save(certification, evidence)
         return certification
@@ -622,42 +659,131 @@ class MarketDataCertificationService:
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         failures: list[str] = []
         insufficiencies: list[str] = []
-        previous_exchange: datetime | None = None
         for event in events:
             if event.available_at < event.received_at:
                 failures.append("available_at precedes received_at")
-            if event.exchange_timestamp is not None:
-                if event.exchange_timestamp > event.received_at + timedelta(seconds=5):
-                    failures.append("future exchange timestamp")
-                if (
-                    event.timestamp_semantic == TimestampSemantic.REALTIME_EVENT
-                    and previous_exchange is not None
-                    and event.exchange_timestamp < previous_exchange
-                ):
-                    failures.append("live out-of-order exchange timestamp")
-                previous_exchange = event.exchange_timestamp
+            if (
+                event.exchange_timestamp is not None
+                and event.exchange_timestamp > event.received_at + timedelta(seconds=5)
+            ):
+                failures.append("future exchange timestamp")
             if event.available_at > sample_end:
                 failures.append("event became available after sample end")
             if event.timestamp_semantic != spec.timestamp_semantic:
                 failures.append("timestamp semantic does not match capability contract")
-            if event.exchange_server_time is None:
-                insufficiencies.append("exchange server time unavailable; clock skew is UNKNOWN")
-            if (
-                event.timestamp_semantic in HISTORICAL_TIMESTAMP_SEMANTICS
-                and event.availability_provenance
-                not in {
-                    AvailabilityProvenance.HISTORICAL_EFFECTIVE_TIME,
-                    AvailabilityProvenance.EXCHANGE_PUBLISHED_TIME,
-                }
-            ):
-                insufficiencies.append("historical availability is not point-in-time proven")
             payload = event.payload()
             missing = [name for name in spec.response_fields if name not in payload]
             if missing:
                 failures.append(f"response fields missing: {','.join(missing)}")
             if spec.capability == "trade" and not payload.get("trade_id"):
                 insufficiencies.append("exchange trade id unavailable; uniqueness is not proven")
+            if spec.capability == "ohlcv":
+                try:
+                    opened = Decimal(str(payload["open"]))
+                    high = Decimal(str(payload["high"]))
+                    low = Decimal(str(payload["low"]))
+                    closed = Decimal(str(payload["close"]))
+                    volume = Decimal(str(payload["volume"]))
+                except (InvalidOperation, KeyError):
+                    failures.append("OHLCV value domain is invalid")
+                else:
+                    if high < max(opened, closed) or low > min(opened, closed) or high < low:
+                        failures.append("OHLCV structure is invalid")
+                    if volume < 0:
+                        failures.append("OHLCV volume is negative")
         return tuple(failures), tuple(insufficiencies)
+
+
+def capability_contract_verdict(
+    spec: ContractValidationSpec, failures: Sequence[str]
+) -> CapabilityContractVerdict:
+    lowered = tuple(reason.lower() for reason in failures)
+    return CapabilityContractVerdict(
+        schema_valid=not any(
+            token in reason
+            for reason in lowered
+            for token in ("schema", "response fields missing", "contract metadata", "fixture")
+        ),
+        units_valid=not any("unit" in reason for reason in lowered),
+        timestamp_semantic_valid=not any(
+            token in reason
+            for reason in lowered
+            for token in ("timestamp semantic", "future exchange timestamp", "timestamp unit")
+        ),
+        value_domain_valid=not any(
+            token in reason
+            for reason in lowered
+            for token in ("value domain", "ohlcv structure", "negative", "magnitude", "sign")
+        ),
+        source_identity_valid=not any("source identity" in reason for reason in lowered),
+    )
+
+
+def historical_research_usability(
+    events: Sequence[RawMarketEvent], spec: ContractValidationSpec
+) -> HistoricalResearchUsability | None:
+    if spec.timestamp_semantic not in HISTORICAL_TIMESTAMP_SEMANTICS:
+        return None
+    proven = {
+        AvailabilityProvenance.HISTORICAL_EFFECTIVE_TIME,
+        AvailabilityProvenance.EXCHANGE_PUBLISHED_TIME,
+    }
+    proven_events = tuple(item for item in events if item.availability_provenance in proven)
+    provenance = (
+        events[0].availability_provenance
+        if events
+        and all(
+            item.availability_provenance == events[0].availability_provenance for item in events
+        )
+        else AvailabilityProvenance.UNKNOWN
+    )
+    if events and len(proven_events) == len(events):
+        return HistoricalResearchUsability(
+            point_in_time_available=True,
+            availability_provenance=provenance,
+            verdict=CertificationVerdict.PASS,
+            reasons=(),
+        )
+    reason = (
+        "historical event count is zero"
+        if not events
+        else "historical availability is not point-in-time proven"
+    )
+    return HistoricalResearchUsability(
+        point_in_time_available=None,
+        availability_provenance=provenance,
+        verdict=CertificationVerdict.INSUFFICIENT_EVIDENCE,
+        reasons=(reason,),
+    )
+
+
+def validate_certification_reason_invariants(
+    *,
+    reasons: Sequence[str],
+    metrics: CertificationMetrics,
+    funding_interval: FundingIntervalResult | None,
+) -> None:
+    lowered = tuple(reason.lower() for reason in reasons)
+    contradictions: list[str] = []
+    if any("out-of-order" in reason for reason in lowered) and metrics.live_out_of_order_count <= 0:
+        contradictions.append("out-of-order reason requires live_out_of_order_count > 0")
+    if any("clock skew above" in reason for reason in lowered):
+        known_violations = sum(
+            item.clock_skew_seconds is not None
+            and abs(item.clock_skew_seconds * Decimal("1000")) > Decimal("5000")
+            for item in metrics.timing
+        )
+        if known_violations <= 0:
+            contradictions.append("clock skew reason requires a known violating record")
+    if any("interval mismatch" in reason for reason in lowered) and (
+        funding_interval is None
+        or not any("interval mismatch" in item.lower() for item in funding_interval.violations)
+    ):
+        contradictions.append("interval mismatch reason requires an interval violation")
+    if contradictions:
+        raise ValueError(
+            "certification metric/reason invariant failed: " + "; ".join(contradictions)
+        )
 
 
 class CapabilityPromotionService:
@@ -913,15 +1039,7 @@ def certification_metrics(
         (sample_end - item.available_at).total_seconds() > interval * 2 for item in normalized
     )
     ordered = sorted(normalized, key=lambda item: item.received_at)
-    live_ordered = [
-        item for item in ordered if item.timestamp_semantic is TimestampSemantic.REALTIME_EVENT
-    ]
-    out_of_order = sum(
-        previous.exchange_timestamp is not None
-        and current.exchange_timestamp is not None
-        and current.exchange_timestamp < previous.exchange_timestamp
-        for previous, current in pairwise(live_ordered)
-    )
+    out_of_order = live_trade_out_of_order_count(ordered)
     sequences = [item.sequence for item in ordered if item.sequence is not None]
     gaps = sum(current != previous + 1 for previous, current in pairwise(sequences))
     timing = tuple(event_timing_metrics(item) for item in normalized)
@@ -940,6 +1058,7 @@ def certification_metrics(
         value / max(abs(left), abs(right), Decimal("0.000000000001"))
         for value, (left, right) in zip(absolute_errors, cross_source_pairs, strict=True)
     ]
+    candle_alignment, candle_missing, future_timestamps = ohlcv_time_metrics(normalized, spec)
     return CertificationMetrics(
         event_count=len(normalized),
         coverage_ratio=min(Decimal("1"), Decimal(len(unique)) / Decimal(expected)),
@@ -960,9 +1079,75 @@ def certification_metrics(
         historical_source_order_reversed=source_reversed,
         historical_duplicate_count=historical_duplicates,
         historical_timestamp_collision_count=historical_collisions,
-        clock_skew_unknown_count=sum(item.exchange_server_time is None for item in timing),
+        clock_skew_unknown_count=sum(item.clock_skew_seconds is None for item in timing),
+        candle_interval_alignment_violation_count=candle_alignment,
+        candle_missing_count=candle_missing,
+        future_timestamp_count=future_timestamps,
         timing=timing,
     )
+
+
+def live_trade_out_of_order_count(events: Sequence[RawMarketEvent]) -> int:
+    streams: dict[tuple[str, str, str, int], list[RawMarketEvent]] = {}
+    for event in events:
+        if (
+            event.event_type != "trade"
+            or event.timestamp_semantic is not TimestampSemantic.REALTIME_EVENT
+        ):
+            continue
+        key = (
+            event.venue,
+            event.canonical_instrument_id,
+            event.channel,
+            event.connection_epoch or 0,
+        )
+        streams.setdefault(key, []).append(event)
+    count = 0
+    for stream in streams.values():
+        ordered = sorted(stream, key=lambda item: item.received_at)
+        for previous, current in pairwise(ordered):
+            if previous.sequence is not None and current.sequence is not None:
+                count += int(current.sequence < previous.sequence)
+                continue
+            previous_id = str(previous.payload().get("trade_id", ""))
+            current_id = str(current.payload().get("trade_id", ""))
+            if previous_id.isdecimal() and current_id.isdecimal():
+                count += int(int(current_id) < int(previous_id))
+                continue
+            if previous.exchange_timestamp is not None and current.exchange_timestamp is not None:
+                count += int(current.exchange_timestamp < previous.exchange_timestamp)
+    return count
+
+
+def _timeframe_seconds(value: str | None) -> int | None:
+    if not value or len(value) < 2 or not value[:-1].isdigit():
+        return None
+    unit = {"m": 60, "h": 3600, "d": 86400}.get(value[-1])
+    return int(value[:-1]) * unit if unit is not None else None
+
+
+def ohlcv_time_metrics(
+    events: Sequence[RawMarketEvent], spec: ContractValidationSpec
+) -> tuple[int, int, int]:
+    if spec.capability != "ohlcv":
+        return 0, 0, 0
+    timestamps = sorted(
+        item.exchange_timestamp for item in events if item.exchange_timestamp is not None
+    )
+    now = max((item.received_at for item in events), default=datetime.now(UTC))
+    future = sum(item > now + timedelta(seconds=5) for item in timestamps)
+    timeframe = next(
+        (_timeframe_seconds(item.timeframe) for item in events if item.timeframe), None
+    )
+    if timeframe is None:
+        return 0, 0, future
+    alignment = sum(int(item.timestamp()) % timeframe != 0 for item in timestamps)
+    missing = sum(
+        max(0, int((current - previous).total_seconds()) // timeframe - 1)
+        for previous, current in pairwise(timestamps)
+        if current > previous
+    )
+    return alignment, missing, future
 
 
 def event_timing_metrics(event: RawMarketEvent) -> EventTimingMetrics:
@@ -981,6 +1166,8 @@ def event_timing_metrics(event: RawMarketEvent) -> EventTimingMetrics:
     skew = (
         Decimal(str((event.received_at - event.exchange_server_time).total_seconds()))
         if event.exchange_server_time is not None
+        and event.timestamp_semantic
+        not in {TimestampSemantic.CANDLE_OPEN_TIME, TimestampSemantic.CANDLE_CLOSE_TIME}
         else None
     )
     return EventTimingMetrics(
@@ -1027,7 +1214,15 @@ def analyze_funding_intervals(
     events: Sequence[RawMarketEvent], spec: ContractValidationSpec
 ) -> FundingIntervalResult:
     if spec.funding_interval_seconds is None:
-        return FundingIntervalResult((), 0, 0, 0, ("funding interval is not declared",), ())
+        return FundingIntervalResult(
+            (),
+            0,
+            None,
+            0,
+            ("funding interval is not declared",),
+            (),
+            "NOT_EVALUATED",
+        )
     finalized: dict[datetime, RawMarketEvent] = {}
     duplicate_count = 0
     for event in events:
@@ -1075,15 +1270,20 @@ def analyze_funding_intervals(
                 schedule_change=changed,
             )
         )
+    window_assessment = "EVALUATED"
+    reported_missing: int | None = missing_total
     if len(timestamps) < 2:
         insufficiencies.append("funding window evidence is insufficient")
+        window_assessment = "NOT_EVALUATED"
+        reported_missing = None
     return FundingIntervalResult(
         observations=tuple(observations),
         duplicate_count=duplicate_count,
-        missing_window_count=missing_total,
+        missing_window_count=reported_missing,
         schedule_change_count=schedule_changes,
         violations=tuple(dict.fromkeys(violations)),
         insufficiencies=tuple(dict.fromkeys(insufficiencies)),
+        window_assessment=window_assessment,
     )
 
 
@@ -1190,6 +1390,11 @@ def write_certification_artifacts(
     events: Sequence[RawMarketEvent],
     promotion: TrustedCapabilityRecord | None = None,
 ) -> Path:
+    validate_certification_reason_invariants(
+        reasons=certification.reasons,
+        metrics=evidence.metrics,
+        funding_interval=evidence.funding_interval,
+    )
     directory = root / certification.certification_id
     fixture_dir = directory / "contract-fixtures"
     fixture_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,6 +1446,8 @@ def write_certification_artifacts(
         f"- Instrument: {certification.canonical_instrument_id}\n"
         f"- Capability: {certification.capability}\n"
         f"- Verdict: **{certification.verdict.value}**\n"
+        f"- Capability contract: {evidence.capability_contract}\n"
+        f"- Historical research usability: {evidence.historical_research_usability}\n"
         f"- Events: {certification.event_count}\n"
         f"- Coverage: {evidence.metrics.coverage_ratio}\n"
         f"- Source: {contract.source_endpoint}\n"
@@ -1260,6 +1467,7 @@ def write_certification_artifacts(
         "certification": asdict(certification),
         "contract": asdict(contract),
         "evidence": asdict(evidence),
+        "artifact_invariant": "PASS",
         "files": {
             str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in manifest_files
@@ -1350,6 +1558,11 @@ def _evidence(payload: str) -> CertificationEvidence:
             raw.get("historical_timestamp_collision_count", 0)
         ),
         clock_skew_unknown_count=int(raw.get("clock_skew_unknown_count", 0)),
+        candle_interval_alignment_violation_count=int(
+            raw.get("candle_interval_alignment_violation_count", 0)
+        ),
+        candle_missing_count=int(raw.get("candle_missing_count", 0)),
+        future_timestamp_count=int(raw.get("future_timestamp_count", 0)),
         timing=timing,
     )
     funding_raw = data.get("funding_interval")
@@ -1370,16 +1583,38 @@ def _evidence(payload: str) -> CertificationEvidence:
                 for item in funding_raw["observations"]
             ),
             duplicate_count=int(funding_raw["duplicate_count"]),
-            missing_window_count=int(funding_raw["missing_window_count"]),
+            missing_window_count=(
+                int(funding_raw["missing_window_count"])
+                if funding_raw["missing_window_count"] is not None
+                else None
+            ),
             schedule_change_count=int(funding_raw["schedule_change_count"]),
             violations=tuple(funding_raw["violations"]),
             insufficiencies=tuple(funding_raw["insufficiencies"]),
+            window_assessment=str(funding_raw.get("window_assessment", "EVALUATED")),
         )
+    contract_raw = data.get("capability_contract")
+    research_raw = data.get("historical_research_usability")
     return CertificationEvidence(
         **{
             **data,
             "metrics": metrics,
             "event_manifest": tuple(tuple(item) for item in data["event_manifest"]),
             "funding_interval": funding_interval,
+            "capability_contract": (
+                CapabilityContractVerdict(**contract_raw) if contract_raw is not None else None
+            ),
+            "historical_research_usability": (
+                HistoricalResearchUsability(
+                    point_in_time_available=research_raw["point_in_time_available"],
+                    availability_provenance=AvailabilityProvenance(
+                        research_raw["availability_provenance"]
+                    ),
+                    verdict=CertificationVerdict(research_raw["verdict"]),
+                    reasons=tuple(research_raw["reasons"]),
+                )
+                if research_raw is not None
+                else None
+            ),
         }
     )

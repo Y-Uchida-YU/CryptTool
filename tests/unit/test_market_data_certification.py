@@ -16,6 +16,7 @@ from app.adapters.exchanges.websocket import ReconciliationState
 from app.domain.venues.models import CapabilitySupport
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRecord
 from app.infrastructure.database.models import Base
+from app.services.research import funding_diagnostic as funding_diagnostic_module
 from app.services.research.certification import (
     FUNDING_CARRY_REQUIREMENT,
     CapabilityAuditArtifactResolver,
@@ -38,9 +39,17 @@ from app.services.research.certification import (
     reconcile_funding_current_history,
     reconcile_values,
     require_operator_approval,
+    validate_certification_reason_invariants,
     validate_funding_interval,
     validate_order_book_events,
     write_certification_artifacts,
+)
+from app.services.research.funding_diagnostic import (
+    FundingHistoryEmptyReason,
+    NormalizedFundingItem,
+    apply_funding_checkpoint,
+    deduplicate_funding_items,
+    diagnose_funding_history,
 )
 from app.services.research.models import (
     AvailabilityProvenance,
@@ -219,7 +228,8 @@ def test_old_ohlcv_candle_is_not_clock_skew() -> None:
         exchange_server_time=NOW,
     )
     metrics = certification_metrics((old,), spec("ohlcv"), NOW - timedelta(minutes=1), NOW, ())
-    assert metrics.maximum_clock_skew_ms == Decimal("0")
+    assert metrics.maximum_clock_skew_ms is None
+    assert metrics.clock_skew_unknown_count == 1
     assert metrics.timing[0].event_age_seconds == Decimal(str(timedelta(days=7).total_seconds()))
 
 
@@ -381,6 +391,298 @@ def test_historical_availability_provenance_blocks_unsupported_research() -> Non
     )
     assert manifest.eligibility_status == "FINALIZED_NOT_ELIGIBLE"
     assert "historical availability is not point-in-time proven" in manifest.eligibility_reasons
+
+
+def test_historical_ohlcv_can_pass_contract_while_research_is_insufficient() -> None:
+    unproven = replace(
+        event("ohlcv"),
+        availability_provenance=AvailabilityProvenance.OBSERVED_RETRIEVAL_TIME,
+        exchange_server_time=None,
+    )
+    repository = InMemoryCertificationRepository()
+    service = MarketDataCertificationService(
+        repository,
+        root=ROOT,
+        commit_sha=COMMIT,
+        adapter_version="adapter-v1",
+        source_version="source-v1",
+    )
+    certification = service.certify(
+        certification_id="ohlcv-contract-research-split",
+        spec=spec("ohlcv"),
+        events=(unproven,),
+        sample_start=NOW - timedelta(minutes=1),
+        sample_end=NOW,
+        cross_source_pairs=((Decimal("100"), Decimal("100")),),
+    )
+    evidence = repository.get(certification.certification_id)[1]  # type: ignore[index]
+    assert certification.verdict is CertificationVerdict.PASS
+    assert evidence.capability_contract is not None
+    assert all(vars(evidence.capability_contract).values())
+    assert evidence.historical_research_usability is not None
+    assert (
+        evidence.historical_research_usability.verdict is CertificationVerdict.INSUFFICIENT_EVIDENCE
+    )
+
+
+def _trade_with_order(
+    *,
+    event_id: str,
+    instrument: str = "BTC",
+    timestamp: datetime = NOW,
+    trade_id: str = "1",
+    sequence: int | None = None,
+    connection_epoch: int = 1,
+) -> RawMarketEvent:
+    base = event("trade", instrument=instrument, event_id=event_id, exchange_timestamp=timestamp)
+    payload = {**base.payload(), "trade_id": trade_id}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return replace(
+        base,
+        raw_payload=raw,
+        payload_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+        sequence=sequence,
+        channel="trades",
+        connection_epoch=connection_epoch,
+    )
+
+
+def test_trade_ordering_is_isolated_by_instrument() -> None:
+    btc = _trade_with_order(event_id="btc", instrument="BTC", timestamp=NOW, trade_id="2")
+    sol = _trade_with_order(
+        event_id="sol", instrument="SOL", timestamp=NOW - timedelta(seconds=1), trade_id="1"
+    )
+    metrics = certification_metrics((btc, sol), spec("trade"), NOW - timedelta(minutes=1), NOW, ())
+    assert metrics.live_out_of_order_count == 0
+
+
+def test_trade_ordering_is_isolated_by_connection_epoch() -> None:
+    old = _trade_with_order(event_id="old", timestamp=NOW, trade_id="2", connection_epoch=1)
+    reconnected = _trade_with_order(
+        event_id="new", timestamp=NOW - timedelta(seconds=1), trade_id="1", connection_epoch=2
+    )
+    metrics = certification_metrics(
+        (old, reconnected), spec("trade"), NOW - timedelta(minutes=1), NOW, ()
+    )
+    assert metrics.live_out_of_order_count == 0
+
+
+def test_equal_trade_timestamp_is_allowed() -> None:
+    first = _trade_with_order(event_id="first", trade_id="trade-a")
+    second = _trade_with_order(event_id="second", trade_id="trade-b")
+    metrics = certification_metrics(
+        (first, second), spec("trade"), NOW - timedelta(minutes=1), NOW, ()
+    )
+    assert metrics.live_out_of_order_count == 0
+
+
+def test_trade_id_ordering_is_preferred() -> None:
+    first = _trade_with_order(event_id="first", timestamp=NOW, trade_id="2")
+    second = _trade_with_order(
+        event_id="second", timestamp=NOW + timedelta(seconds=1), trade_id="1"
+    )
+    metrics = certification_metrics(
+        (first, second), spec("trade"), NOW - timedelta(minutes=1), NOW, ()
+    )
+    assert metrics.live_out_of_order_count == 1
+
+
+def test_zero_funding_events_cannot_report_zero_missing_windows() -> None:
+    result = analyze_funding_intervals((), spec("funding_history"))
+    assert result.missing_window_count is None
+    assert result.window_assessment == "NOT_EVALUATED"
+
+
+@pytest.mark.asyncio
+async def test_funding_history_api_empty_reason_is_explicit() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[]))
+    )
+    result = await diagnose_funding_history(venue="hyperliquid", instrument="BTC", client=client)
+    await client.aclose()
+    assert result.diagnostic.empty_reason is FundingHistoryEmptyReason.API_EMPTY
+
+
+@pytest.mark.asyncio
+async def test_bitget_funding_diagnostic_writes_sanitized_artifact(tmp_path: Path) -> None:
+    response = {
+        "code": "00000",
+        "data": [{"fundingTime": int(NOW.timestamp() * 1000), "fundingRate": "0.0001"}],
+    }
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=response))
+    )
+    result = await diagnose_funding_history(venue="bitget", instrument="SOL", client=client)
+    await client.aclose()
+    path = result.write(tmp_path)
+    assert path.is_file()
+    assert (tmp_path / "raw-response.json").is_file()
+    assert result.diagnostic.response_ordering == "SINGLE"
+    assert result.diagnostic.symbol_mapping == "SOL->SOLUSDT"
+
+
+@pytest.mark.asyncio
+async def test_funding_diagnostic_distinguishes_parameter_and_normalization_errors() -> None:
+    invalid_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, json={"error": "bad"}))
+    )
+    invalid = await diagnose_funding_history(
+        venue="hyperliquid", instrument="BTC", client=invalid_client
+    )
+    await invalid_client.aclose()
+    assert invalid.diagnostic.empty_reason is FundingHistoryEmptyReason.PARAMETER_INVALID
+
+    rejected_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[{"time": "x"}]))
+    )
+    rejected = await diagnose_funding_history(
+        venue="hyperliquid", instrument="BTC", client=rejected_client
+    )
+    await rejected_client.aclose()
+    assert rejected.diagnostic.empty_reason is FundingHistoryEmptyReason.NORMALIZATION_REJECTED_ALL
+
+
+def test_funding_pagination_overlap_deduplicates() -> None:
+    one = NormalizedFundingItem("hyperliquid", "BTC", NOW, "0.1")
+    assert deduplicate_funding_items((one, one)) == (one,)
+
+
+def test_funding_diagnostic_ordering_and_secret_sanitization() -> None:
+    assert funding_diagnostic_module._ordering(()) == "EMPTY"
+    assert funding_diagnostic_module._ordering((NOW,)) == "SINGLE"
+    assert funding_diagnostic_module._ordering((NOW, NOW + timedelta(hours=1))) == "ASCENDING"
+    assert funding_diagnostic_module._ordering((NOW, NOW - timedelta(hours=1))) == "DESCENDING"
+    assert (
+        funding_diagnostic_module._ordering(
+            (NOW, NOW + timedelta(hours=1), NOW - timedelta(hours=1))
+        )
+        == "MIXED"
+    )
+    assert funding_diagnostic_module._sanitize({"api_key": "secret", "nested": [{"value": 1}]}) == {
+        "api_key": "***",
+        "nested": [{"value": 1}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_funding_diagnostic_reports_pagination_and_symbol_error() -> None:
+    rows = [
+        {"fundingTime": int((NOW - timedelta(hours=index)).timestamp() * 1000), "fundingRate": "0"}
+        for index in range(100)
+    ]
+    paged_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"code": "00000", "data": rows})
+        )
+    )
+    paged = await diagnose_funding_history(venue="bitget", instrument="BTC", client=paged_client)
+    await paged_client.aclose()
+    assert paged.diagnostic.pagination_cursor == "pageNo=2"
+    assert "PAGINATION_REQUIRED" in paged.diagnostic.rejection_reasons
+
+    symbol_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(404, json={"error": "symbol not found"})
+        )
+    )
+    missing = await diagnose_funding_history(
+        venue="hyperliquid", instrument="BTC", client=symbol_client
+    )
+    await symbol_client.aclose()
+    assert missing.diagnostic.empty_reason is FundingHistoryEmptyReason.SYMBOL_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_funding_diagnostic_rejects_unsupported_venue() -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        await diagnose_funding_history(venue="unknown", instrument="BTC")
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_funding_backfill_normalizes_and_deduplicates() -> None:
+    rows = [
+        {"time": int((NOW - timedelta(hours=1)).timestamp() * 1000), "fundingRate": "0.1"},
+        {"time": int((NOW - timedelta(hours=1)).timestamp() * 1000), "fundingRate": "0.1"},
+    ]
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=rows)),
+        base_url="https://api.hyperliquid.xyz",
+    )
+    values = await HyperliquidMarketDataAdapter(client).fetch_funding_rates(
+        "BTC", start=NOW - timedelta(days=1), end=NOW
+    )
+    await client.aclose()
+    assert len(values) == 1
+    assert values[0].funding_interval_seconds == 3600
+
+
+@pytest.mark.asyncio
+async def test_bitget_funding_backfill_paginates_and_deduplicates_overlap() -> None:
+    page_one = [
+        {
+            "fundingTime": int((NOW - timedelta(hours=8 * index)).timestamp() * 1000),
+            "fundingRate": "0.0001",
+        }
+        for index in range(100)
+    ]
+    overlap = page_one[-1]
+    older = {
+        "fundingTime": int((NOW - timedelta(hours=8 * 100)).timestamp() * 1000),
+        "fundingRate": "0.0002",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("pageNo")
+        return httpx.Response(200, json={"data": page_one if page == "1" else [overlap, older]})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.bitget.com"
+    )
+    values = await BitgetMarketDataAdapter(client).fetch_funding_rates(
+        "BTCUSDT", start=NOW - timedelta(days=40), end=NOW + timedelta(hours=1)
+    )
+    await client.aclose()
+    assert len(values) == 101
+    assert values[0].exchange_timestamp < values[-1].exchange_timestamp  # type: ignore[operator]
+
+
+def test_funding_checkpoint_cannot_silently_filter_all_history() -> None:
+    one = NormalizedFundingItem("hyperliquid", "BTC", NOW, "0.1")
+    retained, reason = apply_funding_checkpoint((one,), NOW)
+    assert retained == ()
+    assert reason is FundingHistoryEmptyReason.CHECKPOINT_FILTERED_ALL
+
+
+def test_certification_reasons_derive_from_metrics() -> None:
+    first = _trade_with_order(event_id="first", timestamp=NOW, trade_id="2")
+    second = _trade_with_order(
+        event_id="second", timestamp=NOW + timedelta(seconds=1), trade_id="1"
+    )
+    repository = InMemoryCertificationRepository()
+    certification = MarketDataCertificationService(
+        repository,
+        root=ROOT,
+        commit_sha=COMMIT,
+        adapter_version="adapter-v1",
+        source_version="source-v1",
+    ).certify(
+        certification_id="metric-derived-reason",
+        spec=spec("trade"),
+        events=(first, second),
+        sample_start=NOW - timedelta(minutes=1),
+        sample_end=NOW + timedelta(seconds=2),
+    )
+    assert "live out-of-order events detected" in certification.reasons
+
+
+def test_metric_reason_contradiction_fails_finalization() -> None:
+    metrics = certification_metrics((), spec("trade"), NOW - timedelta(minutes=1), NOW, ())
+    with pytest.raises(ValueError, match="invariant failed"):
+        validate_certification_reason_invariants(
+            reasons=("live out-of-order events detected",),
+            metrics=metrics,
+            funding_interval=None,
+        )
 
 
 def test_funding_decimal_unit_normalization() -> None:

@@ -132,6 +132,7 @@ from app.services.research.data_operations import (
     write_collector_health_report,
     write_snapshot_manifest,
 )
+from app.services.research.funding_diagnostic import diagnose_funding_history
 from app.services.research.models import (
     RawMarketEvent,
     ResearchRunResult,
@@ -258,6 +259,45 @@ def certification_preflight(
     """Fail closed before a market-data certification LaunchAgent is registered."""
     payload, _ = _certification_preflight_payload(config)
     typer.echo(json.dumps(payload, sort_keys=True))
+
+
+@app.command("diagnose-funding-history")
+def diagnose_funding_history_command(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    venue: Annotated[str, typer.Option("--venue")],
+    instrument: Annotated[str, typer.Option("--instrument")],
+) -> None:
+    """Run one public funding-history diagnostic without starting a collector."""
+    settings = _settings_from_yaml(config)
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("funding diagnostic requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("funding diagnostic refuses execution credentials")
+    normalized_venue = venue.lower()
+    normalized_instrument = instrument.upper()
+    if normalized_venue not in {"hyperliquid", "bitget"}:
+        raise typer.BadParameter("venue must be hyperliquid or bitget")
+    if normalized_instrument not in {"BTC", "SOL"}:
+        raise typer.BadParameter("instrument must be BTC or SOL")
+    result = asyncio.run(
+        diagnose_funding_history(
+            venue=normalized_venue,
+            instrument=normalized_instrument,
+        )
+    )
+    root = Path(settings.market_data_certification.artifact_root).resolve()
+    diagnostic_id = (
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{normalized_venue}-{normalized_instrument}"
+    )
+    directory = root / "funding-diagnostics" / diagnostic_id
+    artifact = result.write(directory)
+    typer.echo(
+        json.dumps(
+            {**asdict(result.diagnostic), "artifact": artifact, "live_execution": "OFF"},
+            default=_json_default,
+            sort_keys=True,
+        )
+    )
 
 
 def _certification_launch_spec(

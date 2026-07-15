@@ -447,6 +447,13 @@ class PublicAdapterCollectorSource:
                     values = await self.adapter.fetch_funding_rates(
                         identity.venue_symbol, start=funding_start
                     )
+                    if not values and funding_start is not None:
+                        backfill_end = datetime.now(UTC)
+                        values = await self.adapter.fetch_funding_rates(
+                            identity.venue_symbol,
+                            start=backfill_end - timedelta(days=30),
+                            end=backfill_end,
+                        )
             elif identity.event_type == "open_interest":
                 values = await self.adapter.fetch_open_interest(identity.venue_symbol, start=start)
             else:
