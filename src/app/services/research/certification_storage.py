@@ -56,8 +56,9 @@ def _test_storage_override() -> bool:
 
 def is_temporary_path(path: Path) -> bool:
     resolved = path.expanduser().resolve()
+    # These paths are comparison sentinels that are explicitly rejected as storage roots.
     forbidden = {
-        Path("/tmp").resolve(),
+        Path("/tmp").resolve(),  # nosec B108
         Path("/private/tmp").resolve(),
         Path(tempfile.gettempdir()).resolve(),
     }
