@@ -104,6 +104,12 @@ class EventTimingMetrics:
     event_age_seconds: Decimal | None
     transport_latency_seconds: Decimal | None
     clock_skew_seconds: Decimal | None
+    event_id: str = ""
+    timestamp_semantic: str = TimestampSemantic.RECEIPT_ONLY.value
+    availability_provenance: str = AvailabilityProvenance.UNKNOWN.value
+    source_endpoint: str = "unknown"
+    raw_payload_sha256: str = ""
+    clock_skew_formula: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +259,14 @@ class CertificationMetrics:
     historical_duplicate_count: int = 0
     historical_timestamp_collision_count: int = 0
     clock_skew_unknown_count: int = 0
+    clock_skew_known_sample_count: int = 0
+    clock_skew_violation_count: int = 0
+    clock_skew_violation_ratio: Decimal | None = None
+    median_clock_skew_ms: Decimal | None = None
+    p95_clock_skew_ms: Decimal | None = None
+    clock_skew_threshold_ms: Decimal = Decimal("5000")
+    clock_skew_minimum_sample_count: int = 1
+    clock_skew_maximum_violation_ratio: Decimal = Decimal("0.05")
     candle_interval_alignment_violation_count: int = 0
     candle_missing_count: int = 0
     future_timestamp_count: int = 0
@@ -290,6 +304,8 @@ class ContractValidationSpec:
     maximum_relative_error: Decimal = Decimal("0.01")
     maximum_absolute_error: Decimal | None = None
     timestamp_semantic: TimestampSemantic = TimestampSemantic.RECEIPT_ONLY
+    minimum_clock_skew_sample_count: int = 1
+    maximum_clock_skew_violation_ratio: Decimal = Decimal("0.05")
 
     def validate(self, root: Path) -> tuple[str, ...]:
         reasons: list[str] = []
@@ -551,14 +567,16 @@ class MarketDataCertificationService:
             insufficiencies.append("coverage ratio below threshold")
         if metrics.stale_ratio > spec.maximum_stale_ratio:
             insufficiencies.append("stale ratio above threshold")
-        if metrics.clock_skew_unknown_count and spec.timestamp_semantic not in {
-            TimestampSemantic.CANDLE_OPEN_TIME,
-            TimestampSemantic.CANDLE_CLOSE_TIME,
-        }:
+        if (
+            metrics.clock_skew_known_sample_count < spec.minimum_clock_skew_sample_count
+            and spec.timestamp_semantic
+            not in {TimestampSemantic.CANDLE_OPEN_TIME, TimestampSemantic.CANDLE_CLOSE_TIME}
+        ):
             insufficiencies.append("exchange server time unavailable")
         if (
-            metrics.maximum_clock_skew_ms is not None
-            and metrics.maximum_clock_skew_ms > spec.maximum_clock_skew_ms
+            metrics.clock_skew_known_sample_count >= spec.minimum_clock_skew_sample_count
+            and metrics.clock_skew_violation_ratio is not None
+            and metrics.clock_skew_violation_ratio > spec.maximum_clock_skew_violation_ratio
         ):
             failures.append("clock skew above threshold")
         if metrics.live_out_of_order_count > 0:
@@ -772,13 +790,16 @@ def validate_certification_reason_invariants(
     if any("out-of-order" in reason for reason in lowered) and metrics.live_out_of_order_count <= 0:
         contradictions.append("out-of-order reason requires live_out_of_order_count > 0")
     if any("clock skew above" in reason for reason in lowered):
-        known_violations = sum(
-            item.clock_skew_seconds is not None
-            and abs(item.clock_skew_seconds * Decimal("1000")) > Decimal("5000")
-            for item in metrics.timing
+        threshold_exceeded = (
+            metrics.clock_skew_known_sample_count >= metrics.clock_skew_minimum_sample_count
+            and metrics.clock_skew_violation_count > 0
+            and metrics.clock_skew_violation_ratio is not None
+            and metrics.clock_skew_violation_ratio > metrics.clock_skew_maximum_violation_ratio
         )
-        if known_violations <= 0:
-            contradictions.append("clock skew reason requires a known violating record")
+        if not threshold_exceeded:
+            contradictions.append(
+                "clock skew reason requires minimum samples and violation ratio above threshold"
+            )
     if any("interval mismatch" in reason for reason in lowered) and (
         funding_interval is None
         or not any("interval mismatch" in item.lower() for item in funding_interval.violations)
@@ -1046,17 +1067,23 @@ def certification_metrics(
     out_of_order = live_trade_out_of_order_count(ordered)
     sequences = [item.sequence for item in ordered if item.sequence is not None]
     gaps = sum(current != previous + 1 for previous, current in pairwise(sequences))
-    timing = tuple(event_timing_metrics(item) for item in normalized)
+    timing = tuple(
+        event_timing_metrics(item, source_endpoint=spec.source_endpoint) for item in normalized
+    )
     latencies = sorted(
         item.transport_latency_seconds * Decimal("1000")
         for item in timing
         if item.transport_latency_seconds is not None
     )
-    clock_skews = [
+    clock_skews = sorted(
         abs(item.clock_skew_seconds * Decimal("1000"))
         for item in timing
         if item.clock_skew_seconds is not None
-    ]
+    )
+    clock_skew_violations = [value for value in clock_skews if value > spec.maximum_clock_skew_ms]
+    clock_skew_ratio = (
+        Decimal(len(clock_skew_violations)) / Decimal(len(clock_skews)) if clock_skews else None
+    )
     absolute_errors = [abs(left - right) for left, right in cross_source_pairs]
     relative_errors = [
         value / max(abs(left), abs(right), Decimal("0.000000000001"))
@@ -1084,6 +1111,16 @@ def certification_metrics(
         historical_duplicate_count=historical_duplicates,
         historical_timestamp_collision_count=historical_collisions,
         clock_skew_unknown_count=sum(item.clock_skew_seconds is None for item in timing),
+        clock_skew_known_sample_count=len(clock_skews),
+        clock_skew_violation_count=len(clock_skew_violations),
+        clock_skew_violation_ratio=clock_skew_ratio,
+        median_clock_skew_ms=(Decimal(str(median(clock_skews))) if clock_skews else None),
+        p95_clock_skew_ms=(
+            clock_skews[max(0, (95 * len(clock_skews) + 99) // 100 - 1)] if clock_skews else None
+        ),
+        clock_skew_threshold_ms=spec.maximum_clock_skew_ms,
+        clock_skew_minimum_sample_count=spec.minimum_clock_skew_sample_count,
+        clock_skew_maximum_violation_ratio=spec.maximum_clock_skew_violation_ratio,
         candle_interval_alignment_violation_count=candle_alignment,
         candle_missing_count=candle_missing,
         future_timestamp_count=future_timestamps,
@@ -1159,7 +1196,9 @@ def ohlcv_time_metrics(
     return alignment, missing, future
 
 
-def event_timing_metrics(event: RawMarketEvent) -> EventTimingMetrics:
+def event_timing_metrics(
+    event: RawMarketEvent, *, source_endpoint: str = "unknown"
+) -> EventTimingMetrics:
     historical = event.timestamp_semantic in HISTORICAL_TIMESTAMP_SEMANTICS
     event_age = (
         Decimal(str((event.received_at - event.exchange_timestamp).total_seconds()))
@@ -1175,8 +1214,7 @@ def event_timing_metrics(event: RawMarketEvent) -> EventTimingMetrics:
     skew = (
         Decimal(str((event.received_at - event.exchange_server_time).total_seconds()))
         if event.exchange_server_time is not None
-        and event.timestamp_semantic
-        not in {TimestampSemantic.CANDLE_OPEN_TIME, TimestampSemantic.CANDLE_CLOSE_TIME}
+        and event.timestamp_semantic not in HISTORICAL_TIMESTAMP_SEMANTICS
         else None
     )
     return EventTimingMetrics(
@@ -1187,6 +1225,12 @@ def event_timing_metrics(event: RawMarketEvent) -> EventTimingMetrics:
         event_age_seconds=event_age,
         transport_latency_seconds=transport,
         clock_skew_seconds=skew,
+        event_id=event.event_id,
+        timestamp_semantic=event.timestamp_semantic.value,
+        availability_provenance=event.availability_provenance.value,
+        source_endpoint=source_endpoint,
+        raw_payload_sha256=event.source_payload_sha256 or event.payload_sha256,
+        clock_skew_formula=("received_at - exchange_server_time" if skew is not None else None),
     )
 
 
@@ -1419,6 +1463,13 @@ def write_certification_artifacts(
         )
     metrics_path = directory / "metrics.json"
     metrics_path.write_text(_json(asdict(evidence.metrics)) + "\n", encoding="utf-8")
+    with (directory / "clock-skew-evidence.csv").open("w", encoding="utf-8", newline="") as handle:
+        timing_writer = csv.DictWriter(
+            handle,
+            fieldnames=tuple(EventTimingMetrics.__dataclass_fields__),
+        )
+        timing_writer.writeheader()
+        timing_writer.writerows(asdict(item) for item in evidence.metrics.timing)
     with (directory / "reconciliation.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(("metric", "value"))
@@ -1543,6 +1594,16 @@ def _evidence(payload: str) -> CertificationEvidence:
                 if item["clock_skew_seconds"] is not None
                 else None
             ),
+            event_id=str(item.get("event_id", "")),
+            timestamp_semantic=str(
+                item.get("timestamp_semantic", TimestampSemantic.RECEIPT_ONLY.value)
+            ),
+            availability_provenance=str(
+                item.get("availability_provenance", AvailabilityProvenance.UNKNOWN.value)
+            ),
+            source_endpoint=str(item.get("source_endpoint", "unknown")),
+            raw_payload_sha256=str(item.get("raw_payload_sha256", "")),
+            clock_skew_formula=item.get("clock_skew_formula"),
         )
         for item in raw.get("timing", ())
     )
@@ -1567,6 +1628,26 @@ def _evidence(payload: str) -> CertificationEvidence:
             raw.get("historical_timestamp_collision_count", 0)
         ),
         clock_skew_unknown_count=int(raw.get("clock_skew_unknown_count", 0)),
+        clock_skew_known_sample_count=int(raw.get("clock_skew_known_sample_count", 0)),
+        clock_skew_violation_count=int(raw.get("clock_skew_violation_count", 0)),
+        clock_skew_violation_ratio=(
+            Decimal(raw["clock_skew_violation_ratio"])
+            if raw.get("clock_skew_violation_ratio") is not None
+            else None
+        ),
+        median_clock_skew_ms=(
+            Decimal(raw["median_clock_skew_ms"])
+            if raw.get("median_clock_skew_ms") is not None
+            else None
+        ),
+        p95_clock_skew_ms=(
+            Decimal(raw["p95_clock_skew_ms"]) if raw.get("p95_clock_skew_ms") is not None else None
+        ),
+        clock_skew_threshold_ms=Decimal(raw.get("clock_skew_threshold_ms", "5000")),
+        clock_skew_minimum_sample_count=int(raw.get("clock_skew_minimum_sample_count", 1)),
+        clock_skew_maximum_violation_ratio=Decimal(
+            raw.get("clock_skew_maximum_violation_ratio", "0.05")
+        ),
         candle_interval_alignment_violation_count=int(
             raw.get("candle_interval_alignment_violation_count", 0)
         ),

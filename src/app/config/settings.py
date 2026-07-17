@@ -196,6 +196,9 @@ class MarketDataCertificationSettings(BaseModel):
     adapter_version: str = "public-adapters-r4"
     source_version: str = "r4-contract-v1"
     certification_ttl_hours: int = Field(24, ge=1, le=168)
+    maximum_clock_skew_ms: Decimal = Field(Decimal("5000"), gt=0, le=Decimal("30000"))
+    minimum_clock_skew_sample_count: int = Field(20, ge=1, le=10000)
+    maximum_clock_skew_violation_ratio: Decimal = Field(Decimal("0.05"), ge=0, le=1)
     artifact_root: str = "artifacts/certification"
     capability_audit_artifact_directory: str = "artifacts/capability-audit"
 

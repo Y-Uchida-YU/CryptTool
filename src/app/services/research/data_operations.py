@@ -354,16 +354,6 @@ class PublicAdapterCollectorSource:
         await response.aread()
         self._raw_responses.append(response.text)
 
-    async def _exchange_server_time(self) -> datetime | None:
-        loader = getattr(self.adapter, "fetch_server_time", None)
-        if loader is None:
-            return None
-        try:
-            value = await loader()
-        except Exception:
-            return None
-        return utc(value, "exchange_server_time")
-
     def rest_events(
         self,
         identity: ResearchStreamIdentity,
@@ -383,7 +373,6 @@ class PublicAdapterCollectorSource:
         if end <= start:
             raise ValueError("historical end must be after start")
         async with self._http_lock:
-            exchange_server_time = await self._exchange_server_time()
             self._raw_responses.clear()
             if identity.event_type == "ohlcv":
                 values: Sequence[Any] = await self.adapter.fetch_ohlcv(
@@ -408,7 +397,7 @@ class PublicAdapterCollectorSource:
                     identity,
                     value,
                     use_captured_response=True,
-                    exchange_server_time=exchange_server_time,
+                    exchange_server_time=None,
                 )
                 for value in values
             )
@@ -419,7 +408,6 @@ class PublicAdapterCollectorSource:
         checkpoint: CollectionCheckpoint | None,
     ) -> AsyncIterator[CollectedEnvelope]:
         async with self._http_lock:
-            exchange_server_time = await self._exchange_server_time()
             self._raw_responses.clear()
             start = checkpoint.last_available_at if checkpoint else None
             if identity.event_type == "ohlcv":
@@ -463,7 +451,7 @@ class PublicAdapterCollectorSource:
                     identity,
                     value,
                     use_captured_response=True,
-                    exchange_server_time=exchange_server_time,
+                    exchange_server_time=None,
                 )
                 for value in values
             )

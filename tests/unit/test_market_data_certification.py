@@ -209,7 +209,7 @@ def certified(
     return repository, item
 
 
-def test_old_historical_funding_is_event_age_not_clock_skew() -> None:
+def test_historical_funding_effective_time_is_not_clock_skew() -> None:
     old = replace(
         event("funding_history"),
         exchange_timestamp=NOW - timedelta(days=30),
@@ -218,7 +218,7 @@ def test_old_historical_funding_is_event_age_not_clock_skew() -> None:
     timing = event_timing_metrics(old)
     assert timing.event_age_seconds == Decimal(str(timedelta(days=30).total_seconds()))
     assert timing.transport_latency_seconds is None
-    assert timing.clock_skew_seconds == Decimal("0.025")
+    assert timing.clock_skew_seconds is None
 
 
 def test_old_ohlcv_candle_is_not_clock_skew() -> None:
@@ -239,6 +239,101 @@ def test_exchange_server_time_drives_clock_skew_and_missing_is_unknown() -> None
     assert measured.clock_skew_seconds == Decimal("0.02")
     unknown = event_timing_metrics(replace(realtime, exchange_server_time=None))
     assert unknown.clock_skew_seconds is None
+
+
+def test_missing_exchange_server_time_produces_unknown() -> None:
+    metrics = certification_metrics(
+        (replace(event("trade"), exchange_server_time=None),),
+        spec("trade"),
+        NOW - timedelta(minutes=1),
+        NOW,
+        (),
+    )
+    assert metrics.clock_skew_known_sample_count == 0
+    assert metrics.clock_skew_unknown_count == 1
+    assert metrics.clock_skew_violation_ratio is None
+
+
+def _clock_skew_samples(*, count: int, violations: int) -> tuple[RawMarketEvent, ...]:
+    values = []
+    for index in range(count):
+        received = NOW + timedelta(milliseconds=index)
+        skew = timedelta(seconds=6) if index < violations else timedelta(milliseconds=20)
+        values.append(
+            replace(
+                event("trade"),
+                event_id=f"clock-sample-{index}",
+                received_at=received,
+                available_at=received,
+                exchange_server_time=received - skew,
+            )
+        )
+    return tuple(values)
+
+
+def test_single_clock_skew_outlier_below_ratio_threshold_does_not_fail() -> None:
+    events = _clock_skew_samples(count=100, violations=1)
+    policy = replace(
+        spec("trade"),
+        minimum_clock_skew_sample_count=20,
+        maximum_clock_skew_violation_ratio=Decimal("0.05"),
+    )
+    repository = InMemoryCertificationRepository()
+    certification = MarketDataCertificationService(
+        repository,
+        root=ROOT,
+        commit_sha=COMMIT,
+        adapter_version="adapter-v1",
+        source_version="source-v1",
+    ).certify(
+        certification_id="clock-outlier-below-ratio",
+        spec=policy,
+        events=events,
+        sample_start=NOW - timedelta(minutes=1),
+        sample_end=NOW + timedelta(seconds=1),
+    )
+    evidence = repository.get(certification.certification_id)
+    assert evidence is not None
+    assert certification.verdict is CertificationVerdict.PASS
+    assert evidence[1].metrics.clock_skew_violation_count == 1
+    assert evidence[1].metrics.clock_skew_violation_ratio == Decimal("0.01")
+
+
+def test_clock_skew_violation_ratio_above_threshold_fails() -> None:
+    events = _clock_skew_samples(count=20, violations=2)
+    policy = replace(
+        spec("trade"),
+        minimum_clock_skew_sample_count=20,
+        maximum_clock_skew_violation_ratio=Decimal("0.05"),
+    )
+    repository = InMemoryCertificationRepository()
+    certification = MarketDataCertificationService(
+        repository,
+        root=ROOT,
+        commit_sha=COMMIT,
+        adapter_version="adapter-v1",
+        source_version="source-v1",
+    ).certify(
+        certification_id="clock-ratio-failure",
+        spec=policy,
+        events=events,
+        sample_start=NOW - timedelta(minutes=1),
+        sample_end=NOW + timedelta(seconds=1),
+    )
+    assert certification.verdict is CertificationVerdict.FAIL
+    assert "clock skew above threshold" in certification.reasons
+
+
+def test_clock_skew_evidence_identifies_exact_record() -> None:
+    violating = _clock_skew_samples(count=1, violations=1)[0]
+    metrics = certification_metrics(
+        (violating,), spec("trade"), NOW - timedelta(minutes=1), NOW + timedelta(seconds=1), ()
+    )
+    record = metrics.timing[0]
+    assert record.event_id == violating.event_id
+    assert record.raw_payload_sha256 == violating.payload_sha256
+    assert record.source_endpoint == "public:trade"
+    assert record.clock_skew_formula == "received_at - exchange_server_time"
 
 
 def test_descending_historical_history_is_not_live_out_of_order() -> None:

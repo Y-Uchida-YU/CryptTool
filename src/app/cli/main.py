@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
@@ -118,11 +119,13 @@ from app.services.research.certification_runner import (
 )
 from app.services.research.certification_storage import (
     DurableStorageError,
+    atomic_write_json,
     configured_state_dir,
     export_completed_run,
     named_postgres_volume_configured,
     reconstruct_from_artifacts,
     require_durable_path,
+    sha256_file,
     verify_run,
     workspace_for,
 )
@@ -1263,6 +1266,9 @@ def _certification_contract_spec(
     instrument: str,
     root: Path,
     normalization_test_passed: bool = True,
+    maximum_clock_skew_ms: Decimal = Decimal("5000"),
+    minimum_clock_skew_sample_count: int = 20,
+    maximum_clock_skew_violation_ratio: Decimal = Decimal("0.05"),
 ) -> ContractValidationSpec:
     fixture = root / f"tests/contracts/{venue}/public.json"
     endpoints = {
@@ -1341,6 +1347,9 @@ def _certification_contract_spec(
         maximum_stale_ratio=Decimal("0.05"),
         maximum_absolute_error=(Decimal("0.001") if capability == "funding_current" else None),
         timestamp_semantic=semantics.get(capability, TimestampSemantic.RECEIPT_ONLY),
+        maximum_clock_skew_ms=maximum_clock_skew_ms,
+        minimum_clock_skew_sample_count=minimum_clock_skew_sample_count,
+        maximum_clock_skew_violation_ratio=maximum_clock_skew_violation_ratio,
     )
 
 
@@ -1598,6 +1607,13 @@ def run_market_data_certification(
                         instrument=instrument,
                         root=Path.cwd(),
                         normalization_test_passed=normalization_test_passed,
+                        maximum_clock_skew_ms=certification_settings.maximum_clock_skew_ms,
+                        minimum_clock_skew_sample_count=(
+                            certification_settings.minimum_clock_skew_sample_count
+                        ),
+                        maximum_clock_skew_violation_ratio=(
+                            certification_settings.maximum_clock_skew_violation_ratio
+                        ),
                     )
                     if capability.startswith("funding"):
                         observed_interval = _observed_funding_interval(
@@ -1795,6 +1811,259 @@ def verify_certification_run_command(
     finally:
         engine.dispose()
     typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+
+
+def _verify_certification_artifact(manifest_path: Path) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("artifact_invariant") != "PASS":
+        raise DurableStorageError(f"artifact invariant failed: {manifest_path}")
+    for relative, expected in payload.get("files", {}).items():
+        path = manifest_path.parent / relative
+        if not path.is_file() or sha256_file(path) != expected:
+            raise DurableStorageError(f"artifact hash mismatch: {path}")
+
+
+@app.command("recertify-market-data")
+def recertify_market_data_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Re-evaluate immutable saved evidence as a new certification revision."""
+    workspace, settings = _durable_run_settings(run_id)
+    source_artifact = reconstruct_from_artifacts(workspace)
+    source_payload = json.loads(
+        (workspace.root / "certification-records.json").read_text(encoding="utf-8")
+    )
+    source_ids = tuple(str(item["certification"]["certification_id"]) for item in source_payload)
+    engine = build_engine(settings.database_url)
+    revision_id = (
+        f"recertification-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{_current_commit_sha()[:7]}"
+    )
+    revision_root = workspace.root / "revisions" / revision_id
+    certification_root = revision_root / "certifications"
+    if revision_root.exists():
+        raise typer.BadParameter(f"recertification revision already exists: {revision_id}")
+    certification_root.mkdir(parents=True)
+    try:
+        certification_repository = SQLCertificationRepository(engine)
+        research_repository = PostgreSQLResearchRepository(engine)
+        source_records = []
+        event_manifest: set[tuple[str, str]] = set()
+        for certification_id in source_ids:
+            stored = certification_repository.get(certification_id)
+            if stored is None:
+                raise DurableStorageError(
+                    f"source certification is missing from DB: {certification_id}"
+                )
+            source_records.append(stored)
+            event_manifest.update(stored[1].event_manifest)
+        event_by_id = {}
+        for event_id, expected_hash in sorted(event_manifest):
+            event = research_repository.get_experimental_event(event_id)
+            if event is None or event.payload_sha256 != expected_hash:
+                raise DurableStorageError(f"immutable Raw Evidence mismatch: {event_id}")
+            event_by_id[event_id] = event
+        events = tuple(event_by_id[event_id] for event_id in sorted(event_by_id))
+        source_raw_evidence_sha256 = canonical_sha256(
+            tuple((item.event_id, item.payload_sha256) for item in events)
+        )
+        certification_settings = settings.market_data_certification
+        service = MarketDataCertificationService(
+            certification_repository,
+            root=Path.cwd(),
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+            source_version=certification_settings.source_version,
+            certification_ttl=timedelta(hours=certification_settings.certification_ttl_hours),
+        )
+        revisions = []
+        artifact_manifests = []
+        source_timing_reports = []
+        for source_certification, source_evidence in source_records:
+            contract = _certification_contract_spec(
+                venue=source_certification.venue,
+                capability=source_certification.capability,
+                instrument=source_certification.canonical_instrument_id,
+                root=Path.cwd(),
+                normalization_test_passed=source_evidence.normalization_passed,
+                maximum_clock_skew_ms=certification_settings.maximum_clock_skew_ms,
+                minimum_clock_skew_sample_count=(
+                    certification_settings.minimum_clock_skew_sample_count
+                ),
+                maximum_clock_skew_violation_ratio=(
+                    certification_settings.maximum_clock_skew_violation_ratio
+                ),
+            )
+            if source_certification.capability.startswith("funding"):
+                observed_interval = _observed_funding_interval(
+                    events,
+                    venue=source_certification.venue,
+                    instrument=source_certification.canonical_instrument_id,
+                )
+                if observed_interval is not None:
+                    contract = replace(contract, funding_interval_seconds=observed_interval)
+            source_event_keys = set(source_evidence.event_manifest)
+            source_events = tuple(
+                sorted(
+                    (
+                        item
+                        for item in events
+                        if (item.event_id, item.payload_sha256) in source_event_keys
+                    ),
+                    key=lambda item: (
+                        item.exchange_timestamp or item.received_at,
+                        item.event_id,
+                    ),
+                )
+            )
+            if len(source_events) != len(source_evidence.metrics.timing):
+                raise DurableStorageError(
+                    f"source timing/event count mismatch: {source_certification.certification_id}"
+                )
+            source_timing_path = (
+                revision_root / "source-timing" / f"{source_certification.certification_id}.csv"
+            )
+            source_timing_path.parent.mkdir(parents=True, exist_ok=True)
+            with source_timing_path.open("w", encoding="utf-8", newline="") as handle:
+                fieldnames = (
+                    "event_id",
+                    "exchange_timestamp",
+                    "exchange_server_time",
+                    "received_at",
+                    "available_at",
+                    "event_age",
+                    "transport_latency",
+                    "clock_skew",
+                    "timestamp_semantic",
+                    "availability_provenance",
+                    "source_endpoint",
+                    "raw_payload_hash",
+                    "clock_skew_formula",
+                    "clock_skew_timestamp_left",
+                    "clock_skew_timestamp_right",
+                )
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for timing, event in zip(
+                    source_evidence.metrics.timing, source_events, strict=True
+                ):
+                    writer.writerow(
+                        {
+                            "event_id": event.event_id,
+                            "exchange_timestamp": timing.exchange_timestamp,
+                            "exchange_server_time": timing.exchange_server_time,
+                            "received_at": timing.received_at,
+                            "available_at": timing.available_at,
+                            "event_age": timing.event_age_seconds,
+                            "transport_latency": timing.transport_latency_seconds,
+                            "clock_skew": timing.clock_skew_seconds,
+                            "timestamp_semantic": event.timestamp_semantic.value,
+                            "availability_provenance": (event.availability_provenance.value),
+                            "source_endpoint": contract.source_endpoint,
+                            "raw_payload_hash": (
+                                event.source_payload_sha256 or event.payload_sha256
+                            ),
+                            "clock_skew_formula": (
+                                "received_at - exchange_server_time"
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                            "clock_skew_timestamp_left": (
+                                timing.received_at
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                            "clock_skew_timestamp_right": (
+                                timing.exchange_server_time
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                        }
+                    )
+            source_timing_reports.append(source_timing_path)
+            certification_id = (
+                f"{revision_id}-{source_certification.venue}-"
+                f"{source_certification.canonical_instrument_id}-"
+                f"{source_certification.capability}"
+            )
+            revision = service.certify(
+                certification_id=certification_id,
+                spec=contract,
+                events=events,
+                sample_start=source_certification.sample_start,
+                sample_end=source_certification.sample_end,
+                cross_source_pairs=_certification_cross_source_pairs(
+                    events,
+                    venue=source_certification.venue,
+                    instrument=source_certification.canonical_instrument_id,
+                    capability=source_certification.capability,
+                ),
+                audit_passed=source_evidence.audit_passed,
+                audit_run_id=source_evidence.audit_run_id,
+                ci_run_id=source_evidence.ci_run_id,
+                audit_artifact_sha256=source_evidence.audit_artifact_sha256,
+            )
+            stored_revision = certification_repository.get(certification_id)
+            if stored_revision is None:
+                raise DurableStorageError(
+                    f"recertification revision was not persisted: {certification_id}"
+                )
+            manifest_path = write_certification_artifacts(
+                root=certification_root,
+                certification=revision,
+                evidence=stored_revision[1],
+                contract=contract,
+                events=events,
+            )
+            _verify_certification_artifact(manifest_path)
+            artifact_manifests.append(manifest_path)
+            revisions.append(revision)
+        persisted_manifest = []
+        for event_id in sorted(event_by_id):
+            persisted = research_repository.get_experimental_event(event_id)
+            if persisted is None:
+                raise DurableStorageError(f"Raw Evidence disappeared: {event_id}")
+            persisted_manifest.append((event_id, persisted.payload_sha256))
+        persisted_raw_evidence_sha256 = canonical_sha256(tuple(persisted_manifest))
+        if persisted_raw_evidence_sha256 != source_raw_evidence_sha256:
+            raise DurableStorageError("recertification modified source Raw Evidence")
+        counts = {
+            verdict: sum(item.verdict.value == verdict for item in revisions)
+            for verdict in ("pass", "fail", "insufficient_evidence")
+        }
+        manifest = {
+            "revision_id": revision_id,
+            "source_run_id": run_id,
+            "source_commit_sha": source_artifact["run"]["commit_sha"],
+            "recertifier_commit_sha": _current_commit_sha(),
+            "source_artifact_manifest_sha256": source_artifact["run"]["artifact_manifest_sha256"],
+            "source_raw_evidence_sha256": source_raw_evidence_sha256,
+            "raw_evidence_modified": False,
+            "certifications": [asdict(item) for item in revisions],
+            "verdict_counts": counts,
+            "artifact_manifests": {
+                str(path.relative_to(revision_root)): sha256_file(path)
+                for path in artifact_manifests
+            },
+            "source_timing_reports": {
+                str(path.relative_to(revision_root)): sha256_file(path)
+                for path in source_timing_reports
+            },
+            "artifact_verify": "PASS",
+            "live_execution": "OFF",
+            "created_at": datetime.now(UTC),
+        }
+        atomic_write_json(revision_root / "manifest.json", manifest)
+        result = {
+            **manifest,
+            "revision_manifest_sha256": sha256_file(revision_root / "manifest.json"),
+            "artifact": str(revision_root),
+        }
+        typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
 
 
 @app.command("verify-market-data-certification")
