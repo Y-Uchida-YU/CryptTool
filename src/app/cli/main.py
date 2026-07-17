@@ -239,9 +239,10 @@ def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], S
     artifact_root = require_durable_path(artifact_root, purpose="certification artifact root")
     if state_dir != artifact_root and state_dir not in artifact_root.parents:
         raise typer.BadParameter("certification artifact_root must be inside CRYPTTOOL_STATE_DIR")
-    test_override = bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get(
-        "CRYPTTOOL_ALLOW_TEST_STORAGE"
-    ) == "1"
+    test_override = (
+        bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        and os.environ.get("CRYPTTOOL_ALLOW_TEST_STORAGE") == "1"
+    )
     if not test_override and database_url.get_backend_name() != "postgresql":
         raise typer.BadParameter("certification database must be durable PostgreSQL")
     compose_path = Path.cwd() / "docker-compose.yml"
@@ -1811,13 +1812,9 @@ def verify_market_data_certification(
         if evidence.manifest_sha256 != certification.evidence_manifest_sha256:
             raise typer.BadParameter("certification evidence manifest mismatch")
         artifact_root = Path(settings.market_data_certification.artifact_root)
-        durable_matches = tuple(
-            artifact_root.glob(f"*/certifications/{certification_id}")
-        )
+        durable_matches = tuple(artifact_root.glob(f"*/certifications/{certification_id}"))
         directory = (
-            durable_matches[0]
-            if len(durable_matches) == 1
-            else artifact_root / certification_id
+            durable_matches[0] if len(durable_matches) == 1 else artifact_root / certification_id
         )
         manifest_path = directory / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

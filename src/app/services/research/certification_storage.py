@@ -48,9 +48,10 @@ class DurableStorageError(RuntimeError):
 
 
 def _test_storage_override() -> bool:
-    return bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get(
-        TEST_STORAGE_OVERRIDE_ENV
-    ) == "1"
+    return (
+        bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        and os.environ.get(TEST_STORAGE_OVERRIDE_ENV) == "1"
+    )
 
 
 def is_temporary_path(path: Path) -> bool:
@@ -122,9 +123,7 @@ def _json_default(value: object) -> object:
 
 
 def atomic_write_json(path: Path, payload: object) -> None:
-    encoded = (
-        json.dumps(payload, default=_json_default, indent=2, sort_keys=True) + "\n"
-    ).encode()
+    encoded = (json.dumps(payload, default=_json_default, indent=2, sort_keys=True) + "\n").encode()
     atomic_write_bytes(path, encoded)
 
 
@@ -222,17 +221,17 @@ def _run_rows(engine: Engine, run_id: str) -> tuple[Any, list[Any], list[Any], i
         )
         lease_count = int(
             session.scalar(
-                select(func.count()).select_from(CollectorLeaseRow).where(
-                    CollectorLeaseRow.run_id == run_id
-                )
+                select(func.count())
+                .select_from(CollectorLeaseRow)
+                .where(CollectorLeaseRow.run_id == run_id)
             )
             or 0
         )
         production_count = int(
             session.scalar(
-                select(func.count()).select_from(RawMarketEventRow).where(
-                    RawMarketEventRow.capability_verification_run_id.like(f"{run_id}-%")
-                )
+                select(func.count())
+                .select_from(RawMarketEventRow)
+                .where(RawMarketEventRow.capability_verification_run_id.like(f"{run_id}-%"))
             )
             or 0
         )
@@ -269,9 +268,9 @@ def export_completed_run(
         "trade_ordering_metrics": [
             {
                 "certification_id": item["certification"]["certification_id"],
-                "live_out_of_order_count": item["evidence"].get("metrics", {}).get(
-                    "live_out_of_order_count", 0
-                ),
+                "live_out_of_order_count": item["evidence"]
+                .get("metrics", {})
+                .get("live_out_of_order_count", 0),
             }
             for item in records
         ],
@@ -419,8 +418,10 @@ def named_postgres_volume_configured(compose_path: Path) -> bool:
     database = services.get("db") or {}
     mounts = database.get("volumes") or []
     volumes = payload.get("volumes") or {}
-    return any(
-        isinstance(mount, str)
-        and mount.startswith("crypttool_certification_pgdata:")
-        for mount in mounts
-    ) and "crypttool_certification_pgdata" in volumes
+    return (
+        any(
+            isinstance(mount, str) and mount.startswith("crypttool_certification_pgdata:")
+            for mount in mounts
+        )
+        and "crypttool_certification_pgdata" in volumes
+    )
