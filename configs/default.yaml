@@ -38,6 +38,16 @@ continuous_paper:
   maximum_instrument_exposure: 0.40
   maximum_daily_loss: 0.02
   maximum_drawdown: 0.05
+market_data_certification:
+  enabled: false
+  venues: [hyperliquid, bitget]
+  instruments: [BTC, ETH, SOL, HYPE]
+  capabilities: [funding_current, funding_history, mark_price, index_price, open_interest, trade, ohlcv]
+  duration_minutes: 30
+  adapter_version: public-adapters-r4
+  source_version: r4-contract-v1
+  certification_ttl_hours: 24
+  artifact_root: artifacts/certification
 risk:
   leverage: 1.0
   max_risk_per_trade: 0.0025

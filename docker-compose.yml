@@ -27,6 +27,8 @@ services:
     command: ["start-paper-operation", "--config", "configs/paper-operation.yaml"]
   db:
     image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:${CRYPTTOOL_CERTIFICATION_DB_PORT:-55435}:5432"
     environment:
       POSTGRES_DB: cryptbot
       POSTGRES_USER: cryptbot
@@ -36,6 +38,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    volumes: ["crypttool_certification_pgdata:/var/lib/postgresql/data"]
 volumes:
-  postgres-data:
+  crypttool_certification_pgdata:
+    name: crypttool_certification_pgdata

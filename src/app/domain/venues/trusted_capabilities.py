@@ -22,11 +22,14 @@ class TrustedCapabilityRecord:
     source_version: str
     contract_fixture_sha256: str
     audit_run_id: str
+    canonical_instrument_id: str = "*"
 
 
 class TrustedCapabilityRegistry:
     def __init__(self, records: tuple[TrustedCapabilityRecord, ...]) -> None:
-        self._records = {(item.venue, item.capability): item for item in records}
+        self._records = {
+            (item.venue, item.capability, item.canonical_instrument_id): item for item in records
+        }
         if len(self._records) != len(records):
             raise ValueError("duplicate trusted capability records")
 
@@ -42,8 +45,9 @@ class TrustedCapabilityRegistry:
         verified_at: datetime,
         use_case: CapabilityUseCase,
         now: datetime,
+        canonical_instrument_id: str = "*",
     ) -> TrustedCapabilityRecord:
-        record = self._records.get((venue, capability))
+        record = self._record(venue, capability, canonical_instrument_id)
         if record is None:
             raise ValueError("trusted capability record is missing")
         if record.support != CapabilitySupport.LIVE_VERIFIED:
@@ -60,9 +64,14 @@ class TrustedCapabilityRegistry:
         return record
 
     def require_live_verified(
-        self, *, venue: str, capability: str, now: datetime
+        self,
+        *,
+        venue: str,
+        capability: str,
+        now: datetime,
+        canonical_instrument_id: str = "*",
     ) -> TrustedCapabilityRecord:
-        record = self._records.get((venue, capability))
+        record = self._record(venue, capability, canonical_instrument_id)
         if record is None:
             raise ValueError("trusted capability record is missing")
         current = now.astimezone(UTC)
@@ -71,6 +80,14 @@ class TrustedCapabilityRegistry:
         if not record.verified_at <= current <= record.expires_at:
             raise ValueError("trusted capability record is expired or future-dated")
         return record
+
+    def _record(
+        self, venue: str, capability: str, canonical_instrument_id: str
+    ) -> TrustedCapabilityRecord | None:
+        exact = self._records.get((venue, capability, canonical_instrument_id))
+        if exact is not None:
+            return exact
+        return self._records.get((venue, capability, "*"))
 
     @classmethod
     def from_artifacts(

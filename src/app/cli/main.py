@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import secrets
 import signal
 import socket
 import subprocess  # nosec B404
+import sys
 import tempfile
 import time
 from dataclasses import asdict, replace
@@ -23,7 +25,8 @@ import typer
 import yaml  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 
 from app.adapters.exchanges.dex import (
     DydxMarketDataAdapter,
@@ -51,6 +54,7 @@ from app.infrastructure.database.session import build_engine
 from app.services.backtest.engine import BacktestEngine
 from app.services.backtest.events import FundingEvent, MarketEvent, SignalEvent
 from app.services.capability_audit import CapabilityContractAuditor
+from app.services.capability_audit_artifact import verify_capability_audit
 from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 from app.services.operations.collector_health import summarize_collector_health
@@ -78,6 +82,53 @@ from app.services.research.accelerated_validation import (
     HistoricalPublicDatasetLoader,
     run_start_stop_resource_test,
 )
+from app.services.research.certification import (
+    TIER_ONE_CAPABILITIES,
+    CapabilityAuditArtifactResolver,
+    CapabilityPromotionService,
+    ContractValidationSpec,
+    MarketDataCertificationService,
+    ProductionEventCertificationGate,
+    SQLCertificationRepository,
+    write_certification_artifacts,
+)
+from app.services.research.certification_lifecycle import (
+    CertificationCanceled,
+    CertificationLifecycle,
+    CertificationRunRepository,
+    CertificationStage,
+    install_shutdown_signal_handlers,
+    restore_signal_handlers,
+)
+from app.services.research.certification_runner import (
+    LaunchAgentError,
+    LaunchAgentSpec,
+    migration_is_current,
+)
+from app.services.research.certification_runner import (
+    preflight_and_bootstrap as preflight_and_bootstrap_certification_launch_agent,
+)
+from app.services.research.certification_runner import (
+    service_pid as certification_service_pid,
+)
+from app.services.research.certification_runner import (
+    unload as unload_certification_launch_agent,
+)
+from app.services.research.certification_runner import (
+    watchdog as certification_launch_watchdog,
+)
+from app.services.research.certification_storage import (
+    DurableStorageError,
+    atomic_write_json,
+    configured_state_dir,
+    export_completed_run,
+    named_postgres_volume_configured,
+    reconstruct_from_artifacts,
+    require_durable_path,
+    sha256_file,
+    verify_run,
+    workspace_for,
+)
 from app.services.research.collector_runs import (
     CollectorLeaseConflict,
     CollectorRunRecord,
@@ -94,7 +145,13 @@ from app.services.research.data_operations import (
     write_collector_health_report,
     write_snapshot_manifest,
 )
-from app.services.research.models import ResearchRunResult, canonical_sha256
+from app.services.research.funding_diagnostic import diagnose_funding_history
+from app.services.research.models import (
+    RawMarketEvent,
+    ResearchRunResult,
+    TimestampSemantic,
+    canonical_sha256,
+)
 from app.services.research.pipeline import ResearchPipeline
 from app.services.research.report import ResearchArtifactWriter
 from app.services.research.repository import (
@@ -107,6 +164,11 @@ from app.services.validation.splits import anchored_walk_forward, rolling_walk_f
 from app.services.venue_eligibility import eligibility_from_settings
 
 app = typer.Typer(help="CryptBot research and market-regime CLI", no_args_is_help=True)
+
+
+def _redact_database_url(value: str) -> str:
+    url = make_url(value)
+    return url.render_as_string(hide_password=True)
 
 
 def _timestamp(value: Any) -> datetime:
@@ -150,6 +212,241 @@ def _settings_from_yaml(path: Path) -> Settings:
         live["enabled"] = live_enabled.lower() in {"1", "true", "yes", "on"}
         payload["live"] = live
     return Settings(**payload)
+
+
+def _certification_preflight_payload(config: Path) -> tuple[dict[str, object], Settings]:
+    """Validate everything needed before registering a certification LaunchAgent."""
+    resolved_config = config.resolve(strict=True)
+    state_dir = configured_state_dir()
+    require_durable_path(resolved_config, purpose="resolved certification config")
+    require_durable_path(
+        Path(sys.executable), purpose="Python executable", executable_checkout=True
+    )
+    require_durable_path(Path.cwd(), purpose="WorkingDirectory", executable_checkout=True)
+    settings = _settings_from_yaml(resolved_config)
+    certification = settings.market_data_certification
+    if not certification.enabled:
+        raise typer.BadParameter("market_data_certification.enabled=true is required")
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("market-data certification requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("market-data certification refuses execution credentials")
+    _require_nonproduction_database_isolation(settings, run_mode="certification")
+    if settings.production_database_url is None:
+        raise typer.BadParameter("certification requires production_database_url")
+    database_url = make_url(settings.database_url)
+    production_url = make_url(settings.production_database_url)
+    artifact_root = Path(certification.artifact_root)
+    if not artifact_root.is_absolute():
+        raise typer.BadParameter("market_data_certification.artifact_root must be absolute")
+    artifact_root = require_durable_path(artifact_root, purpose="certification artifact root")
+    if state_dir != artifact_root and state_dir not in artifact_root.parents:
+        raise typer.BadParameter("certification artifact_root must be inside CRYPTTOOL_STATE_DIR")
+    test_override = (
+        bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        and os.environ.get("CRYPTTOOL_ALLOW_TEST_STORAGE") == "1"
+    )
+    if not test_override and database_url.get_backend_name() != "postgresql":
+        raise typer.BadParameter("certification database must be durable PostgreSQL")
+    compose_path = Path.cwd() / "docker-compose.yml"
+    if not test_override and not named_postgres_volume_configured(compose_path):
+        raise typer.BadParameter(
+            "named PostgreSQL volume crypttool_certification_pgdata is required"
+        )
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    probe = artifact_root / f".preflight-{os.getpid()}"
+    probe.write_text("writable\n", encoding="utf-8")
+    probe.unlink()
+    engine = build_engine(settings.database_url)
+    try:
+        if not migration_is_current(engine):
+            raise typer.BadParameter("certification database migration is stale")
+    finally:
+        engine.dispose()
+    return (
+        {
+            "status": "PASS",
+            "python_executable": sys.executable,
+            "python_executable_exists": "PASS",
+            "python_version": sys.version.split()[0],
+            "app_import": "PASS",
+            "config": str(resolved_config),
+            "config_load": "PASS",
+            "database_url_parse": database_url.render_as_string(hide_password=True),
+            "certification_database_connection": "PASS",
+            "production_database_identity": production_url.render_as_string(hide_password=True),
+            "database_identity_comparison": "PASS_DISTINCT",
+            "migration_current": "PASS",
+            "artifact_directory": str(artifact_root),
+            "artifact_directory_writable": "PASS",
+            "live_execution": "OFF",
+            "state_dir": str(state_dir),
+            "named_postgresql_volume": "PASS",
+        },
+        settings,
+    )
+
+
+@app.command("certification-preflight")
+def certification_preflight(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+) -> None:
+    """Fail closed before a market-data certification LaunchAgent is registered."""
+    payload, _ = _certification_preflight_payload(config)
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
+@app.command("diagnose-funding-history")
+def diagnose_funding_history_command(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    venue: Annotated[str, typer.Option("--venue")],
+    instrument: Annotated[str, typer.Option("--instrument")],
+) -> None:
+    """Run one public funding-history diagnostic without starting a collector."""
+    settings = _settings_from_yaml(config)
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("funding diagnostic requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("funding diagnostic refuses execution credentials")
+    normalized_venue = venue.lower()
+    normalized_instrument = instrument.upper()
+    if normalized_venue not in {"hyperliquid", "bitget"}:
+        raise typer.BadParameter("venue must be hyperliquid or bitget")
+    if normalized_instrument not in {"BTC", "SOL"}:
+        raise typer.BadParameter("instrument must be BTC or SOL")
+    result = asyncio.run(
+        diagnose_funding_history(
+            venue=normalized_venue,
+            instrument=normalized_instrument,
+        )
+    )
+    root = Path(settings.market_data_certification.artifact_root).resolve()
+    diagnostic_id = (
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{normalized_venue}-{normalized_instrument}"
+    )
+    directory = root / "funding-diagnostics" / diagnostic_id
+    artifact = result.write(directory)
+    typer.echo(
+        json.dumps(
+            {**asdict(result.diagnostic), "artifact": artifact, "live_execution": "OFF"},
+            default=_json_default,
+            sort_keys=True,
+        )
+    )
+
+
+def _certification_launch_spec(
+    *, config: Path, run_id: str, duration_minutes: float
+) -> tuple[LaunchAgentSpec, Settings]:
+    state_dir = configured_state_dir()
+    application_value = os.environ.get("CRYPTTOOL_APPLICATION_DIR")
+    python_value = os.environ.get("CRYPTTOOL_PYTHON_EXECUTABLE")
+    if not application_value or not python_value:
+        raise typer.BadParameter(
+            "CRYPTTOOL_APPLICATION_DIR and CRYPTTOOL_PYTHON_EXECUTABLE are required "
+            "for durable LaunchAgent execution"
+        )
+    root = require_durable_path(
+        Path(application_value),
+        purpose="LaunchAgent WorkingDirectory",
+        executable_checkout=True,
+    )
+    python = require_durable_path(
+        Path(python_value),
+        purpose="LaunchAgent Python executable",
+        executable_checkout=True,
+    )
+    workspace = workspace_for(run_id, state_dir)
+    workspace.initialize()
+    source_config = config.resolve(strict=True)
+    source_settings = _settings_from_yaml(source_config)
+    resolved_config = workspace.persist_resolved_config(
+        source_config,
+        resolved_payload=source_settings.model_dump(mode="json"),
+    )
+    _, settings = _certification_preflight_payload(resolved_config)
+    artifact_root = (state_dir / "certification-runs").resolve()
+    spec = LaunchAgentSpec(
+        run_id=run_id,
+        python_executable=python,
+        repository_root=root,
+        config_path=resolved_config,
+        artifact_root=artifact_root,
+        stdout_path=workspace.stdout_path,
+        stderr_path=workspace.stderr_path,
+        plist_path=workspace.plist_path,
+        state_dir=state_dir,
+        duration_minutes=duration_minutes,
+        uid=os.getuid(),
+    )
+    workspace.persist_environment(spec.environment)
+    return (
+        spec,
+        settings,
+    )
+
+
+@app.command("launch-market-data-certification")
+def launch_market_data_certification(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+    duration_minutes: Annotated[float, typer.Option("--duration-minutes", min=0.01)],
+    wait: Annotated[bool, typer.Option("--wait/--no-wait")] = False,
+    watchdog_seconds: Annotated[float, typer.Option("--watchdog-seconds", min=0.1)] = 60,
+) -> None:
+    """Preflight, register and watch a direct-Python certification LaunchAgent."""
+    spec, settings = _certification_launch_spec(
+        config=config, run_id=run_id, duration_minutes=duration_minutes
+    )
+    engine = build_engine(settings.database_url)
+    registered = False
+    try:
+        preflight = preflight_and_bootstrap_certification_launch_agent(spec)
+        typer.echo(preflight.stdout.strip())
+        registered = True
+        pid = certification_launch_watchdog(spec, engine, timeout=watchdog_seconds)
+        started = datetime.now(UTC)
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "pid": pid,
+                    "service": spec.service,
+                    "python_executable": str(spec.python_executable),
+                    "started_at": started,
+                    "expected_end": started + timedelta(minutes=duration_minutes),
+                    "config": str(spec.config_path),
+                    "database": _redact_database_url(settings.database_url),
+                    "artifact": str(workspace_for(run_id, spec.state_dir).root),
+                    "run_registry_status": "STARTING_OR_RUNNING",
+                    "live_execution": "OFF",
+                },
+                default=_json_default,
+                sort_keys=True,
+            )
+        )
+        if not wait:
+            registered = False
+            return
+        deadline = time.monotonic() + duration_minutes * 60 + 180
+        repository = CertificationRunRepository(engine)
+        while time.monotonic() < deadline:
+            record = repository.get(run_id)
+            running_pid = certification_service_pid(spec)
+            if record is not None and record.status.value in {"FAILED", "CANCELED"}:
+                raise LaunchAgentError(
+                    f"certification ended with {record.status.value}: {record.failure_reason}"
+                )
+            if record is not None and record.status.value == "COMPLETED" and running_pid is None:
+                typer.echo(f"run_id={run_id} status=COMPLETED exit_code=0 live_execution=OFF")
+                return
+            time.sleep(1)
+        raise LaunchAgentError("certification LaunchAgent did not complete before its deadline")
+    finally:
+        engine.dispose()
+        if registered:
+            termination = unload_certification_launch_agent(spec)
+            typer.echo(f"service={spec.service} unloaded=true termination={termination}")
 
 
 @app.command("validate-config")
@@ -946,6 +1243,880 @@ def collect_research_data(
         engine.dispose()
 
 
+async def _run_certification_collection(
+    collector: ResearchMarketDataCollector, *, duration_seconds: float
+) -> None:
+    collector_task = asyncio.create_task(collector.run(), name="r4-certification-collector")
+    timer_task = asyncio.create_task(asyncio.sleep(duration_seconds), name="r4-certification-timer")
+    done, _ = await asyncio.wait({collector_task, timer_task}, return_when=asyncio.FIRST_COMPLETED)
+    if timer_task in done:
+        collector.shutdown()
+        await collector_task
+        return
+    timer_task.cancel()
+    await asyncio.gather(timer_task, return_exceptions=True)
+    await collector_task
+    raise RuntimeError("certification collector stopped before the configured duration")
+
+
+def _certification_contract_spec(
+    *,
+    venue: str,
+    capability: str,
+    instrument: str,
+    root: Path,
+    normalization_test_passed: bool = True,
+    maximum_clock_skew_ms: Decimal = Decimal("5000"),
+    minimum_clock_skew_sample_count: int = 20,
+    maximum_clock_skew_violation_ratio: Decimal = Decimal("0.05"),
+) -> ContractValidationSpec:
+    fixture = root / f"tests/contracts/{venue}/public.json"
+    endpoints = {
+        "hyperliquid": {
+            "funding_current": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "funding_history": "POST https://api.hyperliquid.xyz/info type=fundingHistory",
+            "mark_price": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "index_price": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "open_interest": "POST https://api.hyperliquid.xyz/info type=metaAndAssetCtxs",
+            "trade": "WebSocket wss://api.hyperliquid.xyz/ws channel=trades",
+            "ohlcv": "POST https://api.hyperliquid.xyz/info type=candleSnapshot",
+        },
+        "bitget": {
+            "funding_current": "GET https://api.bitget.com/api/v2/mix/market/current-fund-rate",
+            "funding_history": "GET https://api.bitget.com/api/v2/mix/market/history-fund-rate",
+            "mark_price": "GET https://api.bitget.com/api/v2/mix/market/symbol-price",
+            "index_price": "GET https://api.bitget.com/api/v2/mix/market/symbol-price",
+            "open_interest": "GET https://api.bitget.com/api/v2/mix/market/open-interest",
+            "trade": "WebSocket wss://ws.bitget.com/v2/ws/public channel=trade",
+            "ohlcv": "GET https://api.bitget.com/api/v2/mix/market/candles",
+        },
+    }
+    response_fields = {
+        "funding_current": ("exchange", "symbol", "rate", "received_at", "available_at"),
+        "funding_history": ("exchange", "symbol", "rate", "received_at", "available_at"),
+        "mark_price": ("symbol",),
+        "index_price": ("symbol",),
+        "open_interest": ("exchange", "symbol", "value", "unit"),
+        "trade": ("exchange", "symbol", "trade_id", "price", "quantity", "side"),
+        "ohlcv": ("exchange", "symbol", "open", "high", "low", "close", "volume"),
+    }[capability]
+    symbol = instrument if venue == "hyperliquid" else f"{instrument}USDT"
+    semantics = {
+        "funding_history": TimestampSemantic.FUNDING_EFFECTIVE_TIME,
+        "ohlcv": TimestampSemantic.CANDLE_OPEN_TIME,
+        "trade": TimestampSemantic.REALTIME_EVENT,
+        "mark_price": TimestampSemantic.REALTIME_EVENT,
+        "index_price": TimestampSemantic.REALTIME_EVENT,
+    }
+    return ContractValidationSpec(
+        venue=venue,
+        capability=capability,
+        canonical_instrument_id=instrument,
+        source_endpoint=endpoints[venue][capability],
+        request_parameters=("symbol",),
+        response_fields=response_fields,
+        symbol=symbol,
+        price_unit="USDT or USD quote units",
+        quantity_unit="base asset units",
+        funding_unit="decimal" if capability.startswith("funding") else None,
+        funding_interval_seconds=(
+            (3600 if venue == "hyperliquid" else 28800)
+            if capability.startswith("funding")
+            else None
+        ),
+        timestamp_unit="normalized UTC datetime from documented seconds/milliseconds",
+        timestamp_timezone="UTC",
+        sequence_semantics=("venue sequence when supplied; None is explicit otherwise"),
+        snapshot_delta_semantics=(
+            "hyperliquid snapshot_only; bitget snapshot_and_delta"
+            if capability.startswith("orderbook")
+            else "not_applicable"
+        ),
+        null_behavior="missing exchange timestamps remain None; required values reject",
+        rate_limit_behavior="HTTP 429 is recorded as a collection failure and retried",
+        error_behavior="venue errors are persisted without promoting evidence",
+        fixture_path=str(fixture.relative_to(root)),
+        fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
+        normalization_test_node_id=(
+            "tests/unit/test_market_data_certification.py::"
+            "test_contract_fixture_is_bound_to_normalization"
+        ),
+        normalization_test_passed=normalization_test_passed,
+        minimum_event_count=1,
+        minimum_coverage_ratio=Decimal("0.80"),
+        maximum_stale_ratio=Decimal("0.05"),
+        maximum_absolute_error=(Decimal("0.001") if capability == "funding_current" else None),
+        timestamp_semantic=semantics.get(capability, TimestampSemantic.RECEIPT_ONLY),
+        maximum_clock_skew_ms=maximum_clock_skew_ms,
+        minimum_clock_skew_sample_count=minimum_clock_skew_sample_count,
+        maximum_clock_skew_violation_ratio=maximum_clock_skew_violation_ratio,
+    )
+
+
+def _certification_cross_source_pairs(
+    events: tuple[RawMarketEvent, ...],
+    *,
+    venue: str,
+    instrument: str,
+    capability: str,
+) -> tuple[tuple[Decimal, Decimal], ...]:
+    relevant = tuple(
+        item
+        for item in events
+        if item.venue == venue and item.canonical_instrument_id == instrument
+    )
+
+    def latest(event_type: str, keys: tuple[str, ...]) -> Decimal | None:
+        matching = sorted(
+            (item for item in relevant if item.event_type == event_type),
+            key=lambda item: item.available_at,
+        )
+        if not matching:
+            return None
+        payload = matching[-1].payload()
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                return Decimal(str(payload[key]))
+        return None
+
+    values: tuple[Decimal | None, Decimal | None] | None = None
+    if capability == "funding_current":
+        values = (
+            latest("funding_current", ("rate", "funding_rate")),
+            latest("funding_history", ("rate", "funding_rate")),
+        )
+    elif capability == "mark_price":
+        values = (
+            latest("mark_price", ("mark_price", "markPrice", "mid", "price")),
+            latest("index_price", ("index_price", "indexPrice", "mid", "price")),
+        )
+    elif capability == "ohlcv":
+        values = (
+            latest("ohlcv", ("close",)),
+            latest("trade", ("price",)),
+        )
+    if values is None or values[0] is None or values[1] is None:
+        return ()
+    return ((values[0], values[1]),)
+
+
+def _certified_market_event_id(certification_id: str, source_event_id: str) -> str:
+    return "certified-" + canonical_sha256(
+        {"certification_id": certification_id, "source_event_id": source_event_id}
+    )
+
+
+def _observed_funding_interval(
+    events: tuple[RawMarketEvent, ...], *, venue: str, instrument: str
+) -> int | None:
+    current = sorted(
+        (
+            item
+            for item in events
+            if item.venue == venue
+            and item.canonical_instrument_id == instrument
+            and item.event_type == "funding_current"
+        ),
+        key=lambda item: item.available_at,
+    )
+    if not current:
+        return None
+    value = current[-1].payload().get("funding_interval_seconds")
+    return int(value) if value is not None else None
+
+
+def _certification_normalization_test_passed(root: Path) -> bool:
+    node_id = (
+        "tests/unit/test_market_data_certification.py::"
+        "test_contract_fixture_is_bound_to_normalization"
+    )
+    collected = subprocess.run(  # nosec B603
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", node_id],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if collected.returncode != 0:
+        return False
+    executed = subprocess.run(  # nosec B603
+        [sys.executable, "-m", "pytest", "-q", node_id],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return executed.returncode == 0
+
+
+@app.command("run-market-data-certification")
+def run_market_data_certification(
+    config: Annotated[Path, typer.Option("--config", exists=True, readable=True)],
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    duration_minutes: Annotated[float | None, typer.Option("--duration-minutes", min=0.01)] = None,
+) -> None:
+    """Collect isolated public evidence and issue no certificate without measured PASS evidence."""
+    _, settings = _certification_preflight_payload(config)
+    certification_settings = settings.market_data_certification
+    if not certification_settings.enabled:
+        raise typer.BadParameter("market_data_certification.enabled=true is required")
+    if settings.live_trading or settings.live.enabled:
+        raise typer.BadParameter("market-data certification requires Live Execution OFF")
+    if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+        raise typer.BadParameter("market-data certification refuses execution credentials")
+    if tuple(certification_settings.venues) != ("hyperliquid", "bitget"):
+        raise typer.BadParameter("R4 certification supports only Hyperliquid and Bitget")
+    if not set(certification_settings.capabilities) <= set(TIER_ONE_CAPABILITIES):
+        raise typer.BadParameter("Tier 1 run cannot promote non-Tier-1 capabilities")
+    _require_nonproduction_database_isolation(settings, run_mode="certification")
+    resolved_run_id = run_id or f"certification-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    started_at = datetime.now(UTC)
+    duration = duration_minutes or float(certification_settings.duration_minutes)
+    state_dir = configured_state_dir()
+    workspace = workspace_for(resolved_run_id, state_dir)
+    workspace.initialize()
+    if config.resolve() != workspace.config_path.resolve():
+        workspace.persist_resolved_config(
+            config.resolve(strict=True),
+            resolved_payload=settings.model_dump(mode="json"),
+        )
+    workspace.persist_environment(
+        {
+            "HOME": str(Path.home().resolve()),
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONUNBUFFERED": os.environ.get("PYTHONUNBUFFERED", "1"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", str(Path.cwd() / "src")),
+            "TMPDIR": str(state_dir / "tmp"),
+            "CRYPTTOOL_STATE_DIR": str(state_dir),
+        }
+    )
+    artifact_root = workspace.certifications
+    typer.echo(
+        f"run_id={resolved_run_id} pid={os.getpid()} started_at={started_at.isoformat()} "
+        f"expected_end={(started_at + timedelta(minutes=duration)).isoformat()} "
+        f"database={_redact_database_url(settings.database_url)} "
+        f"artifact={workspace.root} live_execution=OFF"
+    )
+    engine = build_engine(settings.database_url)
+    lifecycle: CertificationLifecycle | None = None
+    lease_repository: SQLCollectorLeaseRepository | None = None
+    lease_group: str | None = None
+    lease_owner = f"{resolved_run_id}:{os.getpid()}"
+    previous_handlers = install_shutdown_signal_handlers()
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            inspector = inspect(engine)
+            migration = (
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                if inspector.has_table("alembic_version")
+                else "0017_certification_run_registry"
+                if inspector.has_table("certification_runs")
+                else "missing"
+            )
+        if migration != "0017_certification_run_registry":
+            raise RuntimeError(f"certification database migration is stale: {migration}")
+        lifecycle = CertificationLifecycle(
+            run_id=resolved_run_id,
+            commit_sha=_current_commit_sha(),
+            config_path=config,
+            database_identity=_redact_database_url(settings.database_url),
+            artifact_directory=workspace.root,
+            repository=CertificationRunRepository(engine),
+            now=started_at,
+        )
+        lifecycle.stage(CertificationStage.CONFIG_LOADED)
+        lifecycle.stage(CertificationStage.DB_CONNECTION_VERIFIED)
+        lifecycle.stage(CertificationStage.MIGRATION_VERIFIED)
+        verify_capability_audit(
+            Path(certification_settings.capability_audit_artifact_directory),
+            _current_commit_sha(),
+        )
+        lifecycle.stage(CertificationStage.AUDIT_ARTIFACT_VERIFIED)
+        repository = PostgreSQLResearchRepository(engine)
+        namespaced = NamespacedResearchRepository(
+            repository, checkpoint_namespace=f"certification:{resolved_run_id}"
+        )
+        adapters = tuple(_research_data_adapter(name) for name in certification_settings.venues)
+        lifecycle.stage(CertificationStage.ADAPTERS_CREATED)
+        lease_repository = SQLCollectorLeaseRepository(engine)
+        lease_group = collector_group_key(
+            database_identity=_redact_database_url(settings.database_url),
+            schema_name="public",
+            venue="+".join(certification_settings.venues),
+            instrument="+".join(certification_settings.instruments),
+            event_type="+".join(certification_settings.capabilities),
+            channel="certification",
+        )
+        lease_repository.acquire(
+            lease_group,
+            resolved_run_id,
+            lease_owner,
+            started_at + timedelta(minutes=duration + 5),
+        )
+        lifecycle.stage(CertificationStage.LEASE_ACQUIRED)
+        collector = ResearchMarketDataCollector(
+            repository=namespaced,
+            sources=tuple(
+                PublicAdapterCollectorSource(adapter, adapter.venue) for adapter in adapters
+            ),
+            capability_gate=TrustedResearchCapabilityGate(TrustedCapabilityRegistry(())),
+            instruments=certification_settings.instruments,
+            event_types=certification_settings.capabilities,
+            collection_enabled=True,
+            poll_interval_seconds=settings.research_collection.poll_interval_seconds,
+            stale_after_seconds=settings.research_collection.stale_after_seconds,
+        )
+        lifecycle.stage(CertificationStage.COLLECTOR_STARTED)
+        lifecycle.stage(CertificationStage.CERTIFICATION_WINDOW_STARTED)
+        asyncio.run(_run_certification_collection(collector, duration_seconds=duration * 60))
+        ended_at = datetime.now(UTC)
+        lifecycle.stage(CertificationStage.FIRST_EVENT_RECEIVED)
+        lifecycle.stage(CertificationStage.FINALIZATION_STARTED)
+        certification_repository = SQLCertificationRepository(engine)
+        service = MarketDataCertificationService(
+            certification_repository,
+            root=Path.cwd(),
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+            source_version=certification_settings.source_version,
+            certification_ttl=timedelta(hours=certification_settings.certification_ttl_hours),
+        )
+        normalization_test_passed = _certification_normalization_test_passed(Path.cwd())
+        audit_resolver = CapabilityAuditArtifactResolver(
+            Path(certification_settings.capability_audit_artifact_directory)
+        )
+        promotion_service = CapabilityPromotionService(
+            certification_repository,
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+        )
+        events = repository.list_experimental_events()
+        certifications = []
+        promoted = 0
+        production_market_events = 0
+        for venue in certification_settings.venues:
+            for instrument in certification_settings.instruments:
+                for capability in certification_settings.capabilities:
+                    certification_id = f"{resolved_run_id}-{venue}-{instrument}-{capability}"
+                    spec = _certification_contract_spec(
+                        venue=venue,
+                        capability=capability,
+                        instrument=instrument,
+                        root=Path.cwd(),
+                        normalization_test_passed=normalization_test_passed,
+                        maximum_clock_skew_ms=certification_settings.maximum_clock_skew_ms,
+                        minimum_clock_skew_sample_count=(
+                            certification_settings.minimum_clock_skew_sample_count
+                        ),
+                        maximum_clock_skew_violation_ratio=(
+                            certification_settings.maximum_clock_skew_violation_ratio
+                        ),
+                    )
+                    if capability.startswith("funding"):
+                        observed_interval = _observed_funding_interval(
+                            events, venue=venue, instrument=instrument
+                        )
+                        if observed_interval is not None:
+                            spec = replace(spec, funding_interval_seconds=observed_interval)
+                    audit = audit_resolver.resolve(
+                        venue=venue,
+                        capability=capability,
+                        commit_sha=_current_commit_sha(),
+                        adapter_version=certification_settings.adapter_version,
+                        source_version=certification_settings.source_version,
+                        fixture_sha256=spec.fixture_sha256,
+                    )
+                    certification = service.certify(
+                        certification_id=certification_id,
+                        spec=spec,
+                        events=events,
+                        sample_start=started_at,
+                        sample_end=ended_at,
+                        cross_source_pairs=_certification_cross_source_pairs(
+                            events,
+                            venue=venue,
+                            instrument=instrument,
+                            capability=capability,
+                        ),
+                        audit_passed=audit is not None,
+                        audit_run_id=audit.audit_run_id if audit else "",
+                        ci_run_id=audit.ci_run_id if audit else "",
+                        audit_artifact_sha256=audit.audit_artifact_sha256 if audit else "",
+                    )
+                    stored = certification_repository.get(certification_id)
+                    if stored is None:
+                        raise RuntimeError("certification repository lost a committed record")
+                    promotion = None
+                    if (
+                        certification.verdict.value == "pass"
+                        and audit is not None
+                        and stored[1].live_smoke_passed
+                    ):
+                        promotion = promotion_service.promote(certification)
+                        promoted += 1
+                        gate = ProductionEventCertificationGate()
+                        for event in events:
+                            if not (
+                                event.venue == venue
+                                and event.canonical_instrument_id == instrument
+                                and event.event_type == capability
+                                and started_at <= event.received_at <= ended_at
+                            ):
+                                continue
+                            gate.require(
+                                event=event,
+                                certification=certification,
+                                trusted_record=promotion,
+                                adapter_version=certification_settings.adapter_version,
+                                now=ended_at,
+                            )
+                            production_event = replace(
+                                event,
+                                event_id=_certified_market_event_id(
+                                    certification_id, event.event_id
+                                ),
+                                capability_verification_run_id=certification_id,
+                                created_at=ended_at,
+                            )
+                            production_market_events += int(
+                                repository.add_raw_event(production_event)
+                            )
+                    write_certification_artifacts(
+                        root=artifact_root,
+                        certification=certification,
+                        evidence=stored[1],
+                        contract=spec,
+                        events=events,
+                        promotion=promotion,
+                    )
+                    certifications.append(certification)
+        if lease_repository is not None and lease_group is not None:
+            lease_repository.release(lease_group, resolved_run_id, lease_owner)
+            lease_group = None
+        lifecycle.stage(CertificationStage.ARTIFACT_WRITTEN)
+        lifecycle.stage(CertificationStage.PROCESS_COMPLETED)
+        export_completed_run(
+            engine=engine,
+            workspace=workspace,
+            adapter_version=certification_settings.adapter_version,
+            database_identity=_redact_database_url(settings.database_url),
+        )
+        typer.echo(
+            f"run_id={resolved_run_id} certifications={len(certifications)} "
+            f"promoted={promoted} production_events={production_market_events} "
+            "live_execution=OFF"
+        )
+    except CertificationCanceled as exc:
+        if lifecycle is not None:
+            lifecycle.fail(
+                exc,
+                exit_code=128 + exc.signal_number,
+                signal_number=exc.signal_number,
+                canceled=True,
+            )
+        raise typer.Exit(128 + exc.signal_number) from None
+    except KeyboardInterrupt as exc:
+        if lifecycle is not None:
+            lifecycle.fail(exc, exit_code=130, signal_number=signal.SIGINT, canceled=True)
+        raise typer.Exit(130) from None
+    except BaseException as exc:
+        if lifecycle is not None:
+            signal_number = (
+                -exc.code
+                if isinstance(exc, SystemExit) and isinstance(exc.code, int) and exc.code < 0
+                else None
+            )
+            lifecycle.fail(exc, signal_number=signal_number)
+        raise
+    finally:
+        restore_signal_handlers(previous_handlers)
+        if lease_repository is not None and lease_group is not None:
+            lease_repository.release(lease_group, resolved_run_id, lease_owner)
+        engine.dispose()
+
+
+def _durable_run_settings(run_id: str) -> tuple[Any, Settings]:
+    workspace = workspace_for(run_id)
+    if not workspace.config_path.is_file():
+        raise typer.BadParameter(f"durable resolved config is missing for run {run_id}")
+    return workspace, _settings_from_yaml(workspace.config_path)
+
+
+@app.command("certification-run-status")
+def certification_run_status(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Report durable artifact state and query the Run Registry without guessing."""
+    workspace, settings = _durable_run_settings(run_id)
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "artifact_directory": str(workspace.root),
+        "live_execution": "OFF",
+    }
+    try:
+        payload["artifact"] = reconstruct_from_artifacts(workspace)
+    except DurableStorageError as exc:
+        payload["artifact_status"] = "NOT_COMPLETED"
+        payload["artifact_reason"] = str(exc)
+    engine = build_engine(settings.database_url)
+    try:
+        record = CertificationRunRepository(engine).get(run_id)
+        payload["database_connection"] = "PASS"
+        payload["run_registry"] = asdict(record) if record is not None else None
+    except Exception as exc:
+        payload["database_connection"] = "FAILED"
+        payload["database_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(payload, default=_json_default, sort_keys=True))
+
+
+@app.command("export-certification-run")
+def export_certification_run_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Re-export a completed Run Registry record into its durable workspace."""
+    workspace, settings = _durable_run_settings(run_id)
+    engine = build_engine(settings.database_url)
+    try:
+        result = export_completed_run(
+            engine=engine,
+            workspace=workspace,
+            adapter_version=settings.market_data_certification.adapter_version,
+            database_identity=_redact_database_url(settings.database_url),
+        )
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+
+
+@app.command("verify-certification-run")
+def verify_certification_run_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Reconnect to the DB and verify Registry, evidence, hashes, audit and leases."""
+    workspace, settings = _durable_run_settings(run_id)
+    engine = build_engine(settings.database_url)
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        result = verify_run(engine, workspace)
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
+    typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+
+
+def _verify_certification_artifact(manifest_path: Path) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("artifact_invariant") != "PASS":
+        raise DurableStorageError(f"artifact invariant failed: {manifest_path}")
+    for relative, expected in payload.get("files", {}).items():
+        path = manifest_path.parent / relative
+        if not path.is_file() or sha256_file(path) != expected:
+            raise DurableStorageError(f"artifact hash mismatch: {path}")
+
+
+@app.command("recertify-market-data")
+def recertify_market_data_command(
+    run_id: Annotated[str, typer.Option("--run-id", min=1)],
+) -> None:
+    """Re-evaluate immutable saved evidence as a new certification revision."""
+    workspace, settings = _durable_run_settings(run_id)
+    source_artifact = reconstruct_from_artifacts(workspace)
+    source_payload = json.loads(
+        (workspace.root / "certification-records.json").read_text(encoding="utf-8")
+    )
+    source_ids = tuple(str(item["certification"]["certification_id"]) for item in source_payload)
+    engine = build_engine(settings.database_url)
+    revision_id = (
+        f"recertification-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{_current_commit_sha()[:7]}"
+    )
+    revision_root = workspace.root / "revisions" / revision_id
+    certification_root = revision_root / "certifications"
+    if revision_root.exists():
+        raise typer.BadParameter(f"recertification revision already exists: {revision_id}")
+    certification_root.mkdir(parents=True)
+    try:
+        certification_repository = SQLCertificationRepository(engine)
+        research_repository = PostgreSQLResearchRepository(engine)
+        source_records = []
+        event_manifest: set[tuple[str, str]] = set()
+        for certification_id in source_ids:
+            stored = certification_repository.get(certification_id)
+            if stored is None:
+                raise DurableStorageError(
+                    f"source certification is missing from DB: {certification_id}"
+                )
+            source_records.append(stored)
+            event_manifest.update(stored[1].event_manifest)
+        event_by_id = {}
+        for event_id, expected_hash in sorted(event_manifest):
+            event = research_repository.get_experimental_event(event_id)
+            if event is None or event.payload_sha256 != expected_hash:
+                raise DurableStorageError(f"immutable Raw Evidence mismatch: {event_id}")
+            event_by_id[event_id] = event
+        events = tuple(event_by_id[event_id] for event_id in sorted(event_by_id))
+        source_raw_evidence_sha256 = canonical_sha256(
+            tuple((item.event_id, item.payload_sha256) for item in events)
+        )
+        certification_settings = settings.market_data_certification
+        service = MarketDataCertificationService(
+            certification_repository,
+            root=Path.cwd(),
+            commit_sha=_current_commit_sha(),
+            adapter_version=certification_settings.adapter_version,
+            source_version=certification_settings.source_version,
+            certification_ttl=timedelta(hours=certification_settings.certification_ttl_hours),
+        )
+        revisions = []
+        artifact_manifests = []
+        source_timing_reports = []
+        for source_certification, source_evidence in source_records:
+            contract = _certification_contract_spec(
+                venue=source_certification.venue,
+                capability=source_certification.capability,
+                instrument=source_certification.canonical_instrument_id,
+                root=Path.cwd(),
+                normalization_test_passed=source_evidence.normalization_passed,
+                maximum_clock_skew_ms=certification_settings.maximum_clock_skew_ms,
+                minimum_clock_skew_sample_count=(
+                    certification_settings.minimum_clock_skew_sample_count
+                ),
+                maximum_clock_skew_violation_ratio=(
+                    certification_settings.maximum_clock_skew_violation_ratio
+                ),
+            )
+            if source_certification.capability.startswith("funding"):
+                observed_interval = _observed_funding_interval(
+                    events,
+                    venue=source_certification.venue,
+                    instrument=source_certification.canonical_instrument_id,
+                )
+                if observed_interval is not None:
+                    contract = replace(contract, funding_interval_seconds=observed_interval)
+            source_event_keys = set(source_evidence.event_manifest)
+            source_events = tuple(
+                sorted(
+                    (
+                        item
+                        for item in events
+                        if (item.event_id, item.payload_sha256) in source_event_keys
+                    ),
+                    key=lambda item: (
+                        item.exchange_timestamp or item.received_at,
+                        item.event_id,
+                    ),
+                )
+            )
+            if len(source_events) != len(source_evidence.metrics.timing):
+                raise DurableStorageError(
+                    f"source timing/event count mismatch: {source_certification.certification_id}"
+                )
+            source_timing_path = (
+                revision_root / "source-timing" / f"{source_certification.certification_id}.csv"
+            )
+            source_timing_path.parent.mkdir(parents=True, exist_ok=True)
+            with source_timing_path.open("w", encoding="utf-8", newline="") as handle:
+                fieldnames = (
+                    "event_id",
+                    "exchange_timestamp",
+                    "exchange_server_time",
+                    "received_at",
+                    "available_at",
+                    "event_age",
+                    "transport_latency",
+                    "clock_skew",
+                    "timestamp_semantic",
+                    "availability_provenance",
+                    "source_endpoint",
+                    "raw_payload_hash",
+                    "clock_skew_formula",
+                    "clock_skew_timestamp_left",
+                    "clock_skew_timestamp_right",
+                )
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for timing, event in zip(
+                    source_evidence.metrics.timing, source_events, strict=True
+                ):
+                    writer.writerow(
+                        {
+                            "event_id": event.event_id,
+                            "exchange_timestamp": timing.exchange_timestamp,
+                            "exchange_server_time": timing.exchange_server_time,
+                            "received_at": timing.received_at,
+                            "available_at": timing.available_at,
+                            "event_age": timing.event_age_seconds,
+                            "transport_latency": timing.transport_latency_seconds,
+                            "clock_skew": timing.clock_skew_seconds,
+                            "timestamp_semantic": event.timestamp_semantic.value,
+                            "availability_provenance": (event.availability_provenance.value),
+                            "source_endpoint": contract.source_endpoint,
+                            "raw_payload_hash": (
+                                event.source_payload_sha256 or event.payload_sha256
+                            ),
+                            "clock_skew_formula": (
+                                "received_at - exchange_server_time"
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                            "clock_skew_timestamp_left": (
+                                timing.received_at
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                            "clock_skew_timestamp_right": (
+                                timing.exchange_server_time
+                                if timing.clock_skew_seconds is not None
+                                else None
+                            ),
+                        }
+                    )
+            source_timing_reports.append(source_timing_path)
+            certification_id = (
+                f"{revision_id}-{source_certification.venue}-"
+                f"{source_certification.canonical_instrument_id}-"
+                f"{source_certification.capability}"
+            )
+            revision = service.certify(
+                certification_id=certification_id,
+                spec=contract,
+                events=events,
+                sample_start=source_certification.sample_start,
+                sample_end=source_certification.sample_end,
+                cross_source_pairs=_certification_cross_source_pairs(
+                    events,
+                    venue=source_certification.venue,
+                    instrument=source_certification.canonical_instrument_id,
+                    capability=source_certification.capability,
+                ),
+                audit_passed=source_evidence.audit_passed,
+                audit_run_id=source_evidence.audit_run_id,
+                ci_run_id=source_evidence.ci_run_id,
+                audit_artifact_sha256=source_evidence.audit_artifact_sha256,
+            )
+            stored_revision = certification_repository.get(certification_id)
+            if stored_revision is None:
+                raise DurableStorageError(
+                    f"recertification revision was not persisted: {certification_id}"
+                )
+            manifest_path = write_certification_artifacts(
+                root=certification_root,
+                certification=revision,
+                evidence=stored_revision[1],
+                contract=contract,
+                events=events,
+            )
+            _verify_certification_artifact(manifest_path)
+            artifact_manifests.append(manifest_path)
+            revisions.append(revision)
+        persisted_manifest = []
+        for event_id in sorted(event_by_id):
+            persisted = research_repository.get_experimental_event(event_id)
+            if persisted is None:
+                raise DurableStorageError(f"Raw Evidence disappeared: {event_id}")
+            persisted_manifest.append((event_id, persisted.payload_sha256))
+        persisted_raw_evidence_sha256 = canonical_sha256(tuple(persisted_manifest))
+        if persisted_raw_evidence_sha256 != source_raw_evidence_sha256:
+            raise DurableStorageError("recertification modified source Raw Evidence")
+        counts = {
+            verdict: sum(item.verdict.value == verdict for item in revisions)
+            for verdict in ("pass", "fail", "insufficient_evidence")
+        }
+        manifest = {
+            "revision_id": revision_id,
+            "source_run_id": run_id,
+            "source_commit_sha": source_artifact["run"]["commit_sha"],
+            "recertifier_commit_sha": _current_commit_sha(),
+            "source_artifact_manifest_sha256": source_artifact["run"]["artifact_manifest_sha256"],
+            "source_raw_evidence_sha256": source_raw_evidence_sha256,
+            "raw_evidence_modified": False,
+            "certifications": [asdict(item) for item in revisions],
+            "verdict_counts": counts,
+            "artifact_manifests": {
+                str(path.relative_to(revision_root)): sha256_file(path)
+                for path in artifact_manifests
+            },
+            "source_timing_reports": {
+                str(path.relative_to(revision_root)): sha256_file(path)
+                for path in source_timing_reports
+            },
+            "artifact_verify": "PASS",
+            "live_execution": "OFF",
+            "created_at": datetime.now(UTC),
+        }
+        atomic_write_json(revision_root / "manifest.json", manifest)
+        result = {
+            **manifest,
+            "revision_manifest_sha256": sha256_file(revision_root / "manifest.json"),
+            "artifact": str(revision_root),
+        }
+        typer.echo(json.dumps(result, default=_json_default, sort_keys=True))
+    except DurableStorageError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        engine.dispose()
+
+
+@app.command("verify-market-data-certification")
+def verify_market_data_certification(
+    certification_id: Annotated[str, typer.Option("--certification-id", min=1)],
+) -> None:
+    """Verify immutable database evidence and every certification artifact hash."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        stored = SQLCertificationRepository(engine).get(certification_id)
+        if stored is None:
+            raise typer.BadParameter("certification does not exist")
+        certification, evidence = stored
+        if evidence.manifest_sha256 != certification.evidence_manifest_sha256:
+            raise typer.BadParameter("certification evidence manifest mismatch")
+        artifact_root = Path(settings.market_data_certification.artifact_root)
+        durable_matches = tuple(artifact_root.glob(f"*/certifications/{certification_id}"))
+        directory = (
+            durable_matches[0] if len(durable_matches) == 1 else artifact_root / certification_id
+        )
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for relative, expected in manifest["files"].items():
+            actual = hashlib.sha256((directory / relative).read_bytes()).hexdigest()
+            if actual != expected:
+                raise typer.BadParameter(f"artifact hash mismatch: {relative}")
+        typer.echo(
+            f"certification_id={certification_id} verdict={certification.verdict.value} "
+            "verified=true live_execution=OFF"
+        )
+    finally:
+        engine.dispose()
+
+
+@app.command("capability-certification-status")
+def capability_certification_status() -> None:
+    """List instrument-scoped certification verdicts without changing capability support."""
+    settings = Settings()
+    engine = build_engine(settings.database_url)
+    try:
+        records = SQLCertificationRepository(engine).list()
+        typer.echo(
+            json.dumps(
+                [asdict(item) for item in records],
+                default=_json_default,
+                sort_keys=True,
+            )
+        )
+    finally:
+        engine.dispose()
+
+
 async def _run_collector_with_lease(
     *,
     collector: ResearchMarketDataCollector,
@@ -1171,14 +2342,17 @@ def _require_nonproduction_database_isolation(settings: Settings, *, run_mode: s
         raise typer.BadParameter(
             f"{run_mode} requires an explicit production_database_url for isolation"
         )
-    run_engine = build_engine(settings.database_url)
-    production_engine = build_engine(settings.production_database_url)
-    try:
-        run_identity = _database_identity(run_engine)
-        production_identity = _database_identity(production_engine)
-    finally:
-        run_engine.dispose()
-        production_engine.dispose()
+
+    def configured_identity(value: str) -> tuple[str, str]:
+        url = make_url(value)
+        if url.get_backend_name() == "sqlite":
+            database = Path(str(url.database)).expanduser().resolve()
+            return f"sqlite:///{database}", "main"
+        schema = str(url.query.get("schema", "public"))
+        return url.render_as_string(hide_password=True), schema
+
+    run_identity = configured_identity(settings.database_url)
+    production_identity = configured_identity(settings.production_database_url)
     if run_identity == production_identity:
         raise typer.BadParameter(
             f"{run_mode} database/schema must be isolated from the production database"
@@ -2202,6 +3376,18 @@ def audit_capabilities() -> None:
             if not finding.passed:
                 failed = True
                 typer.echo(f"  {finding.capability}: {'; '.join(finding.reasons)}")
+    for adapter in (adapters[0], adapters[2]):
+        report = auditor.audit_certification_capabilities(
+            adapter,
+            TIER_ONE_CAPABILITIES,
+            adapter_version="public-adapters-r4",
+            source_version="r4-contract-v1",
+        )
+        reports.append(report)
+        for finding in report.findings:
+            if not finding.passed:
+                failed = True
+                typer.echo(f"  {report.venue}:{finding.capability}: {'; '.join(finding.reasons)}")
     auditor.write_artifact(tuple(reports))
 
     async def close() -> None:

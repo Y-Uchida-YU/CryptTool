@@ -73,6 +73,22 @@ class ResearchRunIdentity:
         object.__setattr__(self, "created_at", utc(self.created_at, "created_at"))
 
 
+class TimestampSemantic(StrEnum):
+    REALTIME_EVENT = "realtime_event"
+    HISTORICAL_EFFECTIVE_TIME = "historical_effective_time"
+    CANDLE_OPEN_TIME = "candle_open_time"
+    CANDLE_CLOSE_TIME = "candle_close_time"
+    FUNDING_EFFECTIVE_TIME = "funding_effective_time"
+    RECEIPT_ONLY = "receipt_only"
+
+
+class AvailabilityProvenance(StrEnum):
+    HISTORICAL_EFFECTIVE_TIME = "historical_effective_time"
+    OBSERVED_RETRIEVAL_TIME = "observed_retrieval_time"
+    EXCHANGE_PUBLISHED_TIME = "exchange_published_time"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class RawMarketEvent:
     event_id: str
@@ -97,6 +113,10 @@ class RawMarketEvent:
     snapshot_sequence: int | None = None
     delta_sequence: int | None = None
     connection_epoch: int | None = None
+    timestamp_semantic: TimestampSemantic = TimestampSemantic.RECEIPT_ONLY
+    availability_provenance: AvailabilityProvenance = AvailabilityProvenance.UNKNOWN
+    exchange_server_time: datetime | None = None
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -120,6 +140,12 @@ class RawMarketEvent:
                 self,
                 "exchange_timestamp",
                 utc(self.exchange_timestamp, "exchange_timestamp"),
+            )
+        if self.exchange_server_time is not None:
+            object.__setattr__(
+                self,
+                "exchange_server_time",
+                utc(self.exchange_server_time, "exchange_server_time"),
             )
 
     def payload(self) -> dict[str, Any]:

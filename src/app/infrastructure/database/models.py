@@ -115,6 +115,10 @@ class RawMarketEventRow(Base):
     snapshot_sequence: Mapped[int | None] = mapped_column(BigInteger)
     delta_sequence: Mapped[int | None] = mapped_column(BigInteger)
     connection_epoch: Mapped[int | None] = mapped_column(Integer)
+    timestamp_semantic: Mapped[str] = mapped_column(String(50), default="receipt_only")
+    availability_provenance: Mapped[str] = mapped_column(String(50), default="unknown")
+    exchange_server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timeframe: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -139,7 +143,19 @@ class ExperimentalMarketEventRow(Base):
     raw_payload: Mapped[str] = mapped_column(Text)
     capability_support: Mapped[str] = mapped_column(String(40))
     capability_verification_run_id: Mapped[str | None] = mapped_column(String(160))
+    exchange_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sequence: Mapped[int | None] = mapped_column(BigInteger)
+    connection_id: Mapped[str | None] = mapped_column(String(36))
+    reconciliation_state: Mapped[str | None] = mapped_column(String(40))
+    normalizer_version: Mapped[str] = mapped_column(String(120), default="unknown")
+    channel: Mapped[str] = mapped_column(String(120), default="unknown")
+    connection_epoch: Mapped[int | None] = mapped_column(Integer)
+    timestamp_semantic: Mapped[str] = mapped_column(String(50), default="receipt_only")
+    availability_provenance: Mapped[str] = mapped_column(String(50), default="unknown")
+    exchange_server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timeframe: Mapped[str | None] = mapped_column(String(20))
 
 
 class MarketDataQuarantineRow(Base):
@@ -342,6 +358,75 @@ class ResearchArtifactRow(Base):
     artifact_type: Mapped[str] = mapped_column(String(80))
     path: Mapped[str] = mapped_column(String(500))
     content_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MarketDataCertificationRow(Base):
+    __tablename__ = "market_data_certifications"
+    __table_args__ = (
+        UniqueConstraint("venue", "capability", "canonical_instrument_id", "certification_id"),
+        CheckConstraint(
+            "verdict IN ('pass', 'fail', 'insufficient_evidence')",
+            name="ck_market_data_certification_verdict",
+        ),
+        CheckConstraint("expires_at >= verified_at", name="ck_market_data_certification_expiry"),
+        CheckConstraint("length(commit_sha) = 40", name="ck_market_data_certification_commit"),
+        CheckConstraint(
+            "length(evidence_manifest_sha256) = 64",
+            name="ck_market_data_certification_manifest_hash",
+        ),
+    )
+    certification_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
+    verdict: Mapped[str] = mapped_column(String(40), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(40))
+    adapter_version: Mapped[str] = mapped_column(String(120))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    evidence_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    payload_json: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CertificationRunRow(Base):
+    __tablename__ = "certification_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('STARTING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELED')",
+            name="ck_certification_runs_status",
+        ),
+    )
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    last_stage: Mapped[str] = mapped_column(String(80))
+    failure_reason: Mapped[str | None] = mapped_column(String(2000))
+    commit_sha: Mapped[str] = mapped_column(String(40))
+    config_path: Mapped[str] = mapped_column(String(1000))
+    database_identity: Mapped[str] = mapped_column(String(1000))
+    artifact_directory: Mapped[str] = mapped_column(String(1000))
+    pid: Mapped[int] = mapped_column(Integer)
+    parent_pid: Mapped[int] = mapped_column(Integer)
+    signal_number: Mapped[int | None] = mapped_column(Integer)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    exception_type: Mapped[str | None] = mapped_column(String(300))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CapabilityPromotionRow(Base):
+    __tablename__ = "capability_promotions"
+    certification_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("market_data_certifications.certification_id"), primary_key=True
+    )
+    venue: Mapped[str] = mapped_column(String(40), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
+    verification_run_id: Mapped[str] = mapped_column(String(160), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

@@ -450,8 +450,15 @@ class AcceleratedValidationResult:
 class StaticReplayCapabilityGate:
     """Explicit validation-only gate; production collection still uses the trusted registry."""
 
-    def decide(self, *, venue: str, capability: str, now: datetime) -> CapabilityDecision:
-        del venue, capability, now
+    def decide(
+        self,
+        *,
+        venue: str,
+        capability: str,
+        canonical_instrument_id: str,
+        now: datetime,
+    ) -> CapabilityDecision:
+        del venue, capability, canonical_instrument_id, now
         return CapabilityDecision(CapabilitySupport.LIVE_VERIFIED, "accelerated-validation")
 
 

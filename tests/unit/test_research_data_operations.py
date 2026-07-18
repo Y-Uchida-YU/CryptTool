@@ -86,8 +86,15 @@ class Gate:
     def __init__(self, support: CapabilitySupport) -> None:
         self.support = support
 
-    def decide(self, *, venue: str, capability: str, now: datetime) -> CapabilityDecision:
-        del venue, capability, now
+    def decide(
+        self,
+        *,
+        venue: str,
+        capability: str,
+        canonical_instrument_id: str,
+        now: datetime,
+    ) -> CapabilityDecision:
+        del venue, capability, canonical_instrument_id, now
         return CapabilityDecision(
             self.support, "verified-run" if self.support == CapabilitySupport.LIVE_VERIFIED else ""
         )

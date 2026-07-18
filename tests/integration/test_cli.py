@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,12 +18,196 @@ from app.adapters.exchanges.websocket import ReconciliationState
 from app.cli.main import app
 from app.config.settings import Settings
 from app.infrastructure.database.models import Base
+from app.services.research.certification import (
+    InMemoryCertificationRepository,
+    MarketDataCertificationService,
+)
 from app.services.research.collector_runs import CollectorRunRecord, CollectorRunStatus
-from app.services.research.models import RawMarketEvent
+from app.services.research.models import RawMarketEvent, TimestampSemantic
 from app.services.research.repository import PostgreSQLResearchRepository
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 runner = CliRunner()
+
+
+def test_recertify_market_data_creates_immutable_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 7, 15, 18, tzinfo=UTC)
+    raw_payload = json.dumps(
+        {
+            "exchange": "hyperliquid",
+            "symbol": "BTC",
+            "trade_id": "trade-1",
+            "price": "100",
+            "quantity": "1",
+            "side": "buy",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    event = RawMarketEvent(
+        event_id="hyperliquid-BTC-trade-1",
+        venue="hyperliquid",
+        canonical_instrument_id="BTC",
+        venue_symbol="BTC",
+        event_type="trade",
+        exchange_timestamp=now,
+        received_at=now,
+        available_at=now,
+        sequence=1,
+        connection_id=None,
+        reconciliation_state=None,
+        payload_sha256=hashlib.sha256(raw_payload.encode()).hexdigest(),
+        raw_payload=raw_payload,
+        normalizer_version="test-r4",
+        capability_verification_run_id="test-audit",
+        created_at=now,
+        timestamp_semantic=TimestampSemantic.REALTIME_EVENT,
+    )
+    repository = InMemoryCertificationRepository()
+    spec = cli._certification_contract_spec(
+        venue="hyperliquid",
+        capability="trade",
+        instrument="BTC",
+        root=Path(__file__).parents[2],
+    )
+    source_id = "source-certification-hyperliquid-BTC-trade"
+    MarketDataCertificationService(
+        repository,
+        root=Path(__file__).parents[2],
+        commit_sha="a" * 40,
+        adapter_version="public-adapters-r4",
+        source_version="r4-contract-v1",
+    ).certify(
+        certification_id=source_id,
+        spec=spec,
+        events=(event,),
+        sample_start=now,
+        sample_end=now,
+    )
+    workspace = SimpleNamespace(root=tmp_path)
+    (tmp_path / "certification-records.json").write_text(
+        json.dumps([{"certification": {"certification_id": source_id}}]),
+        encoding="utf-8",
+    )
+    settings = Settings(database_url="postgresql+psycopg://localhost/test")
+
+    class FakeEngine:
+        def dispose(self) -> None:
+            pass
+
+    class FakeResearchRepository:
+        @staticmethod
+        def get_experimental_event(event_id: str) -> RawMarketEvent | None:
+            return event if event_id == event.event_id else None
+
+    monkeypatch.chdir(Path(__file__).parents[2])
+    monkeypatch.setattr(cli, "_durable_run_settings", lambda _run_id: (workspace, settings))
+    monkeypatch.setattr(
+        cli,
+        "reconstruct_from_artifacts",
+        lambda _workspace: {
+            "run": {
+                "commit_sha": "a" * 40,
+                "artifact_manifest_sha256": "b" * 64,
+            }
+        },
+    )
+    monkeypatch.setattr(cli, "build_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(cli, "SQLCertificationRepository", lambda _engine: repository)
+    monkeypatch.setattr(
+        cli, "PostgreSQLResearchRepository", lambda _engine: FakeResearchRepository()
+    )
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "c" * 40)
+
+    result = runner.invoke(app, ["recertify-market-data", "--run-id", "source-run"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["artifact_verify"] == "PASS"
+    assert payload["raw_evidence_modified"] is False
+    assert payload["verdict_counts"] == {
+        "fail": 0,
+        "insufficient_evidence": 1,
+        "pass": 0,
+    }
+    revision = Path(payload["artifact"])
+    assert (revision / "manifest.json").is_file()
+    assert tuple((revision / "source-timing").glob("*.csv"))
+    artifact_manifest = next((revision / "certifications").glob("*/manifest.json"))
+    invalid_manifest = json.loads(artifact_manifest.read_text(encoding="utf-8"))
+    invalid_manifest["artifact_invariant"] = "FAIL"
+    artifact_manifest.write_text(json.dumps(invalid_manifest), encoding="utf-8")
+    with pytest.raises(cli.DurableStorageError, match="artifact invariant failed"):
+        cli._verify_certification_artifact(artifact_manifest)
+    invalid_manifest["artifact_invariant"] = "PASS"
+    invalid_manifest["files"] = {"missing.json": "0" * 64}
+    artifact_manifest.write_text(json.dumps(invalid_manifest), encoding="utf-8")
+    with pytest.raises(cli.DurableStorageError, match="artifact hash mismatch"):
+        cli._verify_certification_artifact(artifact_manifest)
+    (artifact_manifest.parent / "missing.json").write_text("wrong hash", encoding="utf-8")
+    with pytest.raises(cli.DurableStorageError, match="artifact hash mismatch"):
+        cli._verify_certification_artifact(artifact_manifest)
+
+    missing_event_root = tmp_path / "missing-event"
+    missing_event_root.mkdir()
+    (missing_event_root / "certification-records.json").write_text(
+        json.dumps([{"certification": {"certification_id": source_id}}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_durable_run_settings",
+        lambda _run_id: (SimpleNamespace(root=missing_event_root), settings),
+    )
+    monkeypatch.setattr(
+        cli,
+        "PostgreSQLResearchRepository",
+        lambda _engine: SimpleNamespace(get_experimental_event=lambda _event_id: None),
+    )
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "d" * 40)
+    missing_event = runner.invoke(app, ["recertify-market-data", "--run-id", "source-run"])
+    assert missing_event.exit_code == 2
+    assert "immutable Raw Evidence mismatch" in missing_event.output
+
+
+def test_recertify_market_data_rejects_missing_source_certification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "certification-records.json").write_text(
+        json.dumps([{"certification": {"certification_id": "missing-source"}}]),
+        encoding="utf-8",
+    )
+    settings = Settings(database_url="postgresql+psycopg://localhost/test")
+    disposed = False
+
+    class FakeEngine:
+        def dispose(self) -> None:
+            nonlocal disposed
+            disposed = True
+
+    monkeypatch.setattr(
+        cli,
+        "_durable_run_settings",
+        lambda _run_id: (SimpleNamespace(root=tmp_path), settings),
+    )
+    monkeypatch.setattr(
+        cli,
+        "reconstruct_from_artifacts",
+        lambda _workspace: {"run": {"commit_sha": "a" * 40, "artifact_manifest_sha256": "b" * 64}},
+    )
+    monkeypatch.setattr(cli, "build_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(
+        cli, "SQLCertificationRepository", lambda _engine: InMemoryCertificationRepository()
+    )
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "c" * 40)
+
+    result = runner.invoke(app, ["recertify-market-data", "--run-id", "source-run"])
+
+    assert result.exit_code == 2
+    assert "source certification is missing from DB" in result.output
+    assert disposed is True
 
 
 def test_config_backfill_and_health_commands(tmp_path: Path) -> None:
@@ -407,3 +592,157 @@ def test_yaml_settings_honor_runtime_database_and_live_safety_overrides(
 
     with pytest.raises(ValidationError, match="live mode requires"):
         cli._settings_from_yaml(config)
+
+
+def test_market_data_certification_cli_runs_isolated_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'certification.db'}")
+    Base.metadata.create_all(engine)
+    state_dir = tmp_path / "state"
+    artifact_root = state_dir / "certification-runs"
+    config = tmp_path / "certification.yaml"
+    config.write_text("market_data_certification: {enabled: true}\n", encoding="utf-8")
+    configured = Settings(
+        database_url="postgresql+psycopg://localhost/certification",
+        production_database_url="postgresql+psycopg://localhost/production",
+        symbols=("BTC", "ETH", "SOL", "HYPE"),
+        paper_trading=True,
+        live_trading=False,
+        paper={"enabled": True},
+        live={"enabled": False, "allowed_symbols": ("BTC", "ETH", "SOL", "HYPE")},
+        research_collection={
+            "collection_enabled": True,
+            "venues": ("hyperliquid", "bitget"),
+            "instruments": ("BTC", "ETH", "SOL", "HYPE"),
+        },
+        market_data_certification={
+            "enabled": True,
+            "artifact_root": str(artifact_root),
+        },
+    )
+
+    class Adapter:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+    def certification_event(event_type: str, payload: dict[str, object]) -> RawMarketEvent:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        now = datetime.now(UTC)
+        return RawMarketEvent(
+            event_id=f"hyperliquid-BTC-{event_type}",
+            venue="hyperliquid",
+            canonical_instrument_id="BTC",
+            venue_symbol="BTC",
+            event_type=event_type,
+            exchange_timestamp=now,
+            received_at=now,
+            available_at=now,
+            sequence=None,
+            connection_id=None,
+            reconciliation_state=None,
+            payload_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+            raw_payload=raw,
+            normalizer_version="r4-test",
+            capability_verification_run_id="unverified-experimental",
+            created_at=now,
+        )
+
+    common = {
+        "exchange": "hyperliquid",
+        "symbol": "BTC",
+        "received_at": datetime.now(UTC).isoformat(),
+        "available_at": datetime.now(UTC).isoformat(),
+    }
+    events = (
+        certification_event(
+            "funding_current",
+            {
+                **common,
+                "rate": "0.0001",
+                "next_funding_at": datetime.now(UTC).isoformat(),
+                "funding_interval_seconds": 3600,
+                "funding_schedule_source": "test_contract",
+            },
+        ),
+        certification_event(
+            "funding_history",
+            {
+                **common,
+                "rate": "0.0001",
+                "next_funding_at": datetime.now(UTC).isoformat(),
+                "funding_interval_seconds": 3600,
+                "funding_schedule_source": "test_contract",
+            },
+        ),
+        certification_event("mark_price", {**common, "mid": "100"}),
+        certification_event("index_price", {**common, "mid": "100"}),
+        certification_event("open_interest", {**common, "value": "1000", "unit": "base"}),
+        certification_event(
+            "trade",
+            {**common, "trade_id": "t-1", "price": "100", "quantity": "1", "side": "buy"},
+        ),
+        certification_event(
+            "ohlcv",
+            {
+                **common,
+                "open": "99",
+                "high": "101",
+                "low": "98",
+                "close": "100",
+                "volume": "10",
+            },
+        ),
+    )
+
+    async def collect(collector: object, *, duration_seconds: float) -> None:
+        assert duration_seconds == pytest.approx(0.6)
+        for item in events:
+            collected_at = datetime.now(UTC)
+            collector.repository.add_experimental_event(
+                replace(
+                    item,
+                    exchange_timestamp=collected_at,
+                    received_at=collected_at,
+                    available_at=collected_at,
+                    created_at=collected_at,
+                ),
+                "implemented",
+            )
+
+    monkeypatch.setattr(cli, "_settings_from_yaml", lambda _: configured)
+    monkeypatch.setenv("CRYPTTOOL_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("CRYPTTOOL_ALLOW_TEST_STORAGE", "1")
+    monkeypatch.setattr(cli, "Settings", lambda: configured)
+    monkeypatch.setattr(cli, "build_engine", lambda _: engine)
+    monkeypatch.setattr(
+        cli, "_require_nonproduction_database_isolation", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli, "_research_data_adapter", lambda venue: Adapter(venue))
+    monkeypatch.setattr(cli, "_run_certification_collection", collect)
+    monkeypatch.setattr(cli, "_certification_normalization_test_passed", lambda _: True)
+    monkeypatch.setattr(cli, "_current_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(cli, "verify_capability_audit", lambda *_args, **_kwargs: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "run-market-data-certification",
+            "--config",
+            str(config),
+            "--run-id",
+            "certification-cli",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "certifications=56" in result.output and "promoted=0" in result.output
+    identifier = "certification-cli-hyperliquid-BTC-funding_current"
+    verified = runner.invoke(
+        app,
+        ["verify-market-data-certification", "--certification-id", identifier],
+    )
+    assert verified.exit_code == 0, verified.output
+    status = runner.invoke(app, ["capability-certification-status"])
+    assert status.exit_code == 0 and identifier in status.output

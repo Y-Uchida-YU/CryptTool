@@ -1,0 +1,11 @@
+{
+  "created_at": "2026-07-15T06:54:37Z",
+  "failure_reason": "CANCELED_BEFORE_APPLICATION_START",
+  "launch_agent_service": "gui/501/com.crypttool.certification-stage1-20260715T042628Z",
+  "live_execution": "OFF",
+  "pid": 19889,
+  "process_result": "EXITED_AFTER_SIGTERM",
+  "run_id": "certification-stage1-20260715T042628Z-9a9d7e4",
+  "service_result": "UNLOADED",
+  "sigkill_used": false
+}

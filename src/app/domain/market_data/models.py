@@ -96,6 +96,9 @@ class FundingRate(TimedModel):
     rate: Decimal
     predicted_rate: Decimal | None = None
     next_funding_at: datetime | None = None
+    funding_interval_seconds: int | None = Field(default=None, gt=0)
+    funding_schedule_source: str | None = None
+    is_finalized: bool = True
 
 
 class OpenInterest(TimedModel):
