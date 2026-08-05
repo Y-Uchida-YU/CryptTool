@@ -86,7 +86,7 @@ class FundingCarryShadowConfig:
     instrument: str = "BTC"
     venues: tuple[str, str] = ("hyperliquid", "bitget")
     shadow_notional: Decimal = Decimal("10")
-    minimum_net_edge: Decimal = Decimal("-1")
+    minimum_net_edge: Decimal = Decimal("0")
     maximum_age_seconds: int = 30
     maximum_future_seconds: int = 1
     maximum_venue_timestamp_skew_seconds: int = 5

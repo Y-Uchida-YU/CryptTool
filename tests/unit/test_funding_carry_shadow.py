@@ -100,7 +100,8 @@ def evaluate(
     fundings: tuple[FundingObservation, ...] | None = None,
     config: FundingCarryShadowConfig | None = None,
 ):
-    return FundingCarryShadowEvaluator(config or FundingCarryShadowConfig()).evaluate(
+    test_config = config or replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("-1"))
+    return FundingCarryShadowEvaluator(test_config).evaluate(
         run_id="shadow-run",
         funding=fundings
         if fundings is not None
