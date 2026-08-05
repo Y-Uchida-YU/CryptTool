@@ -11,7 +11,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.domain.market_data.models import Side
+from app.domain.strategies.funding_carry import (
+    FundingCarryRejectCode,
+    FundingCarryShadowCandidate,
+    ShadowDisposition,
+)
 from app.infrastructure.database.models import (
+    FundingCarryShadowCandidateRow,
     OperationalRunRow,
     PaperAttributionRow,
     PaperCashLedgerRow,
@@ -75,6 +81,10 @@ class OperationalRepository(Protocol):
 
     def signals(self, run_id: str) -> tuple[PaperSignal, ...]: ...
 
+    def add_shadow_candidate(self, candidate: FundingCarryShadowCandidate) -> bool: ...
+
+    def shadow_candidates(self, run_id: str) -> tuple[FundingCarryShadowCandidate, ...]: ...
+
     def save_order(self, order: PaperOrderRecord) -> None: ...
 
     def orders(self, run_id: str) -> tuple[PaperOrderRecord, ...]: ...
@@ -115,6 +125,7 @@ class InMemoryOperationalRepository:
         self._runs: dict[str, OperationalRun] = {}
         self._eligibility: dict[tuple[str, str, str], StrategyEligibilityRecord] = {}
         self._signals: dict[str, PaperSignal] = {}
+        self._shadow_candidates: dict[str, FundingCarryShadowCandidate] = {}
         self._orders: dict[str, PaperOrderRecord] = {}
         self._fills: dict[str, PaperFillRecord] = {}
         self._positions: dict[tuple[str, str, str, str], PaperPositionRecord] = {}
@@ -159,6 +170,15 @@ class InMemoryOperationalRepository:
 
     def signals(self, run_id: str) -> tuple[PaperSignal, ...]:
         return tuple(item for item in self._signals.values() if item.identity.run_id == run_id)
+
+    def add_shadow_candidate(self, candidate: FundingCarryShadowCandidate) -> bool:
+        if candidate.candidate_id in self._shadow_candidates:
+            return False
+        self._shadow_candidates[candidate.candidate_id] = candidate
+        return True
+
+    def shadow_candidates(self, run_id: str) -> tuple[FundingCarryShadowCandidate, ...]:
+        return tuple(item for item in self._shadow_candidates.values() if item.run_id == run_id)
 
     def save_order(self, order: PaperOrderRecord) -> None:
         self._orders[order.order_id] = order
@@ -364,6 +384,109 @@ class PostgreSQLOperationalRepository:
         with Session(self.engine) as session:
             rows = session.scalars(select(PaperSignalRow).where(PaperSignalRow.run_id == run_id))
             return tuple(self._signal(row) for row in rows)
+
+    def add_shadow_candidate(self, candidate: FundingCarryShadowCandidate) -> bool:
+        with Session(self.engine) as session, session.begin():
+            if session.get(FundingCarryShadowCandidateRow, candidate.candidate_id) is not None:
+                return False
+            session.add(
+                FundingCarryShadowCandidateRow(
+                    candidate_id=candidate.candidate_id,
+                    run_id=candidate.run_id,
+                    strategy_id=candidate.strategy_id,
+                    instrument=candidate.instrument,
+                    long_venue=candidate.long_venue,
+                    short_venue=candidate.short_venue,
+                    disposition=candidate.disposition.value,
+                    rejection_reason=(
+                        candidate.rejection_reason.value
+                        if candidate.rejection_reason is not None
+                        else None
+                    ),
+                    source_event_ids_json=_json(candidate.source_event_ids),
+                    payload_json=_json(asdict(candidate)),
+                    code_commit_sha=candidate.code_commit_sha,
+                    config_sha256=candidate.config_sha,
+                    created_at=candidate.created_at,
+                )
+            )
+            return True
+
+    def shadow_candidates(self, run_id: str) -> tuple[FundingCarryShadowCandidate, ...]:
+        with Session(self.engine) as session:
+            rows = session.scalars(
+                select(FundingCarryShadowCandidateRow).where(
+                    FundingCarryShadowCandidateRow.run_id == run_id
+                )
+            )
+            return tuple(self._shadow_candidate(row) for row in rows)
+
+    @staticmethod
+    def _shadow_candidate(
+        row: FundingCarryShadowCandidateRow,
+    ) -> FundingCarryShadowCandidate:
+        data = json.loads(row.payload_json)
+
+        def decimal_or_none(name: str) -> Decimal | None:
+            value = data[name]
+            return Decimal(value) if value is not None else None
+
+        return FundingCarryShadowCandidate(
+            candidate_id=row.candidate_id,
+            run_id=row.run_id,
+            strategy_id=row.strategy_id,
+            instrument=row.instrument,
+            long_venue=row.long_venue,
+            short_venue=row.short_venue,
+            receive_leg=data["receive_leg"],
+            pay_leg=data["pay_leg"],
+            source_event_ids=tuple(data["source_event_ids"]),
+            funding_timestamps=tuple(
+                (venue, _utc(datetime.fromisoformat(timestamp)))
+                for venue, timestamp in data["funding_timestamps"]
+            ),
+            orderbook_timestamps=tuple(
+                (venue, _utc(datetime.fromisoformat(timestamp)))
+                for venue, timestamp in data["orderbook_timestamps"]
+            ),
+            raw_funding_rates=tuple(
+                (venue, Decimal(value)) for venue, value in data["raw_funding_rates"]
+            ),
+            canonical_funding_rates=tuple(
+                (venue, Decimal(value)) for venue, value in data["canonical_funding_rates"]
+            ),
+            funding_intervals=tuple(
+                (venue, int(value)) for venue, value in data["funding_intervals"]
+            ),
+            funding_rates_per_hour=tuple(
+                (venue, Decimal(value)) for venue, value in data["funding_rates_per_hour"]
+            ),
+            long_entry_vwap=decimal_or_none("long_entry_vwap"),
+            short_entry_vwap=decimal_or_none("short_entry_vwap"),
+            long_available_quantity=decimal_or_none("long_available_quantity"),
+            short_available_quantity=decimal_or_none("short_available_quantity"),
+            long_slippage_bps=decimal_or_none("long_slippage_bps"),
+            short_slippage_bps=decimal_or_none("short_slippage_bps"),
+            gross_funding_edge=decimal_or_none("gross_funding_edge"),
+            expected_funding_income=decimal_or_none("expected_funding_income"),
+            long_entry_fee=decimal_or_none("long_entry_fee"),
+            short_entry_fee=decimal_or_none("short_entry_fee"),
+            estimated_exit_fee=decimal_or_none("estimated_exit_fee"),
+            long_entry_slippage=decimal_or_none("long_entry_slippage"),
+            short_entry_slippage=decimal_or_none("short_entry_slippage"),
+            estimated_exit_slippage=decimal_or_none("estimated_exit_slippage"),
+            entry_basis_cost=decimal_or_none("entry_basis_cost"),
+            expected_net_edge=decimal_or_none("expected_net_edge"),
+            disposition=ShadowDisposition(row.disposition),
+            rejection_reason=(
+                FundingCarryRejectCode(row.rejection_reason)
+                if row.rejection_reason is not None
+                else None
+            ),
+            created_at=_utc(row.created_at),
+            code_commit_sha=row.code_commit_sha,
+            config_sha=row.config_sha256,
+        )
 
     @staticmethod
     def _identity(row: Any) -> OperationalIdentity:

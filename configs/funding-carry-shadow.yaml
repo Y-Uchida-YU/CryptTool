@@ -1,0 +1,46 @@
+environment: production
+database_url: postgresql+psycopg://localhost:5432/cryptbot
+paper_trading: true
+live_trading: false
+dry_run: true
+symbols: [BTC]
+paper:
+  enabled: true
+live:
+  enabled: false
+  adapter_name: disabled
+  allowed_symbols: [BTC]
+continuous_paper:
+  enabled: true
+  mode: shadow
+  observation_only: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC]
+  strategies: [funding_carry]
+  shadow_notional: 10
+  minimum_shadow_net_edge: 0
+  shadow_venue_taker_fee_rates:
+    hyperliquid: 0.0006
+    bitget: 0.0006
+research_collection:
+  collection_enabled: true
+  venues: [hyperliquid, bitget]
+  instruments: [BTC]
+  event_types: [funding_current, orderbook_snapshot]
+venues:
+  hyperliquid:
+    data_enabled: true
+    execution_enabled: false
+    eligibility_status: data_only
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    api_market_data_available: true
+    reason: public experimental data for observation-only shadow candidates
+  bitget:
+    data_enabled: true
+    execution_enabled: false
+    eligibility_status: data_only
+    jurisdiction: JP
+    terms_checked_at: "2026-07-12T00:00:00Z"
+    api_market_data_available: true
+    reason: public experimental data for observation-only shadow candidates

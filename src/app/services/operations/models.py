@@ -176,6 +176,13 @@ class LiveSignalInput:
     bid_size: Decimal | None = None
     ask_size: Decimal | None = None
     funding_rate: Decimal | None = None
+    bids: tuple[tuple[Decimal, Decimal], ...] = ()
+    asks: tuple[tuple[Decimal, Decimal], ...] = ()
+    funding_unit: str | None = None
+    funding_interval_seconds: int | None = None
+    next_funding_at: datetime | None = None
+    source_timestamp: datetime | None = None
+    received_at: datetime | None = None
 
 
 @dataclass(frozen=True)
