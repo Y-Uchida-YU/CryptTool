@@ -18,6 +18,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.adapters.exchanges.websocket import ReconciliationState
+from app.domain.strategies import capabilities as strategy_capabilities
+from app.domain.strategies.capabilities import StrategyDataRequirement
 from app.domain.venues.models import CapabilitySupport
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRecord
 from app.infrastructure.database.models import CapabilityPromotionRow, MarketDataCertificationRow
@@ -47,6 +49,7 @@ TIER_ONE_CAPABILITIES = (
 )
 SUPPORTED_CERTIFICATION_VENUES = ("hyperliquid", "bitget")
 SUPPORTED_CERTIFICATION_INSTRUMENTS = ("BTC", "ETH", "SOL", "HYPE")
+FUNDING_CARRY_REQUIREMENT = strategy_capabilities.FUNDING_CARRY_REQUIREMENT
 EVENT_CAPABILITY = {
     "funding_current": "funding_current",
     "funding_history": "funding_history",
@@ -352,26 +355,6 @@ class CertificationEvidence:
     funding_interval: FundingIntervalResult | None = None
     capability_contract: CapabilityContractVerdict | None = None
     historical_research_usability: HistoricalResearchUsability | None = None
-
-
-@dataclass(frozen=True)
-class StrategyDataRequirement:
-    strategy_id: str
-    required_capabilities: tuple[str, ...]
-    required_venues: tuple[str, ...]
-    minimum_coverage_ratio: Decimal
-    maximum_stale_ratio: Decimal
-    minimum_history_windows: int
-
-
-FUNDING_CARRY_REQUIREMENT = StrategyDataRequirement(
-    strategy_id="funding_carry",
-    required_capabilities=TIER_ONE_CAPABILITIES,
-    required_venues=SUPPORTED_CERTIFICATION_VENUES,
-    minimum_coverage_ratio=Decimal("0.80"),
-    maximum_stale_ratio=Decimal("0.05"),
-    minimum_history_windows=2,
-)
 
 
 class CertificationRepository(Protocol):

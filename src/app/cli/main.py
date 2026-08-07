@@ -3032,9 +3032,50 @@ def start_paper_operation(
             for raw in sorted(research_repository.raw_events(), key=lambda item: item.available_at)[
                 -2000:
             ]:
-                if raw.event_id in excluded or not raw.event_type.startswith("orderbook"):
+                if raw.event_id in excluded or (
+                    raw.event_type != "funding_current"
+                    and not raw.event_type.startswith("orderbook")
+                ):
                     continue
                 payload = raw.payload()
+                support = (
+                    "experimental"
+                    if raw.capability_verification_run_id in {"unverified-experimental", "pending"}
+                    else "live_verified"
+                )
+                if raw.event_type == "funding_current":
+                    rate = payload.get("rate") or payload.get("funding_rate")
+                    interval = payload.get("funding_interval_seconds")
+                    if rate is None:
+                        continue
+                    next_funding = payload.get("next_funding_at") or payload.get(
+                        "next_funding_time"
+                    )
+                    events.append(
+                        LiveSignalInput(
+                            event_id=raw.event_id,
+                            venue=raw.venue,
+                            instrument=raw.canonical_instrument_id,
+                            event_type=raw.event_type,
+                            available_at=raw.available_at,
+                            data_quality_score=1.0,
+                            capability_support=support,
+                            reconciliation_state=None,
+                            funding_rate=Decimal(str(rate)),
+                            funding_unit="fraction_per_interval",
+                            funding_interval_seconds=(
+                                int(interval) if interval is not None else None
+                            ),
+                            next_funding_at=(
+                                datetime.fromisoformat(str(next_funding))
+                                if next_funding is not None
+                                else None
+                            ),
+                            source_timestamp=raw.exchange_timestamp or raw.available_at,
+                            received_at=raw.received_at,
+                        )
+                    )
+                    continue
                 bids = payload.get("bids") or payload.get("levels", [[], []])[0]
                 asks = payload.get("asks") or payload.get("levels", [[], []])[1]
                 bid = payload.get("bid") or payload.get("best_bid")
@@ -3057,6 +3098,23 @@ def start_paper_operation(
                         ask, ask_size = ask or level[0], ask_size or level[1]
                 if any(item is None for item in (bid, ask, bid_size, ask_size)):
                     continue
+
+                def depth_levels(value: object) -> tuple[tuple[Decimal, Decimal], ...]:
+                    results: list[tuple[Decimal, Decimal]] = []
+                    if not isinstance(value, list):
+                        return ()
+                    for item in value:
+                        if isinstance(item, dict):
+                            price = item.get("px") or item.get("price")
+                            size = item.get("sz") or item.get("quantity")
+                        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                            price, size = item[0], item[1]
+                        else:
+                            continue
+                        if price is not None and size is not None:
+                            results.append((Decimal(str(price)), Decimal(str(size))))
+                    return tuple(results)
+
                 events.append(
                     LiveSignalInput(
                         event_id=raw.event_id,
@@ -3065,7 +3123,7 @@ def start_paper_operation(
                         event_type=raw.event_type,
                         available_at=raw.available_at,
                         data_quality_score=1.0,
-                        capability_support="live_verified",
+                        capability_support=support,
                         reconciliation_state=(
                             raw.reconciliation_state.value if raw.reconciliation_state else None
                         ),
@@ -3073,6 +3131,10 @@ def start_paper_operation(
                         ask=Decimal(str(ask)),
                         bid_size=Decimal(str(bid_size)),
                         ask_size=Decimal(str(ask_size)),
+                        bids=depth_levels(bids),
+                        asks=depth_levels(asks),
+                        source_timestamp=raw.exchange_timestamp or raw.available_at,
+                        received_at=raw.received_at,
                     )
                 )
             return tuple(events)

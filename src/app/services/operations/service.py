@@ -14,6 +14,18 @@ from typing import Protocol
 from app.adapters.notifications.base import NotificationAdapter, NullNotificationAdapter
 from app.config.settings import ContinuousPaperSettings, Settings
 from app.domain.market_data.models import Side
+from app.domain.strategies.capabilities import (
+    FUNDING_CARRY_REQUIRED_INSTRUMENTS,
+    FUNDING_CARRY_REQUIRED_VENUES,
+    FUNDING_CARRY_STRATEGY_ID,
+)
+from app.domain.strategies.funding_carry import (
+    FundingCarryShadowCandidate,
+    FundingCarryShadowConfig,
+    FundingCarryShadowEvaluator,
+    FundingObservation,
+    OrderBookObservation,
+)
 from app.services.operations.models import (
     CapitalFeasibilityStatus,
     CollectorHealthStatus,
@@ -171,6 +183,21 @@ class ContinuousResearchPaperService:
         )
         self._latest_events: dict[tuple[str, str, str], LiveSignalInput] = {}
         self._portfolio_states: dict[str, PortfolioState] = {}
+        self._funding_carry_shadow = FundingCarryShadowEvaluator(
+            FundingCarryShadowConfig(
+                instrument=FUNDING_CARRY_REQUIRED_INSTRUMENTS[0],
+                venues=FUNDING_CARRY_REQUIRED_VENUES,
+                shadow_notional=self.operation_settings.shadow_notional,
+                minimum_net_edge=self.operation_settings.minimum_shadow_net_edge,
+                maximum_age_seconds=self.operation_settings.source_event_max_age_seconds,
+                maximum_venue_timestamp_skew_seconds=(
+                    self.operation_settings.maximum_venue_timestamp_skew_seconds
+                ),
+                venue_taker_fee_rates=tuple(
+                    sorted(self.operation_settings.shadow_venue_taker_fee_rates.items())
+                ),
+            )
+        )
         self._validate_startup()
         self._restore_or_initialize()
         self.workers: tuple[Worker, ...] = (
@@ -205,6 +232,17 @@ class ContinuousResearchPaperService:
             raise ValueError("observation_only mode must be explicitly configured")
         if self.mode is OperationMode.STRICT_PAPER and self.operation_settings.observation_only:
             raise ValueError("strict_paper cannot start while observation_only is configured")
+        if self.operation_settings.mode == "shadow":
+            if self.mode is not OperationMode.OBSERVATION_ONLY:
+                raise ValueError("shadow mode requires observation_only")
+            if self.operation_settings.strategies != (FUNDING_CARRY_STRATEGY_ID,):
+                raise ValueError("shadow mode only starts funding_carry")
+            if self.operation_settings.instruments != FUNDING_CARRY_REQUIRED_INSTRUMENTS:
+                raise ValueError("shadow mode only starts BTC")
+            if self.operation_settings.venues != FUNDING_CARRY_REQUIRED_VENUES:
+                raise ValueError("shadow mode requires hyperliquid and bitget")
+            if self.settings.live.adapter_name != "disabled":
+                raise ValueError("shadow mode requires execution adapter disabled")
         if not self.local_smoke and not self.repository.durable:
             raise ValueError("continuous paper operation requires a durable PostgreSQL repository")
         if not self.local_smoke and self.settings.database_url.startswith("sqlite"):
@@ -400,6 +438,66 @@ class ContinuousResearchPaperService:
 
     def record_market_event(self, event: LiveSignalInput) -> None:
         self._latest_events[(event.venue, event.instrument, event.event_type)] = event
+
+    def generate_funding_carry_shadow_candidate(
+        self,
+        *,
+        events: Sequence[LiveSignalInput],
+        decision_time: datetime | None = None,
+    ) -> FundingCarryShadowCandidate:
+        decision_time = decision_time or self.now()
+        funding = tuple(
+            FundingObservation(
+                event_id=event.event_id,
+                venue=event.venue,
+                instrument=event.instrument,
+                raw_funding_rate=(
+                    event.funding_rate if event.funding_rate is not None else Decimal("NaN")
+                ),
+                funding_unit=event.funding_unit or "",
+                funding_interval_seconds=event.funding_interval_seconds,
+                next_funding_at=event.next_funding_at,
+                source_timestamp=event.source_timestamp or event.available_at,
+                received_at=event.received_at or event.available_at,
+                experimental=event.capability_support != "live_verified",
+            )
+            for event in events
+            if event.event_type == "funding_current"
+        )
+        orderbooks = tuple(
+            OrderBookObservation(
+                event_id=event.event_id,
+                venue=event.venue,
+                instrument=event.instrument,
+                bids=event.bids
+                or (
+                    ((event.bid, event.bid_size),)
+                    if event.bid is not None and event.bid_size is not None
+                    else ()
+                ),
+                asks=event.asks
+                or (
+                    ((event.ask, event.ask_size),)
+                    if event.ask is not None and event.ask_size is not None
+                    else ()
+                ),
+                source_timestamp=event.source_timestamp or event.available_at,
+                received_at=event.received_at or event.available_at,
+                experimental=event.capability_support != "live_verified",
+            )
+            for event in events
+            if event.event_type.startswith("orderbook")
+        )
+        candidate = self._funding_carry_shadow.evaluate(
+            run_id=self.run_id,
+            funding=funding,
+            orderbooks=orderbooks,
+            now=decision_time,
+            code_commit_sha=self.commit_sha,
+            config_sha=self.config_sha256,
+        )
+        self.repository.add_shadow_candidate(candidate)
+        return candidate
 
     def generate_signal(
         self,
@@ -1331,6 +1429,21 @@ class ContinuousResearchPaperService:
     async def _signal_tick(self) -> None:
         now = self.now()
         for instrument in self.operation_settings.instruments:
+            if (
+                self.operation_settings.mode == "shadow"
+                and FUNDING_CARRY_STRATEGY_ID in self.operation_settings.strategies
+            ):
+                shadow_events = tuple(
+                    event
+                    for (venue, saved_instrument, event_type), event in self._latest_events.items()
+                    if venue in FUNDING_CARRY_REQUIRED_VENUES
+                    and saved_instrument == instrument
+                    and (event_type == "funding_current" or event_type.startswith("orderbook"))
+                )
+                self.generate_funding_carry_shadow_candidate(
+                    events=shadow_events, decision_time=now
+                )
+                continue
             books = tuple(
                 event
                 for (venue, saved_instrument, event_type), event in self._latest_events.items()

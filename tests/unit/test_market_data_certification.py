@@ -1048,10 +1048,17 @@ def production_repository() -> InMemoryResearchRepository:
     for venue in requirement.required_venues:
         for capability in requirement.required_capabilities:
             repository.add_raw_event(
-                event(
-                    capability,
-                    venue=venue,
-                    event_id=f"{venue}-BTC-{capability}",
+                replace(
+                    event(
+                        capability,
+                        venue=venue,
+                        event_id=f"{venue}-BTC-{capability}",
+                    ),
+                    reconciliation_state=(
+                        ReconciliationState.SYNCHRONIZED
+                        if capability == "orderbook_snapshot"
+                        else None
+                    ),
                 )
             )
     return repository
@@ -1067,7 +1074,7 @@ def test_strategy_specific_snapshot_requirement() -> None:
     assert manifest.eligibility_status == "FINALIZED_RESEARCH_ELIGIBLE"
 
 
-def test_funding_snapshot_does_not_require_orderbook() -> None:
+def test_funding_snapshot_requires_current_funding_and_orderbook() -> None:
     requirement = replace(FUNDING_CARRY_REQUIREMENT, minimum_history_windows=1)
     repository = production_repository()
     manifest = StrategySnapshotService(repository).finalize(
@@ -1075,15 +1082,14 @@ def test_funding_snapshot_does_not_require_orderbook() -> None:
         cutoff_at=NOW,
         snapshot_id="funding-without-book",
     )
-    assert all(
-        repository.get_raw_event(event_id).event_type != "orderbook_snapshot"
-        for _, event_id, _ in manifest.events
-    )
+    assert {
+        repository.get_raw_event(event_id).event_type for _, event_id, _ in manifest.events
+    } == {"funding_current", "orderbook_snapshot"}
 
 
 def test_strategy_snapshot_fails_closed_when_a_venue_capability_is_missing() -> None:
     repository = production_repository()
-    repository.events.pop("bitget-BTC-funding_history")
+    repository.events.pop("bitget-BTC-orderbook_snapshot")
     manifest = StrategySnapshotService(repository).finalize(
         requirement=replace(FUNDING_CARRY_REQUIREMENT, minimum_history_windows=1),
         cutoff_at=NOW,

@@ -149,6 +149,7 @@ class ResearchCollectionSettings(BaseModel):
 class ContinuousPaperSettings(BaseModel):
     enabled: bool = False
     observation_only: bool = True
+    mode: Literal["paper", "shadow"] = "paper"
     venues: tuple[str, ...] = ("hyperliquid", "bitget")
     instruments: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE")
     strategies: tuple[str, ...] = (
@@ -165,7 +166,16 @@ class ContinuousPaperSettings(BaseModel):
     risk_interval_seconds: int = Field(10, ge=1)
     eligibility_ttl_seconds: int = Field(90000, ge=60)
     source_event_max_age_seconds: int = Field(30, ge=1, le=3600)
+    maximum_venue_timestamp_skew_seconds: int = Field(5, ge=0, le=60)
     minimum_data_quality: float = Field(0.90, ge=0.8, le=1)
+    shadow_notional: Decimal = Field(Decimal("10"), gt=0, le=Decimal("100"))
+    minimum_shadow_net_edge: Decimal = Decimal("0")
+    shadow_venue_taker_fee_rates: dict[str, Decimal] = Field(
+        default_factory=lambda: {
+            "hyperliquid": Decimal("0.0006"),
+            "bitget": Decimal("0.0006"),
+        }
+    )
     initial_capitals: tuple[Decimal, ...] = (
         Decimal("100"),
         Decimal("300"),
