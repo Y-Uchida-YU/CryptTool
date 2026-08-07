@@ -575,13 +575,32 @@ class PublicAdapterCollectorSource:
         exchange_server_time: datetime | None = None,
     ) -> CollectedEnvelope:
         now = datetime.now(UTC)
-        normalized = json.dumps(_json_value(value), sort_keys=True, separators=(",", ":"))
         websocket_raw = getattr(value, "source_raw_payload", None)
         websocket_hash = getattr(value, "source_payload_sha256", None)
         if websocket_raw is None and isinstance(value, dict):
             websocket_metadata = value.get("_collector_source", {})
             websocket_raw = websocket_metadata.get("raw_payload")
             websocket_hash = websocket_metadata.get("payload_sha256")
+        normalized_value = _json_value(value)
+        if (
+            identity.venue == "bitget"
+            and identity.channel == "orderbook"
+            and websocket_raw is not None
+            and isinstance(normalized_value, dict)
+        ):
+            source_message = json.loads(str(websocket_raw))
+            source_data = source_message.get("data", []) if isinstance(source_message, dict) else []
+            if source_data and isinstance(source_data[0], dict):
+                source_book = source_data[0]
+                normalized_value["_book_update"] = {
+                    "action": source_message.get("action"),
+                    "bids": source_book.get("bids", []),
+                    "asks": source_book.get("asks", []),
+                    "checksum": source_book.get("checksum"),
+                    "sequence": source_book.get("seq"),
+                    "previous_sequence": source_book.get("pseq"),
+                }
+        normalized = json.dumps(normalized_value, sort_keys=True, separators=(",", ":"))
         if websocket_raw is not None and websocket_hash is not None:
             actual = hashlib.sha256(str(websocket_raw).encode()).hexdigest()
             if actual != websocket_hash:

@@ -18,6 +18,7 @@ from app.domain.strategies.funding_carry import (
 )
 from app.infrastructure.database.models import (
     FundingCarryShadowCandidateRow,
+    FundingCarryShadowMetricsRow,
     OperationalRunRow,
     PaperAttributionRow,
     PaperCashLedgerRow,
@@ -46,6 +47,7 @@ from app.services.operations.models import (
     PaperRiskEvent,
     PaperSignal,
     ResearchExecutionStatus,
+    ShadowRuntimeMetrics,
     SignalDisposition,
     StrategyEligibilityRecord,
     StrategyEligibilityStatus,
@@ -84,6 +86,16 @@ class OperationalRepository(Protocol):
     def add_shadow_candidate(self, candidate: FundingCarryShadowCandidate) -> bool: ...
 
     def shadow_candidates(self, run_id: str) -> tuple[FundingCarryShadowCandidate, ...]: ...
+
+    def record_shadow_candidate(
+        self,
+        candidate: FundingCarryShadowCandidate,
+        *,
+        matched_source_pair: bool,
+        source_pair_duplicate: bool,
+    ) -> bool: ...
+
+    def shadow_metrics(self, run_id: str) -> ShadowRuntimeMetrics: ...
 
     def save_order(self, order: PaperOrderRecord) -> None: ...
 
@@ -126,6 +138,7 @@ class InMemoryOperationalRepository:
         self._eligibility: dict[tuple[str, str, str], StrategyEligibilityRecord] = {}
         self._signals: dict[str, PaperSignal] = {}
         self._shadow_candidates: dict[str, FundingCarryShadowCandidate] = {}
+        self._shadow_metrics: dict[str, ShadowRuntimeMetrics] = {}
         self._orders: dict[str, PaperOrderRecord] = {}
         self._fills: dict[str, PaperFillRecord] = {}
         self._positions: dict[tuple[str, str, str, str], PaperPositionRecord] = {}
@@ -179,6 +192,33 @@ class InMemoryOperationalRepository:
 
     def shadow_candidates(self, run_id: str) -> tuple[FundingCarryShadowCandidate, ...]:
         return tuple(item for item in self._shadow_candidates.values() if item.run_id == run_id)
+
+    def record_shadow_candidate(
+        self,
+        candidate: FundingCarryShadowCandidate,
+        *,
+        matched_source_pair: bool,
+        source_pair_duplicate: bool,
+    ) -> bool:
+        current = self.shadow_metrics(candidate.run_id)
+        inserted = self.add_shadow_candidate(candidate)
+        self._shadow_metrics[candidate.run_id] = ShadowRuntimeMetrics(
+            run_id=candidate.run_id,
+            candidate_generation_attempt_count=current.candidate_generation_attempt_count + 1,
+            candidate_inserted_count=current.candidate_inserted_count + int(inserted),
+            candidate_rejected_count=current.candidate_rejected_count
+            + int(candidate.disposition is ShadowDisposition.REJECTED),
+            candidate_duplicate_suppressed_count=(
+                current.candidate_duplicate_suppressed_count + int(not inserted)
+            ),
+            source_pair_duplicate_count=current.source_pair_duplicate_count
+            + int(source_pair_duplicate),
+            matched_source_pair_count=current.matched_source_pair_count + int(matched_source_pair),
+        )
+        return inserted
+
+    def shadow_metrics(self, run_id: str) -> ShadowRuntimeMetrics:
+        return self._shadow_metrics.get(run_id, ShadowRuntimeMetrics(run_id=run_id))
 
     def save_order(self, order: PaperOrderRecord) -> None:
         self._orders[order.order_id] = order
@@ -421,6 +461,78 @@ class PostgreSQLOperationalRepository:
             )
             return tuple(self._shadow_candidate(row) for row in rows)
 
+    def record_shadow_candidate(
+        self,
+        candidate: FundingCarryShadowCandidate,
+        *,
+        matched_source_pair: bool,
+        source_pair_duplicate: bool,
+    ) -> bool:
+        with Session(self.engine) as session, session.begin():
+            metrics = session.get(FundingCarryShadowMetricsRow, candidate.run_id)
+            if metrics is None:
+                metrics = FundingCarryShadowMetricsRow(
+                    run_id=candidate.run_id,
+                    candidate_generation_attempt_count=0,
+                    candidate_inserted_count=0,
+                    candidate_rejected_count=0,
+                    candidate_duplicate_suppressed_count=0,
+                    source_pair_duplicate_count=0,
+                    matched_source_pair_count=0,
+                    updated_at=candidate.created_at,
+                )
+                session.add(metrics)
+            metrics.candidate_generation_attempt_count += 1
+            metrics.candidate_rejected_count += int(
+                candidate.disposition is ShadowDisposition.REJECTED
+            )
+            metrics.source_pair_duplicate_count += int(source_pair_duplicate)
+            metrics.matched_source_pair_count += int(matched_source_pair)
+            inserted = session.get(FundingCarryShadowCandidateRow, candidate.candidate_id) is None
+            if inserted:
+                identity = candidate
+                session.add(
+                    FundingCarryShadowCandidateRow(
+                        candidate_id=identity.candidate_id,
+                        run_id=identity.run_id,
+                        strategy_id=identity.strategy_id,
+                        instrument=identity.instrument,
+                        long_venue=identity.long_venue,
+                        short_venue=identity.short_venue,
+                        disposition=identity.disposition.value,
+                        rejection_reason=(
+                            identity.rejection_reason.value
+                            if identity.rejection_reason is not None
+                            else None
+                        ),
+                        source_event_ids_json=_json(identity.source_event_ids),
+                        payload_json=_json(asdict(identity)),
+                        code_commit_sha=identity.code_commit_sha,
+                        config_sha256=identity.config_sha,
+                        created_at=identity.created_at,
+                    )
+                )
+                metrics.candidate_inserted_count += 1
+            else:
+                metrics.candidate_duplicate_suppressed_count += 1
+            metrics.updated_at = candidate.created_at
+            return inserted
+
+    def shadow_metrics(self, run_id: str) -> ShadowRuntimeMetrics:
+        with Session(self.engine) as session:
+            row = session.get(FundingCarryShadowMetricsRow, run_id)
+            if row is None:
+                return ShadowRuntimeMetrics(run_id=run_id)
+            return ShadowRuntimeMetrics(
+                run_id=run_id,
+                candidate_generation_attempt_count=row.candidate_generation_attempt_count,
+                candidate_inserted_count=row.candidate_inserted_count,
+                candidate_rejected_count=row.candidate_rejected_count,
+                candidate_duplicate_suppressed_count=row.candidate_duplicate_suppressed_count,
+                source_pair_duplicate_count=row.source_pair_duplicate_count,
+                matched_source_pair_count=row.matched_source_pair_count,
+            )
+
     @staticmethod
     def _shadow_candidate(
         row: FundingCarryShadowCandidateRow,
@@ -486,6 +598,24 @@ class PostgreSQLOperationalRepository:
             created_at=_utc(row.created_at),
             code_commit_sha=row.code_commit_sha,
             config_sha=row.config_sha256,
+            missing_venue=data.get("missing_venue"),
+            missing_capability=data.get("missing_capability"),
+            last_seen_event_at=(
+                _utc(datetime.fromisoformat(data["last_seen_event_at"]))
+                if data.get("last_seen_event_at")
+                else None
+            ),
+            last_valid_event_at=(
+                _utc(datetime.fromisoformat(data["last_valid_event_at"]))
+                if data.get("last_valid_event_at")
+                else None
+            ),
+            source_event_count=int(data.get("source_event_count", 0)),
+            venue_timestamp_skew_seconds=(
+                Decimal(data["venue_timestamp_skew_seconds"])
+                if data.get("venue_timestamp_skew_seconds") is not None
+                else None
+            ),
         )
 
     @staticmethod

@@ -54,6 +54,7 @@ from app.services.operations.models import (
     canonical_sha256,
 )
 from app.services.operations.repository import OperationalRepository
+from app.services.operations.shadow_runtime import ShadowInputBatch
 
 
 class Worker(Protocol):
@@ -142,7 +143,8 @@ class ContinuousResearchPaperService:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         snapshot_action: Callable[[datetime], str | ScheduledSnapshotOutcome] | None = None,
         research_action: Callable[[str], Sequence[ScheduledResearchOutcome]] | None = None,
-        market_event_action: Callable[[], Sequence[LiveSignalInput]] | None = None,
+        market_event_action: Callable[[], Sequence[LiveSignalInput] | ShadowInputBatch]
+        | None = None,
         collector_health_action: Callable[[], CollectorHealthSummary] | None = None,
     ) -> None:
         self.repository = repository
@@ -182,6 +184,7 @@ class ContinuousResearchPaperService:
             reasons=("health summary not yet evaluated",),
         )
         self._latest_events: dict[tuple[str, str, str], LiveSignalInput] = {}
+        self._shadow_input_batch: ShadowInputBatch | None = None
         self._portfolio_states: dict[str, PortfolioState] = {}
         self._funding_carry_shadow = FundingCarryShadowEvaluator(
             FundingCarryShadowConfig(
@@ -200,23 +203,34 @@ class ContinuousResearchPaperService:
         )
         self._validate_startup()
         self._restore_or_initialize()
-        self.workers: tuple[Worker, ...] = (
-            CollectorSupervisor("collector", 10, self._collector_tick),
-            SnapshotFinalizer(
-                "snapshot",
-                self.operation_settings.operational_snapshot_interval_seconds,
-                self._snapshot_tick,
-            ),
-            ResearchScheduler("research", 60, self._research_tick),
-            SignalScheduler(
-                "signals", self.operation_settings.signal_interval_seconds, self._signal_tick
-            ),
-            PaperExecutionWorker("paper_execution", 1, self._paper_execution_tick),
-            PaperRiskWorker(
-                "paper_risk", self.operation_settings.risk_interval_seconds, self._risk_tick
-            ),
-            ReportingWorker("reporting", 60, self._reporting_tick),
-        )
+        self.workers: tuple[Worker, ...]
+        if self.operation_settings.mode == "shadow":
+            self.workers = (
+                CollectorSupervisor("collector", 10, self._collector_tick),
+                SignalScheduler(
+                    "funding_carry_shadow_evaluator",
+                    self.operation_settings.signal_interval_seconds,
+                    self._signal_tick,
+                ),
+            )
+        else:
+            self.workers = (
+                CollectorSupervisor("collector", 10, self._collector_tick),
+                SnapshotFinalizer(
+                    "snapshot",
+                    self.operation_settings.operational_snapshot_interval_seconds,
+                    self._snapshot_tick,
+                ),
+                ResearchScheduler("research", 60, self._research_tick),
+                SignalScheduler(
+                    "signals", self.operation_settings.signal_interval_seconds, self._signal_tick
+                ),
+                PaperExecutionWorker("paper_execution", 1, self._paper_execution_tick),
+                PaperRiskWorker(
+                    "paper_risk", self.operation_settings.risk_interval_seconds, self._risk_tick
+                ),
+                ReportingWorker("reporting", 60, self._reporting_tick),
+            )
 
     def _validate_startup(self) -> None:
         if self.settings.live_trading or self.settings.live.enabled:
@@ -443,6 +457,7 @@ class ContinuousResearchPaperService:
         self,
         *,
         events: Sequence[LiveSignalInput],
+        batch: ShadowInputBatch | None = None,
         decision_time: datetime | None = None,
     ) -> FundingCarryShadowCandidate:
         decision_time = decision_time or self.now()
@@ -484,9 +499,18 @@ class ContinuousResearchPaperService:
                 source_timestamp=event.source_timestamp or event.available_at,
                 received_at=event.received_at or event.available_at,
                 experimental=event.capability_support != "live_verified",
+                source_event_ids=tuple(
+                    dict.fromkeys(
+                        (
+                            event.source_event_id or event.event_id,
+                            *event.applied_source_event_ids,
+                        )
+                    )
+                ),
             )
             for event in events
             if event.event_type.startswith("orderbook")
+            or event.event_type == "canonical_orderbook_snapshot"
         )
         candidate = self._funding_carry_shadow.evaluate(
             run_id=self.run_id,
@@ -496,7 +520,26 @@ class ContinuousResearchPaperService:
             code_commit_sha=self.commit_sha,
             config_sha=self.config_sha256,
         )
-        self.repository.add_shadow_candidate(candidate)
+        if batch is not None:
+            candidate = replace(
+                candidate,
+                rejection_reason=(
+                    batch.missing.reason if batch.missing else candidate.rejection_reason
+                ),
+                missing_venue=(batch.missing.venue if batch.missing else None),
+                missing_capability=(batch.missing.capability if batch.missing else None),
+                last_seen_event_at=(batch.missing.last_seen_event_at if batch.missing else None),
+                last_valid_event_at=(batch.missing.last_valid_event_at if batch.missing else None),
+                source_event_count=(
+                    batch.missing.source_event_count if batch.missing else len(events)
+                ),
+                venue_timestamp_skew_seconds=batch.venue_timestamp_skew_seconds,
+            )
+        self.repository.record_shadow_candidate(
+            candidate,
+            matched_source_pair=bool(batch and batch.matched),
+            source_pair_duplicate=bool(batch and batch.source_pair_duplicate),
+        )
         return candidate
 
     def generate_signal(
@@ -1315,7 +1358,13 @@ class ContinuousResearchPaperService:
             await self.notifier.send("Collector stopped", self.run_id, "error")
             return
         if self.market_event_action is not None:
-            for event in await asyncio.to_thread(self.market_event_action):
+            result = await asyncio.to_thread(self.market_event_action)
+            if isinstance(result, ShadowInputBatch):
+                self._shadow_input_batch = result
+                events: Sequence[LiveSignalInput] = result.events
+            else:
+                events = result
+            for event in events:
                 self.record_market_event(event)
 
     async def _snapshot_tick(self) -> None:
@@ -1433,15 +1482,11 @@ class ContinuousResearchPaperService:
                 self.operation_settings.mode == "shadow"
                 and FUNDING_CARRY_STRATEGY_ID in self.operation_settings.strategies
             ):
-                shadow_events = tuple(
-                    event
-                    for (venue, saved_instrument, event_type), event in self._latest_events.items()
-                    if venue in FUNDING_CARRY_REQUIRED_VENUES
-                    and saved_instrument == instrument
-                    and (event_type == "funding_current" or event_type.startswith("orderbook"))
-                )
+                batch = self._shadow_input_batch
+                if batch is None:
+                    continue
                 self.generate_funding_carry_shadow_candidate(
-                    events=shadow_events, decision_time=now
+                    events=batch.events, batch=batch, decision_time=now
                 )
                 continue
             books = tuple(

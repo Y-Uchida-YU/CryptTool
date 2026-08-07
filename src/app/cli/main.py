@@ -63,12 +63,15 @@ from app.services.operations.models import (
     LiveSignalInput,
     OperationalRunStatus,
 )
+from app.services.operations.provenance import resolve_commit_sha
 from app.services.operations.repository import PostgreSQLOperationalRepository
 from app.services.operations.service import (
     ContinuousResearchPaperService,
     ScheduledResearchOutcome,
     ScheduledSnapshotOutcome,
 )
+from app.services.operations.shadow_artifacts import ShadowRunArtifactWriter
+from app.services.operations.shadow_runtime import FundingCarryShadowInputSource, ShadowInputBatch
 from app.services.paper_trading.broker import PaperBroker
 from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
@@ -2258,15 +2261,7 @@ async def _run_collector_with_lease(
 
 
 def _current_commit_sha() -> str:
-    head = Path(".git/HEAD")
-    if not head.is_file():
-        return "unknown"
-    value = head.read_text(encoding="utf-8").strip()
-    if value.startswith("ref: "):
-        reference = Path(".git") / value.removeprefix("ref: ")
-        if reference.is_file():
-            return reference.read_text(encoding="utf-8").strip()
-    return value
+    return resolve_commit_sha(cwd=Path.cwd())
 
 
 def _process_identity(pid: int) -> tuple[datetime, str]:
@@ -2290,7 +2285,12 @@ def _process_identity(pid: int) -> tuple[datetime, str]:
 
 
 def _collector_token_path(run_id: str) -> Path:
-    token_directory = Path(tempfile.gettempdir()) / "crypttool-collector-run-tokens"
+    state_value = os.environ.get("CRYPTTOOL_STATE_DIR")
+    token_directory = (
+        Path(state_value).expanduser().resolve() / "collector-run-tokens"
+        if state_value
+        else Path(tempfile.gettempdir()) / "crypttool-collector-run-tokens"
+    )
     token_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     return token_directory / f"{hashlib.sha256(run_id.encode()).hexdigest()}.token"
 
@@ -2853,6 +2853,22 @@ def start_paper_operation(
         raise typer.BadParameter("live execution must remain disabled")
     if settings.database_url.startswith("sqlite"):
         raise typer.BadParameter("continuous paper operation requires PostgreSQL")
+    try:
+        runtime_commit_sha = _current_commit_sha()
+    except RuntimeError:
+        runtime_commit_sha = resolve_commit_sha(
+            cwd=Path.cwd(), explicit_sha=settings.continuous_paper.commit_sha
+        )
+    if settings.continuous_paper.mode == "shadow":
+        if settings.exchange_api_key is not None or settings.exchange_api_secret is not None:
+            raise typer.BadParameter("shadow mode forbids loading live credentials")
+        state_value = os.environ.get("CRYPTTOOL_STATE_DIR")
+        if not state_value:
+            raise typer.BadParameter("CRYPTTOOL_STATE_DIR is required for shadow mode")
+        state_path = Path(state_value).expanduser().resolve()
+        temporary_path = Path(tempfile.gettempdir()).resolve()
+        if state_path == temporary_path or temporary_path in state_path.parents:
+            raise typer.BadParameter("shadow state cannot use the OS temporary directory")
     resolved_run_id = run_id or f"paper-operation-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     config_sha = hashlib.sha256(config.read_bytes()).hexdigest()
     engine = build_engine(settings.database_url)
@@ -2863,6 +2879,19 @@ def start_paper_operation(
             raise typer.BadParameter(
                 "continuous paper operation requires research collection enabled"
             )
+        if settings.continuous_paper.mode == "shadow":
+            if set(collection.venues) != {"hyperliquid", "bitget"}:
+                raise typer.BadParameter("shadow collection requires only hyperliquid and bitget")
+            if collection.instruments != ("BTC",):
+                raise typer.BadParameter("shadow collection requires only BTC")
+            if set(collection.event_types) != {
+                "funding_current",
+                "orderbook_snapshot",
+                "orderbook_delta",
+            }:
+                raise typer.BadParameter(
+                    "shadow collection requires only funding and order-book inputs"
+                )
         adapters = tuple(_research_data_adapter(name) for name in collection.venues)
         registry = TrustedCapabilityRegistry.from_artifacts(
             Path.cwd(), tuple(adapter.capabilities for adapter in adapters)
@@ -2884,7 +2913,7 @@ def start_paper_operation(
             run_id=resolved_run_id,
             collector_group=f"collector-set-{canonical_sha256(groups)[:24]}",
             owner_id=owner_id,
-            commit_sha=_current_commit_sha(),
+            commit_sha=runtime_commit_sha,
             config_path=str(config.resolve()),
             database_identity=database_identity,
             schema_name=schema_name,
@@ -2916,6 +2945,17 @@ def start_paper_operation(
                 lease_repository.release(group, resolved_run_id, owner_id)
             raise
         research_repository = PostgreSQLResearchRepository(engine)
+        shadow_input_source = (
+            FundingCarryShadowInputSource(
+                research_repository,
+                maximum_age_seconds=settings.continuous_paper.source_event_max_age_seconds,
+                maximum_venue_timestamp_skew_seconds=(
+                    settings.continuous_paper.maximum_venue_timestamp_skew_seconds
+                ),
+            )
+            if settings.continuous_paper.mode == "shadow"
+            else None
+        )
         collector = ResearchMarketDataCollector(
             repository=research_repository,
             sources=tuple(
@@ -2961,7 +3001,7 @@ def start_paper_operation(
             for strategy_id in settings.continuous_paper.strategies:
                 result = ResearchPipeline(research_repository).run(
                     {
-                        "commit_sha": _current_commit_sha(),
+                        "commit_sha": runtime_commit_sha,
                         "data_snapshot_id": snapshot_id,
                         "hypothesis_version": (
                             f"r3-{strategy_id}-{manifest.cutoff_at.strftime('%Y%m%dT%H')}"
@@ -3024,7 +3064,9 @@ def start_paper_operation(
                 )
             return tuple(outcomes)
 
-        def live_market_events() -> tuple[LiveSignalInput, ...]:
+        def live_market_events() -> tuple[LiveSignalInput, ...] | ShadowInputBatch:
+            if shadow_input_source is not None:
+                return shadow_input_source.read(now=datetime.now(UTC))
             cutoff_at = datetime.now(UTC)
             quarantined, _ = research_repository.quarantine_summary(cutoff_at)
             excluded = set(quarantined)
@@ -3160,29 +3202,62 @@ def start_paper_operation(
                 experimental_market_event_count=(research_repository.experimental_event_count()),
             )
 
+        operational_repository = PostgreSQLOperationalRepository(engine)
         service = ContinuousResearchPaperService(
-            repository=PostgreSQLOperationalRepository(engine),
+            repository=operational_repository,
             settings=settings,
             run_id=resolved_run_id,
-            commit_sha=_current_commit_sha(),
+            commit_sha=runtime_commit_sha,
             config_sha256=config_sha,
-            snapshot_action=finalize_snapshot,
-            research_action=run_research,
+            snapshot_action=(
+                None if settings.continuous_paper.mode == "shadow" else finalize_snapshot
+            ),
+            research_action=(None if settings.continuous_paper.mode == "shadow" else run_research),
             market_event_action=live_market_events,
             collector_health_action=collector_health,
         )
         service.set_collector_health(True)
-        typer.echo(f"run_id={resolved_run_id} mode={service.mode.value} live_execution=false")
-        asyncio.run(
-            _run_continuous_operation(
-                service=service,
-                collector=collector,
-                lease_repository=lease_repository,
-                groups=groups,
-                collector_run=collector_run,
-                duration_seconds=(duration_minutes * 60 if duration_minutes is not None else None),
+        artifact_writer = (
+            ShadowRunArtifactWriter(
+                run_id=resolved_run_id,
+                commit_sha=runtime_commit_sha,
+                config_path=config,
+                settings=settings,
+                engine=engine,
+                repository=operational_repository,
+                input_source=shadow_input_source,
             )
+            if shadow_input_source is not None
+            else None
         )
+        startup_summary = (
+            f"run_id={resolved_run_id} commit_sha={runtime_commit_sha} "
+            f"mode={service.mode.value} live_execution=false"
+        )
+        typer.echo(startup_summary)
+        if artifact_writer is not None:
+            artifact_writer.startup(startup_summary)
+        try:
+            asyncio.run(
+                _run_continuous_operation(
+                    service=service,
+                    collector=collector,
+                    lease_repository=lease_repository,
+                    groups=groups,
+                    collector_run=collector_run,
+                    duration_seconds=(
+                        duration_minutes * 60 if duration_minutes is not None else None
+                    ),
+                )
+            )
+        except BaseException as exc:
+            if artifact_writer is not None:
+                artifact_writer.failure(exc)
+                artifact_writer.finalize(exit_code=1)
+            raise
+        else:
+            if artifact_writer is not None:
+                artifact_writer.finalize(exit_code=0)
     finally:
         if token_path is not None:
             token_path.unlink(missing_ok=True)
