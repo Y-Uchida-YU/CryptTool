@@ -49,6 +49,12 @@ class FundingCarryRejectCode(StrEnum):
     BITGET_ORDERBOOK_STATE_NOT_INITIALIZED = "bitget_orderbook_state_not_initialized"
     BITGET_ORDERBOOK_SEQUENCE_GAP = "bitget_orderbook_sequence_gap"
     BITGET_ORDERBOOK_STATE_INVALID = "bitget_orderbook_state_invalid"
+    HYPERLIQUID_FUNDING_STALE = "hyperliquid_funding_stale"
+    BITGET_FUNDING_STALE = "bitget_funding_stale"
+    FUNDING_OBSERVATION_UNSYNCHRONIZED = "funding_observation_unsynchronized"
+    HYPERLIQUID_ORDERBOOK_STALE = "hyperliquid_orderbook_stale"
+    BITGET_ORDERBOOK_STALE = "bitget_orderbook_stale"
+    ORDERBOOK_VENUES_UNSYNCHRONIZED = "orderbook_venues_unsynchronized"
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,10 @@ class FundingCarryShadowConfig:
     minimum_net_edge: Decimal = Decimal("0")
     maximum_age_seconds: int = 30
     maximum_future_seconds: int = 1
+    funding_max_age_seconds: int = 40
+    funding_max_observation_skew_seconds: int = 30
+    maximum_orderbook_venue_skew_seconds: int = 5
+    # Legacy configuration retained for compatibility; no 4-way skew is evaluated.
     maximum_venue_timestamp_skew_seconds: int = 5
     venue_taker_fee_rates: tuple[tuple[str, Decimal], ...] = (
         ("hyperliquid", Decimal("0.0006")),
@@ -151,6 +161,15 @@ class FundingCarryShadowCandidate:
     last_valid_event_at: datetime | None = None
     source_event_count: int = 0
     venue_timestamp_skew_seconds: Decimal | None = None
+    hyperliquid_funding_age_seconds: Decimal | None = None
+    bitget_funding_age_seconds: Decimal | None = None
+    funding_observation_skew_seconds: Decimal | None = None
+    hyperliquid_orderbook_age_seconds: Decimal | None = None
+    bitget_orderbook_age_seconds: Decimal | None = None
+    orderbook_venue_skew_seconds: Decimal | None = None
+    funding_freshness_pass: bool | None = None
+    orderbook_freshness_pass: bool | None = None
+    orderbook_synchronization_pass: bool | None = None
 
 
 def _identity(strategy_id: str, instrument: str, source_event_ids: Iterable[str]) -> str:
@@ -443,22 +462,39 @@ class FundingCarryShadowEvaluator:
             raise ValueError(FundingCarryRejectCode.MISSING_FUNDING_CURRENT)
         if len(orderbooks) != 2:
             raise ValueError(FundingCarryRejectCode.MISSING_ORDERBOOK_SNAPSHOT)
-        maximum_age = timedelta(seconds=self.config.maximum_age_seconds)
+        maximum_funding_age = timedelta(seconds=self.config.funding_max_age_seconds)
+        maximum_orderbook_age = timedelta(seconds=self.config.maximum_age_seconds)
         maximum_future = timedelta(seconds=self.config.maximum_future_seconds)
-        timestamps: list[datetime] = []
         for item in all_inputs:
             if item.source_timestamp.tzinfo is None or item.received_at.tzinfo is None:
                 raise ValueError(FundingCarryRejectCode.FUTURE_TIMESTAMP)
             source = item.source_timestamp.astimezone(UTC)
             if source > now + maximum_future:
                 raise ValueError(FundingCarryRejectCode.FUTURE_TIMESTAMP)
-            if now - source > maximum_age:
-                raise ValueError(FundingCarryRejectCode.STALE_DATA)
-            timestamps.append(source)
-        if max(timestamps) - min(timestamps) > timedelta(
-            seconds=self.config.maximum_venue_timestamp_skew_seconds
+        funding_by_venue = {item.venue: item for item in funding}
+        books_by_venue = {item.venue: item for item in orderbooks}
+        for venue, reason in (
+            ("hyperliquid", FundingCarryRejectCode.HYPERLIQUID_FUNDING_STALE),
+            ("bitget", FundingCarryRejectCode.BITGET_FUNDING_STALE),
         ):
-            raise ValueError(FundingCarryRejectCode.UNSYNCHRONIZED_VENUE_TIMESTAMPS)
+            if now - funding_by_venue[venue].source_timestamp > maximum_funding_age:
+                raise ValueError(reason)
+        if abs(
+            funding_by_venue["hyperliquid"].source_timestamp
+            - funding_by_venue["bitget"].source_timestamp
+        ) > timedelta(seconds=self.config.funding_max_observation_skew_seconds):
+            raise ValueError(FundingCarryRejectCode.FUNDING_OBSERVATION_UNSYNCHRONIZED)
+        for venue, reason in (
+            ("hyperliquid", FundingCarryRejectCode.HYPERLIQUID_ORDERBOOK_STALE),
+            ("bitget", FundingCarryRejectCode.BITGET_ORDERBOOK_STALE),
+        ):
+            if now - books_by_venue[venue].source_timestamp > maximum_orderbook_age:
+                raise ValueError(reason)
+        if abs(
+            books_by_venue["hyperliquid"].source_timestamp
+            - books_by_venue["bitget"].source_timestamp
+        ) > timedelta(seconds=self.config.maximum_orderbook_venue_skew_seconds):
+            raise ValueError(FundingCarryRejectCode.ORDERBOOK_VENUES_UNSYNCHRONIZED)
         for book in orderbooks:
             if not book.bids or not book.asks:
                 raise ValueError(FundingCarryRejectCode.EMPTY_USABLE_DEPTH)

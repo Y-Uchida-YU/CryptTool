@@ -183,11 +183,11 @@ def test_raw_venue_funding_sign_is_normalized(venue: str) -> None:
     [
         (
             (
-                funding("hyperliquid", "0.001", timestamp=NOW - timedelta(seconds=31)),
+                funding("hyperliquid", "0.001", timestamp=NOW - timedelta(seconds=41)),
                 funding("bitget", "0.0001"),
             ),
             None,
-            FundingCarryRejectCode.STALE_DATA,
+            FundingCarryRejectCode.HYPERLIQUID_FUNDING_STALE,
         ),
         (
             (
@@ -288,12 +288,12 @@ def test_runtime_validation_rejects_invalid_inputs(
             FundingCarryRejectCode.EMPTY_USABLE_DEPTH,
         ),
         (
-            (
-                funding("hyperliquid", "0.001", timestamp=NOW - timedelta(seconds=6)),
-                funding("bitget", "0.0001"),
-            ),
             None,
-            FundingCarryRejectCode.UNSYNCHRONIZED_VENUE_TIMESTAMPS,
+            (
+                book("hyperliquid", timestamp=NOW - timedelta(seconds=6)),
+                book("bitget"),
+            ),
+            FundingCarryRejectCode.ORDERBOOK_VENUES_UNSYNCHRONIZED,
         ),
         (
             (

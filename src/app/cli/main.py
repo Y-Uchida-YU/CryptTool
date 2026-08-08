@@ -2949,8 +2949,13 @@ def start_paper_operation(
             FundingCarryShadowInputSource(
                 research_repository,
                 maximum_age_seconds=settings.continuous_paper.source_event_max_age_seconds,
-                maximum_venue_timestamp_skew_seconds=(
-                    settings.continuous_paper.maximum_venue_timestamp_skew_seconds
+                collector_poll_interval_seconds=collection.poll_interval_seconds,
+                funding_max_age_seconds=settings.continuous_paper.funding_max_age_seconds,
+                funding_max_observation_skew_seconds=(
+                    settings.continuous_paper.funding_max_observation_skew_seconds
+                ),
+                maximum_orderbook_venue_skew_seconds=(
+                    settings.continuous_paper.maximum_orderbook_venue_skew_seconds
                 ),
             )
             if settings.continuous_paper.mode == "shadow"
@@ -3257,7 +3262,9 @@ def start_paper_operation(
             raise
         else:
             if artifact_writer is not None:
-                artifact_writer.finalize(exit_code=0)
+                actual_exit_code = artifact_writer.finalize(exit_code=0)
+                if actual_exit_code != 0:
+                    raise typer.Exit(code=actual_exit_code)
     finally:
         if token_path is not None:
             token_path.unlink(missing_ok=True)

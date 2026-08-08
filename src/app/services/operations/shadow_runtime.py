@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -13,6 +13,8 @@ from typing import Protocol
 from app.domain.strategies.funding_carry import FundingCarryRejectCode
 from app.services.operations.models import LiveSignalInput
 from app.services.research.models import RawMarketEvent
+
+SHADOW_INPUT_REFRESH_INTERVAL_SECONDS = 10
 
 
 class ExperimentalEventRepository(Protocol):
@@ -57,12 +59,27 @@ class MissingShadowInput:
 
 
 @dataclass(frozen=True)
+class ShadowTimingMetrics:
+    hyperliquid_funding_age_seconds: Decimal
+    bitget_funding_age_seconds: Decimal
+    funding_observation_skew_seconds: Decimal
+    hyperliquid_orderbook_age_seconds: Decimal
+    bitget_orderbook_age_seconds: Decimal
+    orderbook_venue_skew_seconds: Decimal
+    funding_freshness_pass: bool
+    orderbook_freshness_pass: bool
+    orderbook_synchronization_pass: bool
+
+
+@dataclass(frozen=True)
 class ShadowInputBatch:
     events: tuple[LiveSignalInput, ...]
     matched: bool
     pair_identity: str | None
     source_pair_duplicate: bool
     missing: MissingShadowInput | None = None
+    timing: ShadowTimingMetrics | None = None
+    # Legacy only. It must never mix funding and order-book timestamp domains.
     venue_timestamp_skew_seconds: Decimal | None = None
 
 
@@ -432,6 +449,8 @@ class CanonicalOrderBookStateBuilder:
 
 class FundingCarryShadowInputSource:
     SOURCE_TABLE = "experimental_market_events"
+    FUNDING_TIMESTAMP_SEMANTIC = "funding_observation"
+    ORDERBOOK_TIMESTAMP_SEMANTIC = "orderbook_market_event"
 
     def __init__(
         self,
@@ -439,12 +458,36 @@ class FundingCarryShadowInputSource:
         *,
         maximum_age_seconds: int = 30,
         maximum_future_seconds: int = 1,
-        maximum_venue_timestamp_skew_seconds: int = 5,
+        collector_poll_interval_seconds: float = 30,
+        input_refresh_interval_seconds: float = SHADOW_INPUT_REFRESH_INTERVAL_SECONDS,
+        funding_max_age_seconds: int | None = None,
+        funding_max_observation_skew_seconds: int | None = None,
+        maximum_orderbook_venue_skew_seconds: int = 5,
+        maximum_venue_timestamp_skew_seconds: int | None = None,
     ) -> None:
         self.repository = repository
-        self.maximum_age = timedelta(seconds=maximum_age_seconds)
+        self.maximum_orderbook_age = timedelta(seconds=maximum_age_seconds)
         self.maximum_future = timedelta(seconds=maximum_future_seconds)
-        self.maximum_skew = Decimal(maximum_venue_timestamp_skew_seconds)
+        derived_funding_age = math.ceil(
+            collector_poll_interval_seconds + input_refresh_interval_seconds
+        )
+        derived_funding_skew = math.ceil(collector_poll_interval_seconds)
+        self.funding_max_age_seconds = (
+            funding_max_age_seconds if funding_max_age_seconds is not None else derived_funding_age
+        )
+        self.funding_max_observation_skew_seconds = (
+            funding_max_observation_skew_seconds
+            if funding_max_observation_skew_seconds is not None
+            else derived_funding_skew
+        )
+        self.maximum_orderbook_venue_skew_seconds = (
+            maximum_orderbook_venue_skew_seconds
+            if maximum_venue_timestamp_skew_seconds is None
+            else maximum_venue_timestamp_skew_seconds
+        )
+        self.maximum_funding_age = timedelta(seconds=self.funding_max_age_seconds)
+        self.maximum_funding_skew = Decimal(self.funding_max_observation_skew_seconds)
+        self.maximum_orderbook_skew = Decimal(self.maximum_orderbook_venue_skew_seconds)
         self.book_builder = CanonicalOrderBookStateBuilder(
             maximum_age_seconds=maximum_age_seconds,
             maximum_future_seconds=maximum_future_seconds,
@@ -488,7 +531,7 @@ class FundingCarryShadowInputSource:
             self._processed_book_events.add(event.event_id)
             snapshot = self.book_builder.apply(event, now=now)
             if snapshot is not None:
-                parsed_book = self._book(snapshot)
+                parsed_book = self._book(snapshot, now=now)
                 self._latest_books[event.venue] = parsed_book
                 self.last_valid[(event.venue, capability)] = event.available_at
             elif event.venue == "hyperliquid" or self.book_builder.last_invalid_reason.get(
@@ -512,31 +555,36 @@ class FundingCarryShadowInputSource:
             self._latest_funding["bitget"],
             self._latest_books["bitget"],
         )
-        timestamps = tuple((item.source_timestamp or item.available_at) for item in paired)
-        for item, timestamp in zip(paired, timestamps, strict=True):
-            capability = (
-                "funding_current" if item.event_type == "funding_current" else "orderbook_snapshot"
-            )
+        paired = (
+            self._with_freshness(paired[0], now=now),
+            self._with_freshness(paired[1], now=now),
+            self._with_freshness(paired[2], now=now),
+            self._with_freshness(paired[3], now=now),
+        )
+        for item in paired:
+            timestamp = item.exchange_timestamp or item.available_at
             if timestamp > now + self.maximum_future:
-                return self._invalid_batch(
-                    paired, item, capability, FundingCarryRejectCode.FUTURE_TIMESTAMP
+                capability = (
+                    "funding_current"
+                    if item.timestamp_semantic == self.FUNDING_TIMESTAMP_SEMANTIC
+                    else "orderbook_snapshot"
                 )
-            if now - timestamp > self.maximum_age:
                 return self._invalid_batch(
-                    paired, item, capability, FundingCarryRejectCode.STALE_DATA
+                    paired,
+                    item,
+                    capability,
+                    FundingCarryRejectCode.FUTURE_TIMESTAMP,
                 )
-        skew = Decimal(str((max(timestamps) - min(timestamps)).total_seconds()))
-        if skew > self.maximum_skew:
-            missing = MissingShadowInput(
-                reason=FundingCarryRejectCode.UNSYNCHRONIZED_VENUE_TIMESTAMPS,
-                venue="cross_venue",
-                capability="timestamp_synchronization",
-                last_seen_event_at=max(timestamps),
-                last_valid_event_at=None,
-                source_event_count=self.source_event_count,
-            )
-            return ShadowInputBatch(
-                paired, False, None, False, missing, venue_timestamp_skew_seconds=skew
+        timing = self._timing_metrics(paired)
+        rejection = self._timing_rejection(paired, timing)
+        if rejection is not None:
+            item, capability, reason = rejection
+            return self._invalid_batch(
+                paired,
+                item,
+                capability,
+                reason,
+                timing=timing,
             )
         pair_identity = hashlib.sha256(
             json.dumps(self._source_event_ids(paired), separators=(",", ":")).encode()
@@ -544,17 +592,15 @@ class FundingCarryShadowInputSource:
         duplicate = pair_identity == self._last_pair_identity
         self._last_pair_identity = pair_identity
         return ShadowInputBatch(
-            paired, True, pair_identity, duplicate, venue_timestamp_skew_seconds=skew
+            paired,
+            True,
+            pair_identity,
+            duplicate,
+            timing=timing,
         )
 
     def _funding(self, event: RawMarketEvent, *, now: datetime) -> LiveSignalInput | None:
         timestamp = event.exchange_timestamp or event.available_at
-        if timestamp > now + self.maximum_future:
-            self._funding_invalid_reason[event.venue] = FundingCarryRejectCode.FUTURE_TIMESTAMP
-            return None
-        if now - timestamp > self.maximum_age:
-            self._funding_invalid_reason[event.venue] = FundingCarryRejectCode.STALE_DATA
-            return None
         payload = event.payload()
         rate = payload.get("rate") or payload.get("funding_rate")
         interval = payload.get("funding_interval_seconds")
@@ -608,9 +654,12 @@ class FundingCarryShadowInputSource:
             connection_epoch=event.connection_epoch,
             sequence=event.sequence,
             source_event_id=event.event_id,
+            timestamp_semantic=self.FUNDING_TIMESTAMP_SEMANTIC,
+            exchange_timestamp=timestamp,
+            freshness_age_seconds=self._age_seconds(now, timestamp),
         )
 
-    def _book(self, snapshot: CanonicalOrderBookSnapshot) -> LiveSignalInput:
+    def _book(self, snapshot: CanonicalOrderBookSnapshot, *, now: datetime) -> LiveSignalInput:
         return LiveSignalInput(
             event_id=f"canonical-book-{snapshot.state_hash}",
             venue=snapshot.venue,
@@ -635,6 +684,9 @@ class FundingCarryShadowInputSource:
             state_hash=snapshot.state_hash,
             source_event_id=snapshot.source_snapshot_event_id,
             applied_source_event_ids=snapshot.applied_delta_event_ids,
+            timestamp_semantic=self.ORDERBOOK_TIMESTAMP_SEMANTIC,
+            exchange_timestamp=snapshot.exchange_timestamp,
+            freshness_age_seconds=self._age_seconds(now, snapshot.exchange_timestamp),
         )
 
     def _missing(self) -> MissingShadowInput | None:
@@ -668,6 +720,12 @@ class FundingCarryShadowInputSource:
                 reason = self.book_builder.last_invalid_reason.get((venue, "BTC"), reason)
             if venue == "hyperliquid" and capability == "orderbook_snapshot":
                 reason = self.book_builder.last_invalid_reason.get((venue, "BTC"), reason)
+            if reason is FundingCarryRejectCode.STALE_DATA and capability == "orderbook_snapshot":
+                reason = (
+                    FundingCarryRejectCode.HYPERLIQUID_ORDERBOOK_STALE
+                    if venue == "hyperliquid"
+                    else FundingCarryRejectCode.BITGET_ORDERBOOK_STALE
+                )
             return MissingShadowInput(
                 reason=reason,
                 venue=venue,
@@ -705,6 +763,8 @@ class FundingCarryShadowInputSource:
         item: LiveSignalInput,
         capability: str,
         reason: FundingCarryRejectCode,
+        *,
+        timing: ShadowTimingMetrics | None = None,
     ) -> ShadowInputBatch:
         missing = MissingShadowInput(
             reason=reason,
@@ -714,4 +774,121 @@ class FundingCarryShadowInputSource:
             last_valid_event_at=self.last_valid.get((item.venue, capability)),
             source_event_count=self.source_event_count,
         )
-        return ShadowInputBatch(events, False, None, False, missing)
+        return ShadowInputBatch(events, False, None, False, missing, timing=timing)
+
+    @staticmethod
+    def _age_seconds(now: datetime, timestamp: datetime) -> Decimal:
+        return Decimal(str((now - timestamp).total_seconds()))
+
+    def _with_freshness(self, item: LiveSignalInput, *, now: datetime) -> LiveSignalInput:
+        timestamp = item.exchange_timestamp or item.available_at
+        return replace(
+            item,
+            exchange_timestamp=timestamp,
+            freshness_age_seconds=self._age_seconds(now, timestamp),
+        )
+
+    @staticmethod
+    def _semantic_event(
+        events: tuple[LiveSignalInput, ...], venue: str, semantic: str
+    ) -> LiveSignalInput:
+        return next(
+            item for item in events if item.venue == venue and item.timestamp_semantic == semantic
+        )
+
+    def _timing_metrics(self, events: tuple[LiveSignalInput, ...]) -> ShadowTimingMetrics:
+        hl_funding = self._semantic_event(events, "hyperliquid", self.FUNDING_TIMESTAMP_SEMANTIC)
+        bg_funding = self._semantic_event(events, "bitget", self.FUNDING_TIMESTAMP_SEMANTIC)
+        hl_book = self._semantic_event(events, "hyperliquid", self.ORDERBOOK_TIMESTAMP_SEMANTIC)
+        bg_book = self._semantic_event(events, "bitget", self.ORDERBOOK_TIMESTAMP_SEMANTIC)
+        hl_funding_age = hl_funding.freshness_age_seconds or Decimal("0")
+        bg_funding_age = bg_funding.freshness_age_seconds or Decimal("0")
+        hl_book_age = hl_book.freshness_age_seconds or Decimal("0")
+        bg_book_age = bg_book.freshness_age_seconds or Decimal("0")
+        funding_skew = abs(
+            Decimal(
+                str(
+                    (
+                        (hl_funding.exchange_timestamp or hl_funding.available_at)
+                        - (bg_funding.exchange_timestamp or bg_funding.available_at)
+                    ).total_seconds()
+                )
+            )
+        )
+        book_skew = abs(
+            Decimal(
+                str(
+                    (
+                        (hl_book.exchange_timestamp or hl_book.available_at)
+                        - (bg_book.exchange_timestamp or bg_book.available_at)
+                    ).total_seconds()
+                )
+            )
+        )
+        return ShadowTimingMetrics(
+            hyperliquid_funding_age_seconds=hl_funding_age,
+            bitget_funding_age_seconds=bg_funding_age,
+            funding_observation_skew_seconds=funding_skew,
+            hyperliquid_orderbook_age_seconds=hl_book_age,
+            bitget_orderbook_age_seconds=bg_book_age,
+            orderbook_venue_skew_seconds=book_skew,
+            funding_freshness_pass=(
+                hl_funding_age <= Decimal(self.funding_max_age_seconds)
+                and bg_funding_age <= Decimal(self.funding_max_age_seconds)
+                and funding_skew <= self.maximum_funding_skew
+            ),
+            orderbook_freshness_pass=(
+                hl_book_age <= Decimal(str(self.maximum_orderbook_age.total_seconds()))
+                and bg_book_age <= Decimal(str(self.maximum_orderbook_age.total_seconds()))
+            ),
+            orderbook_synchronization_pass=book_skew <= self.maximum_orderbook_skew,
+        )
+
+    def _timing_rejection(
+        self,
+        events: tuple[LiveSignalInput, ...],
+        timing: ShadowTimingMetrics,
+    ) -> tuple[LiveSignalInput, str, FundingCarryRejectCode] | None:
+        hl_funding = self._semantic_event(events, "hyperliquid", self.FUNDING_TIMESTAMP_SEMANTIC)
+        bg_funding = self._semantic_event(events, "bitget", self.FUNDING_TIMESTAMP_SEMANTIC)
+        hl_book = self._semantic_event(events, "hyperliquid", self.ORDERBOOK_TIMESTAMP_SEMANTIC)
+        bg_book = self._semantic_event(events, "bitget", self.ORDERBOOK_TIMESTAMP_SEMANTIC)
+        maximum_funding_age = Decimal(self.funding_max_age_seconds)
+        maximum_book_age = Decimal(str(self.maximum_orderbook_age.total_seconds()))
+        if timing.hyperliquid_funding_age_seconds > maximum_funding_age:
+            return (
+                hl_funding,
+                "funding_current",
+                FundingCarryRejectCode.HYPERLIQUID_FUNDING_STALE,
+            )
+        if timing.bitget_funding_age_seconds > maximum_funding_age:
+            return (
+                bg_funding,
+                "funding_current",
+                FundingCarryRejectCode.BITGET_FUNDING_STALE,
+            )
+        if timing.funding_observation_skew_seconds > self.maximum_funding_skew:
+            return (
+                hl_funding,
+                "funding_observation_synchronization",
+                FundingCarryRejectCode.FUNDING_OBSERVATION_UNSYNCHRONIZED,
+            )
+        if timing.hyperliquid_orderbook_age_seconds > maximum_book_age:
+            return (
+                hl_book,
+                "orderbook_snapshot",
+                FundingCarryRejectCode.HYPERLIQUID_ORDERBOOK_STALE,
+            )
+        if timing.bitget_orderbook_age_seconds > maximum_book_age:
+            return (
+                bg_book,
+                "orderbook_snapshot",
+                FundingCarryRejectCode.BITGET_ORDERBOOK_STALE,
+            )
+        if timing.orderbook_venue_skew_seconds > self.maximum_orderbook_skew:
+            return (
+                hl_book,
+                "orderbook_synchronization",
+                FundingCarryRejectCode.ORDERBOOK_VENUES_UNSYNCHRONIZED,
+            )
+        return None

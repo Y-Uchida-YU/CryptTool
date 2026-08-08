@@ -616,6 +616,15 @@ class PostgreSQLOperationalRepository:
                 if data.get("venue_timestamp_skew_seconds") is not None
                 else None
             ),
+            hyperliquid_funding_age_seconds=decimal_or_none("hyperliquid_funding_age_seconds"),
+            bitget_funding_age_seconds=decimal_or_none("bitget_funding_age_seconds"),
+            funding_observation_skew_seconds=decimal_or_none("funding_observation_skew_seconds"),
+            hyperliquid_orderbook_age_seconds=decimal_or_none("hyperliquid_orderbook_age_seconds"),
+            bitget_orderbook_age_seconds=decimal_or_none("bitget_orderbook_age_seconds"),
+            orderbook_venue_skew_seconds=decimal_or_none("orderbook_venue_skew_seconds"),
+            funding_freshness_pass=data.get("funding_freshness_pass"),
+            orderbook_freshness_pass=data.get("orderbook_freshness_pass"),
+            orderbook_synchronization_pass=data.get("orderbook_synchronization_pass"),
         )
 
     @staticmethod
