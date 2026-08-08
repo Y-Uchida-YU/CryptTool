@@ -176,6 +176,7 @@ class ContinuousPaperSettings(BaseModel):
             "bitget": Decimal("0.0006"),
         }
     )
+    commit_sha: str | None = None
     initial_capitals: tuple[Decimal, ...] = (
         Decimal("100"),
         Decimal("300"),

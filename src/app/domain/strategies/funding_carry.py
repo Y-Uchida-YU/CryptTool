@@ -42,6 +42,13 @@ class FundingCarryRejectCode(StrEnum):
     INSUFFICIENT_ORDERBOOK_DEPTH = "insufficient_orderbook_depth"
     UNKNOWN_FEE = "unknown_fee"
     EDGE_BELOW_THRESHOLD = "edge_below_threshold"
+    MISSING_HYPERLIQUID_FUNDING_CURRENT = "missing_hyperliquid_funding_current"
+    MISSING_BITGET_FUNDING_CURRENT = "missing_bitget_funding_current"
+    MISSING_HYPERLIQUID_ORDERBOOK_SNAPSHOT = "missing_hyperliquid_orderbook_snapshot"
+    MISSING_BITGET_ORDERBOOK_SNAPSHOT = "missing_bitget_orderbook_snapshot"
+    BITGET_ORDERBOOK_STATE_NOT_INITIALIZED = "bitget_orderbook_state_not_initialized"
+    BITGET_ORDERBOOK_SEQUENCE_GAP = "bitget_orderbook_sequence_gap"
+    BITGET_ORDERBOOK_STATE_INVALID = "bitget_orderbook_state_invalid"
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class OrderBookObservation:
     source_timestamp: datetime
     received_at: datetime
     experimental: bool = True
+    source_event_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,6 +145,12 @@ class FundingCarryShadowCandidate:
     created_at: datetime
     code_commit_sha: str
     config_sha: str
+    missing_venue: str | None = None
+    missing_capability: str | None = None
+    last_seen_event_at: datetime | None = None
+    last_valid_event_at: datetime | None = None
+    source_event_count: int = 0
+    venue_timestamp_skew_seconds: Decimal | None = None
 
 
 def _identity(strategy_id: str, instrument: str, source_event_ids: Iterable[str]) -> str:
@@ -227,7 +241,15 @@ class FundingCarryShadowEvaluator:
         config_sha: str,
     ) -> FundingCarryShadowCandidate:
         all_inputs: tuple[FundingObservation | OrderBookObservation, ...] = funding + orderbooks
-        source_ids = tuple(item.event_id for item in all_inputs)
+        source_ids = tuple(
+            source_id
+            for item in all_inputs
+            for source_id in (
+                item.source_event_ids
+                if isinstance(item, OrderBookObservation) and item.source_event_ids
+                else (item.event_id,)
+            )
+        )
         candidate_id = _identity(FUNDING_CARRY_STRATEGY_ID, self.config.instrument, source_ids)
         try:
             self._validate_inputs(funding, orderbooks, now)

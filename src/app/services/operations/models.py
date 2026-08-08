@@ -183,6 +183,24 @@ class LiveSignalInput:
     next_funding_at: datetime | None = None
     source_timestamp: datetime | None = None
     received_at: datetime | None = None
+    source_table: str = "raw_market_events"
+    normalizer_version: str = "unknown"
+    connection_epoch: int | None = None
+    sequence: int | None = None
+    state_hash: str | None = None
+    source_event_id: str | None = None
+    applied_source_event_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ShadowRuntimeMetrics:
+    run_id: str
+    candidate_generation_attempt_count: int = 0
+    candidate_inserted_count: int = 0
+    candidate_rejected_count: int = 0
+    candidate_duplicate_suppressed_count: int = 0
+    source_pair_duplicate_count: int = 0
+    matched_source_pair_count: int = 0
 
 
 @dataclass(frozen=True)

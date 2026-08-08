@@ -23,7 +23,7 @@ from app.adapters.exchanges.websocket import (
     ReconciliationState,
     WebSocketConnectionLifecycle,
 )
-from app.domain.market_data.models import Market, Side, Trade
+from app.domain.market_data.models import Market, OrderBook, OrderBookLevel, Side, Trade
 from app.domain.venues.models import CapabilitySupport
 from app.infrastructure.database.models import Base, ResearchArtifactRow
 from app.infrastructure.database.session import build_engine
@@ -759,6 +759,54 @@ def test_websocket_raw_frame_is_preserved_separately_from_normalized_event() -> 
     assert collected.raw_payload == raw_frame
     assert collected.normalized_payload is not None
     assert "source_raw_payload" not in collected.normalized_payload
+
+
+def test_bitget_collector_preserves_raw_snapshot_delta_update_for_state_builder() -> None:
+    source = PublicAdapterCollectorSource(object(), "bitget")  # type: ignore[arg-type]
+    raw_frame = json.dumps(
+        {
+            "action": "update",
+            "data": [
+                {
+                    "bids": [["99", "3"]],
+                    "asks": [["100", "0"]],
+                    "seq": 105,
+                    "pseq": 100,
+                    "checksum": 123,
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    book = OrderBook(
+        exchange="bitget",
+        symbol="BTCUSDT",
+        exchange_timestamp=BASE,
+        received_at=BASE,
+        available_at=BASE,
+        sequence=105,
+        bids=(OrderBookLevel(price=Decimal("99"), quantity=Decimal("3")),),
+        asks=(OrderBookLevel(price=Decimal("101"), quantity=Decimal("2")),),
+        source_raw_payload=raw_frame,
+        source_payload_sha256=hashlib.sha256(raw_frame.encode()).hexdigest(),
+    )
+    identity = ResearchStreamIdentity("bitget", "BTC", "BTCUSDT", "orderbook_delta", "orderbook")
+    collected = source._envelope(
+        identity,
+        book,
+        event_type="orderbook_delta",
+        delta_sequence=105,
+        previous_delta_sequence=100,
+    )
+    normalized = json.loads(collected.normalized_payload or "{}")
+    assert normalized["_book_update"] == {
+        "action": "update",
+        "asks": [["100", "0"]],
+        "bids": [["99", "3"]],
+        "checksum": 123,
+        "previous_sequence": 100,
+        "sequence": 105,
+    }
 
 
 def test_connection_lifecycle_is_filtered_and_persisted_with_recovery_identity() -> None:

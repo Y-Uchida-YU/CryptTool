@@ -508,6 +508,20 @@ class FundingCarryShadowCandidateRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class FundingCarryShadowMetricsRow(Base):
+    __tablename__ = "funding_carry_shadow_metrics"
+    run_id: Mapped[str] = mapped_column(
+        String(160), ForeignKey("operational_runs.run_id"), primary_key=True
+    )
+    candidate_generation_attempt_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    candidate_inserted_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    candidate_rejected_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    candidate_duplicate_suppressed_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    source_pair_duplicate_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    matched_source_pair_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class PaperOrderRow(Base):
     __tablename__ = "paper_orders"
     order_id: Mapped[str] = mapped_column(String(160), primary_key=True)
