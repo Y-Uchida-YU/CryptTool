@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
@@ -54,7 +55,10 @@ from app.services.operations.models import (
     canonical_sha256,
 )
 from app.services.operations.repository import OperationalRepository
-from app.services.operations.shadow_runtime import ShadowInputBatch
+from app.services.operations.shadow_runtime import (
+    SHADOW_INPUT_REFRESH_INTERVAL_SECONDS,
+    ShadowInputBatch,
+)
 
 
 class Worker(Protocol):
@@ -193,6 +197,20 @@ class ContinuousResearchPaperService:
                 shadow_notional=self.operation_settings.shadow_notional,
                 minimum_net_edge=self.operation_settings.minimum_shadow_net_edge,
                 maximum_age_seconds=self.operation_settings.source_event_max_age_seconds,
+                funding_max_age_seconds=(
+                    self.operation_settings.funding_max_age_seconds
+                    if self.operation_settings.funding_max_age_seconds is not None
+                    else math.ceil(self.settings.research_collection.poll_interval_seconds)
+                    + SHADOW_INPUT_REFRESH_INTERVAL_SECONDS
+                ),
+                funding_max_observation_skew_seconds=(
+                    self.operation_settings.funding_max_observation_skew_seconds
+                    if self.operation_settings.funding_max_observation_skew_seconds is not None
+                    else math.ceil(self.settings.research_collection.poll_interval_seconds)
+                ),
+                maximum_orderbook_venue_skew_seconds=(
+                    self.operation_settings.maximum_orderbook_venue_skew_seconds
+                ),
                 maximum_venue_timestamp_skew_seconds=(
                     self.operation_settings.maximum_venue_timestamp_skew_seconds
                 ),
@@ -206,7 +224,9 @@ class ContinuousResearchPaperService:
         self.workers: tuple[Worker, ...]
         if self.operation_settings.mode == "shadow":
             self.workers = (
-                CollectorSupervisor("collector", 10, self._collector_tick),
+                CollectorSupervisor(
+                    "collector", SHADOW_INPUT_REFRESH_INTERVAL_SECONDS, self._collector_tick
+                ),
                 SignalScheduler(
                     "funding_carry_shadow_evaluator",
                     self.operation_settings.signal_interval_seconds,
@@ -534,6 +554,33 @@ class ContinuousResearchPaperService:
                     batch.missing.source_event_count if batch.missing else len(events)
                 ),
                 venue_timestamp_skew_seconds=batch.venue_timestamp_skew_seconds,
+                hyperliquid_funding_age_seconds=(
+                    batch.timing.hyperliquid_funding_age_seconds if batch.timing else None
+                ),
+                bitget_funding_age_seconds=(
+                    batch.timing.bitget_funding_age_seconds if batch.timing else None
+                ),
+                funding_observation_skew_seconds=(
+                    batch.timing.funding_observation_skew_seconds if batch.timing else None
+                ),
+                hyperliquid_orderbook_age_seconds=(
+                    batch.timing.hyperliquid_orderbook_age_seconds if batch.timing else None
+                ),
+                bitget_orderbook_age_seconds=(
+                    batch.timing.bitget_orderbook_age_seconds if batch.timing else None
+                ),
+                orderbook_venue_skew_seconds=(
+                    batch.timing.orderbook_venue_skew_seconds if batch.timing else None
+                ),
+                funding_freshness_pass=(
+                    batch.timing.funding_freshness_pass if batch.timing else None
+                ),
+                orderbook_freshness_pass=(
+                    batch.timing.orderbook_freshness_pass if batch.timing else None
+                ),
+                orderbook_synchronization_pass=(
+                    batch.timing.orderbook_synchronization_pass if batch.timing else None
+                ),
             )
         self.repository.record_shadow_candidate(
             candidate,

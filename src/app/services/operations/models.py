@@ -190,6 +190,9 @@ class LiveSignalInput:
     state_hash: str | None = None
     source_event_id: str | None = None
     applied_source_event_ids: tuple[str, ...] = ()
+    timestamp_semantic: str | None = None
+    exchange_timestamp: datetime | None = None
+    freshness_age_seconds: Decimal | None = None
 
 
 @dataclass(frozen=True)

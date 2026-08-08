@@ -39,7 +39,10 @@ from app.services.operations.service import (
     ResearchScheduler,
     SnapshotFinalizer,
 )
-from app.services.operations.shadow_artifacts import ShadowRunArtifactWriter
+from app.services.operations.shadow_artifacts import (
+    ArtifactFinalizationError,
+    ShadowRunArtifactWriter,
+)
 from app.services.operations.shadow_runtime import (
     BookStateStatus,
     CanonicalOrderBookStateBuilder,
@@ -329,8 +332,8 @@ def test_invalid_hyperliquid_book_never_reaches_evaluator(payload: dict[str, obj
         ),
         (
             funding_payload("0.001", 3600),
-            NOW - timedelta(seconds=31),
-            FundingCarryRejectCode.STALE_DATA,
+            NOW - timedelta(seconds=41),
+            FundingCarryRejectCode.HYPERLIQUID_FUNDING_STALE,
         ),
         ({"funding_interval_seconds": 3600}, NOW, FundingCarryRejectCode.MISSING_FUNDING_CURRENT),
         ({"rate": "0.001"}, NOW, FundingCarryRejectCode.UNKNOWN_FUNDING_INTERVAL),
@@ -401,7 +404,7 @@ def test_bitget_checksum_is_validated_before_book_publication() -> None:
     )
 
 
-def test_cross_venue_timestamp_skew_is_rejected_before_pairing() -> None:
+def test_funding_polling_offset_does_not_cause_orderbook_sync_rejection() -> None:
     repository = complete_repository()
     repository.experimental_events.pop("bg-funding")
     assert repository.add_experimental_event(
@@ -415,11 +418,75 @@ def test_cross_venue_timestamp_skew_is_rejected_before_pairing() -> None:
         "implemented",
     )
     batch = FundingCarryShadowInputSource(repository).read(now=NOW)
+    assert batch.matched
+    assert batch.missing is None
+    assert batch.timing is not None
+    assert batch.timing.funding_observation_skew_seconds == Decimal("6.0")
+    assert batch.timing.orderbook_venue_skew_seconds == Decimal("0.0")
+
+
+def test_timestamp_semantics_and_freshness_are_persisted_per_input_domain() -> None:
+    batch = FundingCarryShadowInputSource(complete_repository()).read(now=NOW)
+    assert batch.matched
+    assert {(item.event_type, item.timestamp_semantic) for item in batch.events} == {
+        ("funding_current", "funding_observation"),
+        ("canonical_orderbook_snapshot", "orderbook_market_event"),
+    }
+    assert all(item.exchange_timestamp is not None for item in batch.events)
+    assert all(item.freshness_age_seconds == 0 for item in batch.events)
+
+
+@pytest.mark.parametrize(
+    ("venue", "reason"),
+    [
+        ("hyperliquid", FundingCarryRejectCode.HYPERLIQUID_FUNDING_STALE),
+        ("bitget", FundingCarryRejectCode.BITGET_FUNDING_STALE),
+    ],
+)
+def test_funding_freshness_uses_funding_timing_policy(
+    venue: str, reason: FundingCarryRejectCode
+) -> None:
+    repository = complete_repository()
+    repository.experimental_events.pop("hl-funding" if venue == "hyperliquid" else "bg-funding")
+    assert repository.add_experimental_event(
+        event(
+            f"stale-{venue}-funding",
+            venue,
+            "funding_current",
+            funding_payload("0.001", 3600),
+            timestamp=NOW - timedelta(seconds=41),
+        ),
+        "implemented",
+    )
+    batch = FundingCarryShadowInputSource(repository).read(now=NOW)
     assert not batch.matched
     assert batch.missing is not None
-    assert batch.missing.reason is FundingCarryRejectCode.UNSYNCHRONIZED_VENUE_TIMESTAMPS
-    assert batch.missing.venue == "cross_venue"
-    assert batch.venue_timestamp_skew_seconds == Decimal("6.0")
+    assert batch.missing.reason is reason
+    assert batch.timing is not None
+    assert not batch.timing.funding_freshness_pass
+
+
+def test_unsynchronized_orderbooks_use_orderbook_only_timing_policy() -> None:
+    repository = complete_repository()
+    repository.experimental_events.pop("hl-book")
+    assert repository.add_experimental_event(
+        event(
+            "skewed-hl-book",
+            "hyperliquid",
+            "orderbook_snapshot",
+            book_payload(),
+            sequence=10,
+            timestamp=NOW - timedelta(seconds=6),
+        ),
+        "implemented",
+    )
+    batch = FundingCarryShadowInputSource(repository).read(now=NOW)
+    assert not batch.matched
+    assert batch.missing is not None
+    assert batch.missing.reason is FundingCarryRejectCode.ORDERBOOK_VENUES_UNSYNCHRONIZED
+    assert batch.timing is not None
+    assert batch.timing.funding_freshness_pass
+    assert not batch.timing.orderbook_synchronization_pass
 
 
 def test_all_four_inputs_create_matched_pair_and_reach_evaluator() -> None:
@@ -629,9 +696,10 @@ def test_shadow_artifact_bundle_is_complete_and_records_zero_safety_counters(
     Base.metadata.create_all(engine)
     operational = PostgreSQLOperationalRepository(engine)
     settings = shadow_settings()
+    settings.continuous_paper.minimum_shadow_net_edge = Decimal("1")
     commit_sha = "a" * 40
     run_id = "artifact-test"
-    ContinuousResearchPaperService(
+    operation = ContinuousResearchPaperService(
         repository=operational,
         settings=settings,
         run_id=run_id,
@@ -642,6 +710,11 @@ def test_shadow_artifact_bundle_is_complete_and_records_zero_safety_counters(
         now=lambda: NOW,
     )
     source = FundingCarryShadowInputSource(complete_repository())
+    batch = source.read(now=NOW)
+    inserted = operation.generate_funding_carry_shadow_candidate(
+        events=batch.events, batch=batch, decision_time=NOW
+    )
+    assert inserted.disposition.value == "rejected"
     source_config = tmp_path / "source-config.yaml"
     source_config.write_text("mode: shadow\n", encoding="utf-8")
     writer = ShadowRunArtifactWriter(
@@ -655,7 +728,7 @@ def test_shadow_artifact_bundle_is_complete_and_records_zero_safety_counters(
     )
     writer.startup(f"commit_sha={commit_sha}")
     writer.finalize(exit_code=0)
-    assert {item.name for item in writer.directory.iterdir()} == set(writer.REQUIRED_FILES)
+    assert {item.name for item in writer.directory.iterdir()} == set(writer.SUCCESS_FILES)
     safety = json.loads((writer.directory / "safety-counters.json").read_text())
     assert safety == {
         "capability_promotion_count": 0,
@@ -673,6 +746,81 @@ def test_shadow_artifact_bundle_is_complete_and_records_zero_safety_counters(
     manifest = json.loads((writer.directory / "run-manifest.json").read_text())
     assert manifest["commit_sha"] == commit_sha
     assert manifest["provenance_consistent"] is True
+    assert manifest["exit_code"] == 0
+    pairing = json.loads((writer.directory / "pairing-metrics.json").read_text())
+    assert isinstance(pairing["last_seen_inputs"], list)
+    assert "('hyperliquid', 'funding_current')" not in json.dumps(pairing)
+    dedup = json.loads((writer.directory / "dedup-metrics.json").read_text())
+    assert set(dedup) >= {
+        "candidate_evaluation_attempt_count",
+        "candidate_record_inserted_count",
+        "candidate_disposition_candidate_count",
+        "candidate_disposition_rejected_count",
+        "candidate_duplicate_suppressed_count",
+        "matched_source_pair_count",
+    }
+    assert dedup["candidate_record_inserted_count"] == 1
+    assert dedup["candidate_disposition_candidate_count"] == 0
+    assert dedup["candidate_disposition_rejected_count"] == 1
+
+
+def test_artifact_serialization_failure_is_nonzero_and_writes_partial_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "durable-state"
+    monkeypatch.setenv("CRYPTTOOL_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(
+        "app.services.operations.shadow_artifacts.tempfile.gettempdir",
+        lambda: "/system-temporary-directory",
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    operational = PostgreSQLOperationalRepository(engine)
+    settings = shadow_settings()
+    commit_sha = "a" * 40
+    run_id = "artifact-failure-test"
+    ContinuousResearchPaperService(
+        repository=operational,
+        settings=settings,
+        run_id=run_id,
+        commit_sha=commit_sha,
+        config_sha256="b" * 64,
+        mode=OperationMode.OBSERVATION_ONLY,
+        local_smoke=True,
+        now=lambda: NOW,
+    )
+    source_config = tmp_path / "source-config.yaml"
+    source_config.write_text("mode: shadow\n", encoding="utf-8")
+    writer = ShadowRunArtifactWriter(
+        run_id=run_id,
+        commit_sha=commit_sha,
+        config_path=source_config,
+        settings=settings,
+        engine=engine,
+        repository=operational,
+        input_source=FundingCarryShadowInputSource(complete_repository()),
+    )
+    original_write_json = writer._write_json
+
+    def fail_pairing_metrics(name: str, value: object) -> None:
+        if name == "pairing-metrics.json":
+            raise TypeError("fixture serialization failure")
+        original_write_json(name, value)
+
+    monkeypatch.setattr(writer, "_write_json", fail_pairing_metrics)
+    with pytest.raises(ArtifactFinalizationError):
+        writer.finalize(exit_code=0)
+    manifest = json.loads((writer.directory / "run-manifest.json").read_text())
+    error = json.loads((writer.directory / "artifact-error.json").read_text())
+    failure = json.loads((writer.directory / "failure.json").read_text())
+    assert manifest["exit_code"] == error["actual_exit_code"] == failure["actual_exit_code"] == 1
+    assert manifest["process_status"] == "FAILED"
+    assert error["failed_artifact_filename"] == "pairing-metrics.json"
+    assert error["exception_type"] == "TypeError"
+    assert (writer.directory / "lifecycle.jsonl").is_file()
+    assert (writer.directory / "stdout.log").is_file()
+    assert (writer.directory / "stderr.log").is_file()
+    assert not (writer.directory / "COMPLETED").exists()
 
 
 def test_worktree_commit_resolution_and_unknown_fail_closed(tmp_path: Path) -> None:
