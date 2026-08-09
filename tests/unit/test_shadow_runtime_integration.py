@@ -762,6 +762,35 @@ def test_shadow_artifact_bundle_is_complete_and_records_zero_safety_counters(
     assert dedup["candidate_record_inserted_count"] == 1
     assert dedup["candidate_disposition_candidate_count"] == 0
     assert dedup["candidate_disposition_rejected_count"] == 1
+    exported = json.loads((writer.directory / "candidate-export.json").read_text())
+    rejected = exported[0]
+    assert rejected["disposition"] == "rejected"
+    assert rejected["rejection_reason"] == "edge_below_threshold"
+    assert rejected["evaluation_stage"] == "threshold_evaluated"
+    assert rejected["economics_calculated"] is True
+    assert all(
+        rejected[name] is not None
+        for name in (
+            "long_venue",
+            "short_venue",
+            "gross_funding_edge_per_hour",
+            "long_entry_vwap",
+            "short_entry_vwap",
+            "entry_fee_total",
+            "estimated_exit_fee",
+            "entry_slippage_total",
+            "estimated_exit_slippage",
+            "entry_basis_cost",
+            "expected_funding_income",
+            "expected_net_edge",
+            "round_trip_cost",
+            "break_even_holding_hours",
+        )
+    )
+    assert rejected["raw_funding_rates"]
+    assert rejected["canonical_funding_rates"]
+    assert rejected["funding_intervals"]
+    assert rejected["funding_rates_per_hour"]
 
 
 def test_artifact_serialization_failure_is_nonzero_and_writes_partial_evidence(

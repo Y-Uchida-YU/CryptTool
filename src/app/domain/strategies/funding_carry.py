@@ -21,6 +21,14 @@ class ShadowDisposition(StrEnum):
     REJECTED = "rejected"
 
 
+class FundingCarryEvaluationStage(StrEnum):
+    INPUT_VALIDATION = "input_validation"
+    FUNDING_NORMALIZATION = "funding_normalization"
+    BOOK_PRICING = "book_pricing"
+    ECONOMICS_CALCULATED = "economics_calculated"
+    THRESHOLD_EVALUATED = "threshold_evaluated"
+
+
 class FundingCarryRejectCode(StrEnum):
     MISSING_RECEIVE_LEG = "missing_receive_leg"
     MISSING_PAY_LEG = "missing_pay_leg"
@@ -108,6 +116,8 @@ class FundingCarryShadowConfig:
     maximum_orderbook_venue_skew_seconds: int = 5
     # Legacy configuration retained for compatibility; no 4-way skew is evaluated.
     maximum_venue_timestamp_skew_seconds: int = 5
+    economics_currency: str = "USD"
+    evaluation_horizon_seconds: int = 3600
     venue_taker_fee_rates: tuple[tuple[str, Decimal], ...] = (
         ("hyperliquid", Decimal("0.0006")),
         ("bitget", Decimal("0.0006")),
@@ -115,6 +125,53 @@ class FundingCarryShadowConfig:
 
     def fee_rate(self, venue: str) -> Decimal | None:
         return dict(self.venue_taker_fee_rates).get(venue)
+
+
+@dataclass(frozen=True)
+class FundingCarryEconomics:
+    """Immutable economics snapshot committed before the threshold decision.
+
+    Funding edge is a fraction/hour. Cashflow, fees, slippage, basis and
+    round-trip cost are quote-currency amounts. Expected net edge is the net
+    quote-currency income divided by notional over evaluation_horizon_seconds.
+    """
+
+    long_venue: str
+    short_venue: str
+    receive_leg: str
+    pay_leg: str
+    funding_timestamps: tuple[tuple[str, datetime], ...]
+    orderbook_timestamps: tuple[tuple[str, datetime], ...]
+    raw_funding_rates: tuple[tuple[str, Decimal], ...]
+    canonical_funding_rates: tuple[tuple[str, Decimal], ...]
+    funding_intervals: tuple[tuple[str, int], ...]
+    funding_rates_per_hour: tuple[tuple[str, Decimal], ...]
+    long_entry_vwap: Decimal
+    short_entry_vwap: Decimal
+    long_available_quantity: Decimal
+    short_available_quantity: Decimal
+    long_slippage_bps: Decimal
+    short_slippage_bps: Decimal
+    gross_funding_edge_per_hour: Decimal
+    gross_funding_cashflow_per_hour: Decimal
+    expected_funding_income: Decimal
+    long_entry_fee: Decimal
+    short_entry_fee: Decimal
+    entry_fee_total: Decimal
+    estimated_exit_fee: Decimal
+    long_entry_slippage: Decimal
+    short_entry_slippage: Decimal
+    entry_slippage_total: Decimal
+    estimated_exit_slippage: Decimal
+    basis_cost: Decimal
+    round_trip_cost: Decimal
+    expected_net_income: Decimal
+    expected_net_edge: Decimal
+    break_even_holding_hours: Decimal | None
+    economics_currency: str
+    notional: Decimal
+    evaluation_horizon_seconds: int
+    funding_income_horizon: str
 
 
 @dataclass(frozen=True)
@@ -170,6 +227,19 @@ class FundingCarryShadowCandidate:
     funding_freshness_pass: bool | None = None
     orderbook_freshness_pass: bool | None = None
     orderbook_synchronization_pass: bool | None = None
+    evaluation_stage: FundingCarryEvaluationStage = FundingCarryEvaluationStage.INPUT_VALIDATION
+    economics_calculated: bool = False
+    economics_currency: str = "USD"
+    economics_notional: Decimal | None = None
+    evaluation_horizon_seconds: int | None = None
+    funding_income_horizon: str | None = None
+    gross_funding_edge_per_hour: Decimal | None = None
+    gross_funding_cashflow_per_hour: Decimal | None = None
+    entry_fee_total: Decimal | None = None
+    entry_slippage_total: Decimal | None = None
+    round_trip_cost: Decimal | None = None
+    expected_net_income: Decimal | None = None
+    break_even_holding_hours: Decimal | None = None
 
 
 def _identity(strategy_id: str, instrument: str, source_event_ids: Iterable[str]) -> str:
@@ -270,8 +340,10 @@ class FundingCarryShadowEvaluator:
             )
         )
         candidate_id = _identity(FUNDING_CARRY_STRATEGY_ID, self.config.instrument, source_ids)
+        stage = FundingCarryEvaluationStage.INPUT_VALIDATION
         try:
             self._validate_inputs(funding, orderbooks, now)
+            stage = FundingCarryEvaluationStage.FUNDING_NORMALIZATION
             normalized = {item.venue: normalize_funding(item) for item in funding}
             books = {item.venue: item for item in orderbooks}
             ordered = sorted(normalized, key=lambda venue: normalized[venue].funding_rate_per_hour)
@@ -279,6 +351,7 @@ class FundingCarryShadowEvaluator:
             long_rate = normalized[long_venue]
             short_rate = normalized[short_venue]
             long_book, short_book = books[long_venue], books[short_venue]
+            stage = FundingCarryEvaluationStage.BOOK_PRICING
             long_vwap, long_qty, long_available, long_bps = _vwap(
                 long_book.asks, self.config.shadow_notional, buying=True
             )
@@ -290,53 +363,55 @@ class FundingCarryShadowEvaluator:
             if long_fee_rate is None or short_fee_rate is None:
                 raise ValueError(FundingCarryRejectCode.UNKNOWN_FEE)
             gross_edge = short_rate.funding_rate_per_hour - long_rate.funding_rate_per_hour
-            funding_income = gross_edge * self.config.shadow_notional
+            gross_cashflow_per_hour = gross_edge * self.config.shadow_notional
+            funding_income = (
+                gross_cashflow_per_hour
+                * Decimal(self.config.evaluation_horizon_seconds)
+                / Decimal(3600)
+            )
             long_fee = self.config.shadow_notional * long_fee_rate
             short_fee = self.config.shadow_notional * short_fee_rate
+            entry_fee_total = long_fee + short_fee
             exit_fee = long_fee + short_fee
             long_slippage = long_qty * (long_vwap - long_book.asks[0][0])
             short_slippage = short_qty * (short_book.bids[0][0] - short_vwap)
+            entry_slippage_total = long_slippage + short_slippage
             exit_slippage = long_slippage + short_slippage
             midpoint = (long_vwap + short_vwap) / Decimal(2)
             basis_cost = (long_vwap - short_vwap) / midpoint * self.config.shadow_notional
-            net_income = (
-                funding_income
-                - long_fee
-                - short_fee
-                - exit_fee
-                - long_slippage
-                - short_slippage
-                - exit_slippage
-                - basis_cost
+            round_trip_cost = (
+                entry_fee_total + exit_fee + entry_slippage_total + exit_slippage + basis_cost
             )
+            net_income = funding_income - round_trip_cost
             net_edge = net_income / self.config.shadow_notional
+            break_even = (
+                max(round_trip_cost, Decimal("0")) / gross_cashflow_per_hour
+                if gross_cashflow_per_hour > 0
+                else None
+            )
             if not all(
                 _finite(value)
                 for value in (
                     gross_edge,
+                    gross_cashflow_per_hour,
                     funding_income,
                     long_fee,
                     short_fee,
+                    entry_fee_total,
                     exit_fee,
                     long_slippage,
                     short_slippage,
+                    entry_slippage_total,
                     exit_slippage,
                     basis_cost,
+                    round_trip_cost,
+                    net_income,
                     net_edge,
+                    *(value for value in (break_even,) if value is not None),
                 )
             ):
                 raise ValueError(FundingCarryRejectCode.NON_FINITE_NUMERIC_VALUE)
-            if net_edge < self.config.minimum_net_edge:
-                raise ValueError(FundingCarryRejectCode.EDGE_BELOW_THRESHOLD)
-            return FundingCarryShadowCandidate(
-                candidate_id=candidate_id,
-                run_id=run_id,
-                strategy_id=FUNDING_CARRY_STRATEGY_ID,
-                instrument=self.config.instrument,
-                source_event_ids=tuple(sorted(source_ids)),
-                created_at=now,
-                code_commit_sha=code_commit_sha,
-                config_sha=config_sha,
+            economics = FundingCarryEconomics(
                 long_venue=long_venue,
                 short_venue=short_venue,
                 receive_leg=short_venue,
@@ -372,18 +447,44 @@ class FundingCarryShadowEvaluator:
                 short_available_quantity=short_available,
                 long_slippage_bps=long_bps,
                 short_slippage_bps=short_bps,
-                gross_funding_edge=gross_edge,
+                gross_funding_edge_per_hour=gross_edge,
+                gross_funding_cashflow_per_hour=gross_cashflow_per_hour,
                 expected_funding_income=funding_income,
                 long_entry_fee=long_fee,
                 short_entry_fee=short_fee,
+                entry_fee_total=entry_fee_total,
                 estimated_exit_fee=exit_fee,
                 long_entry_slippage=long_slippage,
                 short_entry_slippage=short_slippage,
+                entry_slippage_total=entry_slippage_total,
                 estimated_exit_slippage=exit_slippage,
-                entry_basis_cost=basis_cost,
+                basis_cost=basis_cost,
+                round_trip_cost=round_trip_cost,
+                expected_net_income=net_income,
                 expected_net_edge=net_edge,
-                disposition=ShadowDisposition.CANDIDATE,
-                rejection_reason=None,
+                break_even_holding_hours=break_even,
+                economics_currency=self.config.economics_currency,
+                notional=self.config.shadow_notional,
+                evaluation_horizon_seconds=self.config.evaluation_horizon_seconds,
+                funding_income_horizon="configured_evaluation_horizon",
+            )
+            stage = FundingCarryEvaluationStage.ECONOMICS_CALCULATED
+            disposition = ShadowDisposition.CANDIDATE
+            reason = None
+            if economics.expected_net_edge < self.config.minimum_net_edge:
+                disposition = ShadowDisposition.REJECTED
+                reason = FundingCarryRejectCode.EDGE_BELOW_THRESHOLD
+            stage = FundingCarryEvaluationStage.THRESHOLD_EVALUATED
+            return self._candidate_from_economics(
+                candidate_id=candidate_id,
+                run_id=run_id,
+                source_ids=source_ids,
+                now=now,
+                code_commit_sha=code_commit_sha,
+                config_sha=config_sha,
+                economics=economics,
+                disposition=disposition,
+                rejection_reason=reason,
             )
         except (ArithmeticError, InvalidOperation, ValueError) as exc:
             reason = (
@@ -391,44 +492,138 @@ class FundingCarryShadowEvaluator:
                 if exc.args and isinstance(exc.args[0], FundingCarryRejectCode)
                 else FundingCarryRejectCode.EDGE_CALCULATION_FAILURE
             )
-            return FundingCarryShadowCandidate(
+            return self._pre_economics_rejection(
                 candidate_id=candidate_id,
                 run_id=run_id,
-                strategy_id=FUNDING_CARRY_STRATEGY_ID,
-                instrument=self.config.instrument,
-                source_event_ids=tuple(sorted(source_ids)),
-                created_at=now,
+                source_ids=source_ids,
+                now=now,
                 code_commit_sha=code_commit_sha,
                 config_sha=config_sha,
-                long_venue=None,
-                short_venue=None,
-                receive_leg=None,
-                pay_leg=None,
-                funding_timestamps=(),
-                orderbook_timestamps=(),
-                raw_funding_rates=(),
-                canonical_funding_rates=(),
-                funding_intervals=(),
-                funding_rates_per_hour=(),
-                long_entry_vwap=None,
-                short_entry_vwap=None,
-                long_available_quantity=None,
-                short_available_quantity=None,
-                long_slippage_bps=None,
-                short_slippage_bps=None,
-                gross_funding_edge=None,
-                expected_funding_income=None,
-                long_entry_fee=None,
-                short_entry_fee=None,
-                estimated_exit_fee=None,
-                long_entry_slippage=None,
-                short_entry_slippage=None,
-                estimated_exit_slippage=None,
-                entry_basis_cost=None,
-                expected_net_edge=None,
-                disposition=ShadowDisposition.REJECTED,
+                stage=stage,
                 rejection_reason=reason,
             )
+
+    def _candidate_from_economics(
+        self,
+        *,
+        candidate_id: str,
+        run_id: str,
+        source_ids: tuple[str, ...],
+        now: datetime,
+        code_commit_sha: str,
+        config_sha: str,
+        economics: FundingCarryEconomics,
+        disposition: ShadowDisposition,
+        rejection_reason: FundingCarryRejectCode | None,
+    ) -> FundingCarryShadowCandidate:
+        return FundingCarryShadowCandidate(
+            candidate_id=candidate_id,
+            run_id=run_id,
+            strategy_id=FUNDING_CARRY_STRATEGY_ID,
+            instrument=self.config.instrument,
+            source_event_ids=tuple(sorted(source_ids)),
+            created_at=now,
+            code_commit_sha=code_commit_sha,
+            config_sha=config_sha,
+            long_venue=economics.long_venue,
+            short_venue=economics.short_venue,
+            receive_leg=economics.receive_leg,
+            pay_leg=economics.pay_leg,
+            funding_timestamps=economics.funding_timestamps,
+            orderbook_timestamps=economics.orderbook_timestamps,
+            raw_funding_rates=economics.raw_funding_rates,
+            canonical_funding_rates=economics.canonical_funding_rates,
+            funding_intervals=economics.funding_intervals,
+            funding_rates_per_hour=economics.funding_rates_per_hour,
+            long_entry_vwap=economics.long_entry_vwap,
+            short_entry_vwap=economics.short_entry_vwap,
+            long_available_quantity=economics.long_available_quantity,
+            short_available_quantity=economics.short_available_quantity,
+            long_slippage_bps=economics.long_slippage_bps,
+            short_slippage_bps=economics.short_slippage_bps,
+            gross_funding_edge=economics.gross_funding_edge_per_hour,
+            expected_funding_income=economics.expected_funding_income,
+            long_entry_fee=economics.long_entry_fee,
+            short_entry_fee=economics.short_entry_fee,
+            estimated_exit_fee=economics.estimated_exit_fee,
+            long_entry_slippage=economics.long_entry_slippage,
+            short_entry_slippage=economics.short_entry_slippage,
+            estimated_exit_slippage=economics.estimated_exit_slippage,
+            entry_basis_cost=economics.basis_cost,
+            expected_net_edge=economics.expected_net_edge,
+            disposition=disposition,
+            rejection_reason=rejection_reason,
+            evaluation_stage=FundingCarryEvaluationStage.THRESHOLD_EVALUATED,
+            economics_calculated=True,
+            economics_currency=economics.economics_currency,
+            economics_notional=economics.notional,
+            evaluation_horizon_seconds=economics.evaluation_horizon_seconds,
+            funding_income_horizon=economics.funding_income_horizon,
+            gross_funding_edge_per_hour=economics.gross_funding_edge_per_hour,
+            gross_funding_cashflow_per_hour=economics.gross_funding_cashflow_per_hour,
+            entry_fee_total=economics.entry_fee_total,
+            entry_slippage_total=economics.entry_slippage_total,
+            round_trip_cost=economics.round_trip_cost,
+            expected_net_income=economics.expected_net_income,
+            break_even_holding_hours=economics.break_even_holding_hours,
+        )
+
+    def _pre_economics_rejection(
+        self,
+        *,
+        candidate_id: str,
+        run_id: str,
+        source_ids: tuple[str, ...],
+        now: datetime,
+        code_commit_sha: str,
+        config_sha: str,
+        stage: FundingCarryEvaluationStage,
+        rejection_reason: FundingCarryRejectCode,
+    ) -> FundingCarryShadowCandidate:
+        return FundingCarryShadowCandidate(
+            candidate_id=candidate_id,
+            run_id=run_id,
+            strategy_id=FUNDING_CARRY_STRATEGY_ID,
+            instrument=self.config.instrument,
+            source_event_ids=tuple(sorted(source_ids)),
+            created_at=now,
+            code_commit_sha=code_commit_sha,
+            config_sha=config_sha,
+            long_venue=None,
+            short_venue=None,
+            receive_leg=None,
+            pay_leg=None,
+            funding_timestamps=(),
+            orderbook_timestamps=(),
+            raw_funding_rates=(),
+            canonical_funding_rates=(),
+            funding_intervals=(),
+            funding_rates_per_hour=(),
+            long_entry_vwap=None,
+            short_entry_vwap=None,
+            long_available_quantity=None,
+            short_available_quantity=None,
+            long_slippage_bps=None,
+            short_slippage_bps=None,
+            gross_funding_edge=None,
+            expected_funding_income=None,
+            long_entry_fee=None,
+            short_entry_fee=None,
+            estimated_exit_fee=None,
+            long_entry_slippage=None,
+            short_entry_slippage=None,
+            estimated_exit_slippage=None,
+            entry_basis_cost=None,
+            expected_net_edge=None,
+            disposition=ShadowDisposition.REJECTED,
+            rejection_reason=rejection_reason,
+            evaluation_stage=stage,
+            economics_calculated=False,
+            economics_currency=self.config.economics_currency,
+            economics_notional=self.config.shadow_notional,
+            evaluation_horizon_seconds=self.config.evaluation_horizon_seconds,
+            funding_income_horizon="configured_evaluation_horizon",
+        )
 
     def _validate_inputs(
         self,
