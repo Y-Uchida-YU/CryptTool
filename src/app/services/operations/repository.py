@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.domain.market_data.models import Side
 from app.domain.strategies.funding_carry import (
+    FundingCarryEvaluationStage,
     FundingCarryRejectCode,
     FundingCarryShadowCandidate,
     ShadowDisposition,
@@ -540,7 +541,7 @@ class PostgreSQLOperationalRepository:
         data = json.loads(row.payload_json)
 
         def decimal_or_none(name: str) -> Decimal | None:
-            value = data[name]
+            value = data.get(name)
             return Decimal(value) if value is not None else None
 
         return FundingCarryShadowCandidate(
@@ -625,6 +626,25 @@ class PostgreSQLOperationalRepository:
             funding_freshness_pass=data.get("funding_freshness_pass"),
             orderbook_freshness_pass=data.get("orderbook_freshness_pass"),
             orderbook_synchronization_pass=data.get("orderbook_synchronization_pass"),
+            evaluation_stage=FundingCarryEvaluationStage(
+                data.get("evaluation_stage", FundingCarryEvaluationStage.INPUT_VALIDATION)
+            ),
+            economics_calculated=bool(data.get("economics_calculated", False)),
+            economics_currency=str(data.get("economics_currency", "USD")),
+            economics_notional=decimal_or_none("economics_notional"),
+            evaluation_horizon_seconds=(
+                int(data["evaluation_horizon_seconds"])
+                if data.get("evaluation_horizon_seconds") is not None
+                else None
+            ),
+            funding_income_horizon=data.get("funding_income_horizon"),
+            gross_funding_edge_per_hour=decimal_or_none("gross_funding_edge_per_hour"),
+            gross_funding_cashflow_per_hour=decimal_or_none("gross_funding_cashflow_per_hour"),
+            entry_fee_total=decimal_or_none("entry_fee_total"),
+            entry_slippage_total=decimal_or_none("entry_slippage_total"),
+            round_trip_cost=decimal_or_none("round_trip_cost"),
+            expected_net_income=decimal_or_none("expected_net_income"),
+            break_even_holding_hours=decimal_or_none("break_even_holding_hours"),
         )
 
     @staticmethod

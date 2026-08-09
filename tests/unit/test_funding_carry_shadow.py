@@ -15,6 +15,7 @@ from app.domain.strategies.capabilities import (
     STRATEGY_CAPABILITY_REGISTRY,
 )
 from app.domain.strategies.funding_carry import (
+    FundingCarryEvaluationStage,
     FundingCarryRejectCode,
     FundingCarryShadowConfig,
     FundingCarryShadowEvaluator,
@@ -363,7 +364,115 @@ def test_unknown_fee_is_not_treated_as_zero() -> None:
 
 def test_edge_below_threshold_is_rejected() -> None:
     config = replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("1"))
-    assert evaluate(config=config).rejection_reason is FundingCarryRejectCode.EDGE_BELOW_THRESHOLD
+    result = evaluate(config=config)
+    assert result.disposition is ShadowDisposition.REJECTED
+    assert result.rejection_reason is FundingCarryRejectCode.EDGE_BELOW_THRESHOLD
+    assert result.evaluation_stage is FundingCarryEvaluationStage.THRESHOLD_EVALUATED
+    assert result.economics_calculated
+    assert (result.long_venue, result.short_venue) == ("bitget", "hyperliquid")
+    assert result.raw_funding_rates and result.canonical_funding_rates
+    assert result.funding_intervals and result.funding_rates_per_hour
+    assert result.long_entry_vwap is not None and result.short_entry_vwap is not None
+    assert result.entry_fee_total is not None and result.estimated_exit_fee is not None
+    assert result.entry_slippage_total is not None
+    assert result.estimated_exit_slippage is not None
+    assert result.entry_basis_cost is not None
+    assert result.gross_funding_edge_per_hour is not None
+    assert result.expected_net_edge is not None
+
+
+def test_pre_economics_rejection_may_have_null_economics() -> None:
+    result = evaluate(fundings=())
+    assert result.disposition is ShadowDisposition.REJECTED
+    assert result.evaluation_stage is FundingCarryEvaluationStage.INPUT_VALIDATION
+    assert not result.economics_calculated
+    assert result.expected_net_edge is None
+    assert result.round_trip_cost is None
+
+
+def test_post_economics_rejection_contract_requires_complete_economics() -> None:
+    result = evaluate(config=replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("1")))
+    required = (
+        result.gross_funding_edge_per_hour,
+        result.gross_funding_cashflow_per_hour,
+        result.long_entry_vwap,
+        result.short_entry_vwap,
+        result.entry_fee_total,
+        result.estimated_exit_fee,
+        result.entry_slippage_total,
+        result.estimated_exit_slippage,
+        result.entry_basis_cost,
+        result.expected_funding_income,
+        result.expected_net_income,
+        result.expected_net_edge,
+        result.round_trip_cost,
+        result.break_even_holding_hours,
+    )
+    assert result.economics_calculated
+    assert all(value is not None for value in required)
+
+
+def test_threshold_disposition_does_not_change_candidate_identity() -> None:
+    accepted = evaluate(config=replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("-1")))
+    rejected = evaluate(config=replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("1")))
+    assert accepted.disposition is ShadowDisposition.CANDIDATE
+    assert rejected.disposition is ShadowDisposition.REJECTED
+    assert accepted.candidate_id == rejected.candidate_id
+
+
+def test_economics_units_and_dimensional_consistency() -> None:
+    result = evaluate(config=replace(FundingCarryShadowConfig(), minimum_net_edge=Decimal("1")))
+    assert result.economics_currency == "USD"
+    assert result.economics_notional == Decimal("10")
+    assert result.evaluation_horizon_seconds == 3600
+    assert result.funding_income_horizon == "configured_evaluation_horizon"
+    assert result.expected_funding_income == (
+        result.gross_funding_cashflow_per_hour * Decimal(result.evaluation_horizon_seconds) / 3600
+    )
+    assert result.round_trip_cost == (
+        result.entry_fee_total
+        + result.estimated_exit_fee
+        + result.entry_slippage_total
+        + result.estimated_exit_slippage
+        + result.entry_basis_cost
+    )
+    assert result.expected_net_income == result.expected_funding_income - result.round_trip_cost
+    assert result.expected_net_edge == result.expected_net_income / result.economics_notional
+
+
+def test_break_even_holding_hours_is_deterministic() -> None:
+    first = evaluate()
+    second = evaluate()
+    assert first.break_even_holding_hours == second.break_even_holding_hours
+    assert first.break_even_holding_hours == (
+        first.round_trip_cost / first.gross_funding_cashflow_per_hour
+    )
+
+
+def test_break_even_is_null_when_gross_funding_cashflow_is_not_positive() -> None:
+    result = evaluate(hyperliquid_rate="0.001", bitget_rate="0.001")
+    assert result.gross_funding_cashflow_per_hour == 0
+    assert result.break_even_holding_hours is None
+
+
+def test_favorable_basis_reduces_cost_and_break_even_floors_at_zero() -> None:
+    result = evaluate(
+        books=(
+            book(
+                "hyperliquid",
+                bids=((Decimal("110"), Decimal("1")),),
+                asks=((Decimal("111"), Decimal("1")),),
+            ),
+            book(
+                "bitget",
+                bids=((Decimal("89"), Decimal("1")),),
+                asks=((Decimal("90"), Decimal("1")),),
+            ),
+        )
+    )
+    assert result.entry_basis_cost is not None and result.entry_basis_cost < 0
+    assert result.round_trip_cost is not None and result.round_trip_cost < 0
+    assert result.break_even_holding_hours == 0
 
 
 def test_experimental_evidence_creates_candidate_only_and_never_eligible() -> None:
