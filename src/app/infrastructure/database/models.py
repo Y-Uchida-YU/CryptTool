@@ -134,6 +134,16 @@ class RawMarketPayloadRow(Base):
 
 class ExperimentalMarketEventRow(Base):
     __tablename__ = "experimental_market_events"
+    __table_args__ = (
+        Index(
+            "ix_experimental_shadow_incremental",
+            "venue",
+            "canonical_instrument_id",
+            "event_type",
+            "available_at",
+            "event_id",
+        ),
+    )
     event_id: Mapped[str] = mapped_column(String(160), primary_key=True)
     venue: Mapped[str] = mapped_column(String(40), index=True)
     canonical_instrument_id: Mapped[str] = mapped_column(String(100), index=True)
@@ -156,6 +166,40 @@ class ExperimentalMarketEventRow(Base):
     availability_provenance: Mapped[str] = mapped_column(String(50), default="unknown")
     exchange_server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     timeframe: Mapped[str | None] = mapped_column(String(20))
+
+
+class ShadowInputCursorRow(Base):
+    __tablename__ = "shadow_input_cursors"
+    __table_args__ = (UniqueConstraint("run_id", "venue", "instrument", "event_stream"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    venue: Mapped[str] = mapped_column(String(40))
+    instrument: Mapped[str] = mapped_column(String(100))
+    event_stream: Mapped[str] = mapped_column(String(80))
+    last_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_event_id: Mapped[str | None] = mapped_column(String(160))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ShadowInputCheckpointRow(Base):
+    __tablename__ = "shadow_input_checkpoints"
+    run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    state_json: Mapped[str] = mapped_column(Text)
+    events_fetched_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    events_processed_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    events_failed_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    batch_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_batch_size: Mapped[int] = mapped_column(Integer, default=0)
+    scan_duration_ms: Mapped[Decimal] = mapped_column(Numeric(30, 6), default=0)
+    processing_duration_ms: Mapped[Decimal] = mapped_column(Numeric(30, 6), default=0)
+    latest_db_event_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    shadow_input_lag_seconds: Mapped[Decimal | None] = mapped_column(Numeric(30, 6))
+    shadow_input_backlog_estimate: Mapped[int] = mapped_column(BigInteger, default=0)
+    strategy_observation_first_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    strategy_observation_last_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_cursor_advanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runtime_status: Mapped[str] = mapped_column(String(40), default="healthy")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class MarketDataQuarantineRow(Base):

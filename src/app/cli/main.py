@@ -59,6 +59,7 @@ from app.services.ingestion.quality import validate_ohlcv
 from app.services.live_trading.preflight import LivePreflightContext, evaluate_live_preflight
 from app.services.operations.collector_health import summarize_collector_health
 from app.services.operations.models import (
+    CollectorHealthStatus,
     CollectorHealthSummary,
     LiveSignalInput,
     OperationalRunStatus,
@@ -2948,6 +2949,12 @@ def start_paper_operation(
         shadow_input_source = (
             FundingCarryShadowInputSource(
                 research_repository,
+                run_id=resolved_run_id,
+                batch_size=settings.continuous_paper.shadow_event_batch_size,
+                maximum_shadow_input_stall_seconds=(
+                    settings.continuous_paper.maximum_shadow_input_stall_seconds
+                ),
+                initial_available_at=started_at,
                 maximum_age_seconds=settings.continuous_paper.source_event_max_age_seconds,
                 collector_poll_interval_seconds=collection.poll_interval_seconds,
                 funding_max_age_seconds=settings.continuous_paper.funding_max_age_seconds,
@@ -3194,7 +3201,7 @@ def start_paper_operation(
                 "sequence_gap",
                 "stale_stream",
             }
-            return summarize_collector_health(
+            summary = summarize_collector_health(
                 failures=research_repository.collection_failures(),
                 checkpoints=research_repository.list_checkpoints(),
                 now=datetime.now(UTC),
@@ -3206,6 +3213,13 @@ def start_paper_operation(
                 ),
                 experimental_market_event_count=(research_repository.experimental_event_count()),
             )
+            if shadow_input_source is not None and shadow_input_source.runtime_status == "degraded":
+                return replace(
+                    summary,
+                    status=CollectorHealthStatus.DEGRADED,
+                    reasons=(*summary.reasons, "shadow_input_cursor_stalled"),
+                )
+            return summary
 
         operational_repository = PostgreSQLOperationalRepository(engine)
         service = ContinuousResearchPaperService(

@@ -175,6 +175,8 @@ class ContinuousPaperSettings(BaseModel):
     minimum_data_quality: float = Field(0.90, ge=0.8, le=1)
     shadow_notional: Decimal = Field(Decimal("10"), gt=0, le=Decimal("100"))
     minimum_shadow_net_edge: Decimal = Decimal("0")
+    shadow_event_batch_size: int = Field(1000, ge=100, le=10000)
+    maximum_shadow_input_stall_seconds: int | None = Field(None, ge=1, le=3600)
     shadow_venue_taker_fee_rates: dict[str, Decimal] = Field(
         default_factory=lambda: {
             "hyperliquid": Decimal("0.0006"),

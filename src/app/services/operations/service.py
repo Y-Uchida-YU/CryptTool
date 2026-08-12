@@ -1401,7 +1401,11 @@ class ContinuousResearchPaperService:
                 None if healthy else f"collector_health_{self._collector_health.status.value}",
             )
             run = self._require_run()
-        if not run.collector_healthy:
+        shadow_input_recovery = (
+            self.settings.continuous_paper.mode == "shadow"
+            and "shadow_input_cursor_stalled" in self._collector_health.reasons
+        )
+        if not run.collector_healthy and not shadow_input_recovery:
             await self.notifier.send("Collector stopped", self.run_id, "error")
             return
         if self.market_event_action is not None:

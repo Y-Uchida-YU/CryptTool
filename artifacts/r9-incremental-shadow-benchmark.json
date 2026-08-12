@@ -1,0 +1,42 @@
+{
+  "batch_count": 886,
+  "benchmark_index_transaction_rolled_back": true,
+  "batch_latency_ms": {
+    "maximum": 557.7257080003619,
+    "p50": 331.2590420246124,
+    "p95": 408.89966259710485
+  },
+  "batch_size": 1000,
+  "events_processed": 226708,
+  "final_cursor_available_at": "2026-08-10 04:56:12.293892+00:00",
+  "final_cursor_event_id": "bitget-4f9921153036a2da0cdfdcfc9657fd4833fd011190057a534d1b25bada165a34",
+  "final_lag_seconds": 0,
+  "milestones": {
+    "100000": {
+      "cursor_available_at": "2026-08-10 04:56:10.322356+00:00",
+      "cursor_event_id": "hyperliquid-89655fc1923500754c94ea7d26a481a65195d5d8742751f368e94dc780230cec",
+      "wall_seconds": 135.9933314579539
+    },
+    "200000": {
+      "cursor_available_at": "2026-08-10 04:56:10.322356+00:00",
+      "cursor_event_id": "hyperliquid-89655fc1923500754c94ea7d26a481a65195d5d8742751f368e94dc780230cec",
+      "wall_seconds": 275.75165187497623
+    },
+    "44247": {
+      "cursor_available_at": "2026-08-10 04:56:10.322356+00:00",
+      "cursor_event_id": "hyperliquid-89655fc1923500754c94ea7d26a481a65195d5d8742751f368e94dc780230cec",
+      "wall_seconds": 52.950359208043665
+    }
+  },
+  "old_full_scan": {
+    "events_observed_before_stall": 44247,
+    "one_thousand_event_sample_seconds": 0.581,
+    "run_wall_seconds": 21603.631181,
+    "tail_reached": false,
+    "ten_thousand_event_sample_seconds": 2.679
+  },
+  "peak_python_memory_bytes": 23461419,
+  "read_only": true,
+  "source": "saved 6-hour experimental_market_events database",
+  "wall_seconds": 311.054443791043
+}
