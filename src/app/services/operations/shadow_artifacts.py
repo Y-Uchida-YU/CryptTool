@@ -205,6 +205,7 @@ class ShadowRunArtifactWriter:
                 "legacy_mixed_timestamp_skew": False,
             },
             "timing_observations": timing_observations,
+            "shadow_input": self.input_source.runtime_metrics(now=completed_at),
         }
         disposition_candidate_count = sum(
             item.disposition.value == "candidate" for item in candidates
@@ -267,6 +268,7 @@ class ShadowRunArtifactWriter:
         collector_metrics = {
             "source_table": "experimental_market_events",
             "source_event_count": self.input_source.source_event_count,
+            **self.input_source.runtime_metrics(now=completed_at),
         }
         summary = {
             "collector_metrics": collector_metrics,

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -26,20 +28,60 @@ from app.infrastructure.database.models import (
     RawMarketPayloadRow,
     ResearchArtifactRow,
     ResearchRunRow,
+    ShadowInputCheckpointRow,
+    ShadowInputCursorRow,
 )
 from app.services.research.models import (
     AvailabilityProvenance,
     CollectionCheckpoint,
     CollectionFailureEvent,
     DataSnapshotManifest,
+    ExperimentalEventCursor,
     FeeTierKind,
     FrozenHypothesis,
     InstrumentRuleSnapshot,
     RawMarketEvent,
     ResearchRunIdentity,
     RuleVerificationStatus,
+    ShadowInputCheckpoint,
     TimestampSemantic,
 )
+
+
+def _shadow_event_stream(event_type: str) -> str:
+    return "funding_current" if event_type == "funding_current" else "orderbook_snapshot"
+
+
+def _cursor_predicates(
+    cursors: tuple[ExperimentalEventCursor, ...],
+    *,
+    venues: tuple[str, ...],
+) -> tuple[Any, ...]:
+    cursor_map = {(item.venue, item.event_stream): item for item in cursors}
+    predicates: list[Any] = []
+    for venue in venues:
+        for stream, event_types in (
+            ("funding_current", ("funding_current",)),
+            ("orderbook_snapshot", ("orderbook_snapshot", "orderbook_delta")),
+        ):
+            cursor = cursor_map.get((venue, stream))
+            ordering: Any = True
+            if cursor is not None and cursor.last_available_at is not None:
+                ordering = or_(
+                    ExperimentalMarketEventRow.available_at > cursor.last_available_at,
+                    and_(
+                        ExperimentalMarketEventRow.available_at == cursor.last_available_at,
+                        ExperimentalMarketEventRow.event_id > (cursor.last_event_id or ""),
+                    ),
+                )
+            predicates.append(
+                and_(
+                    ExperimentalMarketEventRow.venue == venue,
+                    ExperimentalMarketEventRow.event_type.in_(event_types),
+                    ordering,
+                )
+            )
+    return tuple(predicates)
 
 
 class ResearchRepository(Protocol):
@@ -56,6 +98,47 @@ class ResearchRepository(Protocol):
     def experimental_event_count(self) -> int: ...
 
     def list_experimental_events(self) -> tuple[RawMarketEvent, ...]: ...
+
+    def list_experimental_events_after(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+        limit: int,
+    ) -> tuple[RawMarketEvent, ...]: ...
+
+    def experimental_event_backlog(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+    ) -> tuple[int, datetime | None]: ...
+
+    def shadow_input_checkpoint(
+        self, run_id: str
+    ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]: ...
+
+    def commit_shadow_input_checkpoint(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        checkpoint: ShadowInputCheckpoint,
+    ) -> None: ...
+
+    def list_experimental_event_ids_between(
+        self,
+        *,
+        venue: str,
+        instrument: str,
+        event_type: str,
+        after_available_at: datetime,
+        after_event_id: str,
+        through_available_at: datetime,
+        through_event_id: str,
+    ) -> tuple[str, ...]: ...
 
     def save_raw_payload(
         self,
@@ -167,6 +250,8 @@ class InMemoryResearchRepository:
         self.snapshots: dict[str, tuple[datetime, int, str]] = {}
         self.snapshot_manifests: dict[str, DataSnapshotManifest] = {}
         self.experimental_events: dict[str, tuple[RawMarketEvent, str]] = {}
+        self.shadow_cursors: dict[tuple[str, str, str, str], ExperimentalEventCursor] = {}
+        self.shadow_checkpoints: dict[str, ShadowInputCheckpoint] = {}
         self.raw_payloads: dict[str, tuple[str, str, str, str, datetime]] = {}
         self.checkpoints: dict[tuple[str, str, str], CollectionCheckpoint] = {}
         self.rules: dict[str, InstrumentRuleSnapshot] = {}
@@ -199,6 +284,119 @@ class InMemoryResearchRepository:
 
     def list_experimental_events(self) -> tuple[RawMarketEvent, ...]:
         return tuple(item[0] for item in self.experimental_events.values())
+
+    def list_experimental_events_after(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+        limit: int,
+    ) -> tuple[RawMarketEvent, ...]:
+        cursor_map = {(item.venue, item.event_stream): item for item in cursors}
+
+        def unseen(event: RawMarketEvent) -> bool:
+            stream = _shadow_event_stream(event.event_type)
+            cursor = cursor_map.get((event.venue, stream))
+            return (
+                cursor is None
+                or cursor.last_available_at is None
+                or (event.available_at, event.event_id)
+                > (cursor.last_available_at, cursor.last_event_id or "")
+            )
+
+        return tuple(
+            sorted(
+                (
+                    item[0]
+                    for item in self.experimental_events.values()
+                    if item[0].venue in venues
+                    and item[0].canonical_instrument_id == instrument
+                    and item[0].event_type in event_types
+                    and unseen(item[0])
+                ),
+                key=lambda item: (item.available_at, item.event_id),
+            )[:limit]
+        )
+
+    def experimental_event_backlog(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+    ) -> tuple[int, datetime | None]:
+        events = self.list_experimental_events_after(
+            cursors,
+            venues=venues,
+            instrument=instrument,
+            event_types=event_types,
+            limit=len(self.experimental_events) + 1,
+        )
+        latest = max(
+            (
+                item[0].available_at
+                for item in self.experimental_events.values()
+                if item[0].venue in venues
+                and item[0].canonical_instrument_id == instrument
+                and item[0].event_type in event_types
+            ),
+            default=None,
+        )
+        return len(events), latest
+
+    def shadow_input_checkpoint(
+        self, run_id: str
+    ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]:
+        cursors = tuple(
+            sorted(
+                (item for key, item in self.shadow_cursors.items() if key[0] == run_id),
+                key=lambda item: (item.venue, item.event_stream),
+            )
+        )
+        return cursors, self.shadow_checkpoints.get(run_id)
+
+    def commit_shadow_input_checkpoint(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        checkpoint: ShadowInputCheckpoint,
+    ) -> None:
+        for item in cursors:
+            self.shadow_cursors[(item.run_id, item.venue, item.instrument, item.event_stream)] = (
+                item
+            )
+        self.shadow_checkpoints[checkpoint.run_id] = checkpoint
+
+    def list_experimental_event_ids_between(
+        self,
+        *,
+        venue: str,
+        instrument: str,
+        event_type: str,
+        after_available_at: datetime,
+        after_event_id: str,
+        through_available_at: datetime,
+        through_event_id: str,
+    ) -> tuple[str, ...]:
+        return tuple(
+            event.event_id
+            for event in sorted(
+                (
+                    item[0]
+                    for item in self.experimental_events.values()
+                    if item[0].venue == venue
+                    and item[0].canonical_instrument_id == instrument
+                    and item[0].event_type == event_type
+                    and (item[0].available_at, item[0].event_id)
+                    > (after_available_at, after_event_id)
+                    and (item[0].available_at, item[0].event_id)
+                    <= (through_available_at, through_event_id)
+                ),
+                key=lambda item: (item.available_at, item.event_id),
+            )
+        )
 
     def save_raw_payload(
         self,
@@ -496,6 +694,261 @@ class PostgreSQLResearchRepository:
         with Session(self.engine) as session:
             rows = session.scalars(select(ExperimentalMarketEventRow)).all()
             return tuple(self._experimental_event(row) for row in rows)
+
+    def list_experimental_events_after(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+        limit: int,
+    ) -> tuple[RawMarketEvent, ...]:
+        cursor_map = {(item.venue, item.event_stream): item for item in cursors}
+        stream_queries = tuple(
+            (venue, stream, stream_event_types)
+            for venue in venues
+            for stream, stream_event_types in (
+                ("funding_current", ("funding_current",)),
+                ("orderbook_snapshot", ("orderbook_snapshot", "orderbook_delta")),
+            )
+        )
+        per_stream_limit = max(1, math.ceil(limit / len(stream_queries)))
+        collected: list[RawMarketEvent] = []
+        with Session(self.engine) as session:
+            for venue, stream, stream_event_types in stream_queries:
+                cursor = cursor_map.get((venue, stream))
+                ordering: Any = True
+                if cursor is not None and cursor.last_available_at is not None:
+                    ordering = or_(
+                        ExperimentalMarketEventRow.available_at > cursor.last_available_at,
+                        and_(
+                            ExperimentalMarketEventRow.available_at == cursor.last_available_at,
+                            ExperimentalMarketEventRow.event_id > (cursor.last_event_id or ""),
+                        ),
+                    )
+                statement = (
+                    select(ExperimentalMarketEventRow)
+                    .where(
+                        ExperimentalMarketEventRow.venue == venue,
+                        ExperimentalMarketEventRow.canonical_instrument_id == instrument,
+                        ExperimentalMarketEventRow.event_type.in_(stream_event_types),
+                        ExperimentalMarketEventRow.event_type.in_(event_types),
+                        ordering,
+                    )
+                    .order_by(
+                        ExperimentalMarketEventRow.available_at,
+                        ExperimentalMarketEventRow.event_id,
+                    )
+                    .limit(per_stream_limit)
+                )
+                collected.extend(
+                    self._experimental_event(row) for row in session.scalars(statement).all()
+                )
+        return tuple(sorted(collected, key=lambda item: (item.available_at, item.event_id))[:limit])
+
+    def experimental_event_backlog(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+    ) -> tuple[int, datetime | None]:
+        predicates = _cursor_predicates(cursors, venues=venues)
+        with Session(self.engine) as session:
+            backlog_lower_bound = sum(
+                session.scalar(
+                    select(ExperimentalMarketEventRow.event_id)
+                    .where(
+                        ExperimentalMarketEventRow.canonical_instrument_id == instrument,
+                        ExperimentalMarketEventRow.event_type.in_(event_types),
+                        predicate,
+                    )
+                    .limit(1)
+                )
+                is not None
+                for predicate in predicates
+            )
+            latest_by_venue = tuple(
+                session.scalar(
+                    select(ExperimentalMarketEventRow.available_at)
+                    .where(
+                        ExperimentalMarketEventRow.canonical_instrument_id == instrument,
+                        ExperimentalMarketEventRow.venue == venue,
+                        ExperimentalMarketEventRow.event_type.in_(event_types),
+                    )
+                    .order_by(ExperimentalMarketEventRow.available_at.desc())
+                    .limit(1)
+                )
+                for venue in venues
+            )
+        latest = max((item for item in latest_by_venue if item is not None), default=None)
+        return backlog_lower_bound, self._aware(latest) if latest is not None else None
+
+    def shadow_input_checkpoint(
+        self, run_id: str
+    ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]:
+        with Session(self.engine) as session:
+            cursor_rows = session.scalars(
+                select(ShadowInputCursorRow)
+                .where(ShadowInputCursorRow.run_id == run_id)
+                .order_by(ShadowInputCursorRow.venue, ShadowInputCursorRow.event_stream)
+            ).all()
+            row = session.get(ShadowInputCheckpointRow, run_id)
+            cursors = tuple(
+                ExperimentalEventCursor(
+                    run_id=item.run_id,
+                    venue=item.venue,
+                    instrument=item.instrument,
+                    event_stream=item.event_stream,
+                    last_available_at=(
+                        self._aware(item.last_available_at) if item.last_available_at else None
+                    ),
+                    last_event_id=item.last_event_id,
+                    updated_at=self._aware(item.updated_at),
+                )
+                for item in cursor_rows
+            )
+            if row is None:
+                return cursors, None
+            return cursors, ShadowInputCheckpoint(
+                run_id=row.run_id,
+                state_json=row.state_json,
+                events_fetched_total=row.events_fetched_total,
+                events_processed_total=row.events_processed_total,
+                events_failed_total=row.events_failed_total,
+                batch_count=row.batch_count,
+                last_batch_size=row.last_batch_size,
+                scan_duration_ms=Decimal(row.scan_duration_ms),
+                processing_duration_ms=Decimal(row.processing_duration_ms),
+                latest_db_event_available_at=(
+                    self._aware(row.latest_db_event_available_at)
+                    if row.latest_db_event_available_at
+                    else None
+                ),
+                shadow_input_lag_seconds=(
+                    Decimal(row.shadow_input_lag_seconds)
+                    if row.shadow_input_lag_seconds is not None
+                    else None
+                ),
+                shadow_input_backlog_estimate=row.shadow_input_backlog_estimate,
+                strategy_observation_first_at=(
+                    self._aware(row.strategy_observation_first_at)
+                    if row.strategy_observation_first_at
+                    else None
+                ),
+                strategy_observation_last_at=(
+                    self._aware(row.strategy_observation_last_at)
+                    if row.strategy_observation_last_at
+                    else None
+                ),
+                last_cursor_advanced_at=(
+                    self._aware(row.last_cursor_advanced_at)
+                    if row.last_cursor_advanced_at
+                    else None
+                ),
+                runtime_status=row.runtime_status,
+                updated_at=self._aware(row.updated_at),
+            )
+
+    def commit_shadow_input_checkpoint(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        checkpoint: ShadowInputCheckpoint,
+    ) -> None:
+        with Session(self.engine) as session:
+            for cursor in cursors:
+                row = session.scalar(
+                    select(ShadowInputCursorRow).where(
+                        ShadowInputCursorRow.run_id == cursor.run_id,
+                        ShadowInputCursorRow.venue == cursor.venue,
+                        ShadowInputCursorRow.instrument == cursor.instrument,
+                        ShadowInputCursorRow.event_stream == cursor.event_stream,
+                    )
+                )
+                if row is None:
+                    row = ShadowInputCursorRow(
+                        run_id=cursor.run_id,
+                        venue=cursor.venue,
+                        instrument=cursor.instrument,
+                        event_stream=cursor.event_stream,
+                        last_available_at=cursor.last_available_at,
+                        last_event_id=cursor.last_event_id,
+                        updated_at=cursor.updated_at,
+                    )
+                    session.add(row)
+                else:
+                    row.last_available_at = cursor.last_available_at
+                    row.last_event_id = cursor.last_event_id
+                    row.updated_at = cursor.updated_at
+            saved = session.get(ShadowInputCheckpointRow, checkpoint.run_id)
+            values = {
+                "state_json": checkpoint.state_json,
+                "events_fetched_total": checkpoint.events_fetched_total,
+                "events_processed_total": checkpoint.events_processed_total,
+                "events_failed_total": checkpoint.events_failed_total,
+                "batch_count": checkpoint.batch_count,
+                "last_batch_size": checkpoint.last_batch_size,
+                "scan_duration_ms": checkpoint.scan_duration_ms,
+                "processing_duration_ms": checkpoint.processing_duration_ms,
+                "latest_db_event_available_at": checkpoint.latest_db_event_available_at,
+                "shadow_input_lag_seconds": checkpoint.shadow_input_lag_seconds,
+                "shadow_input_backlog_estimate": checkpoint.shadow_input_backlog_estimate,
+                "strategy_observation_first_at": checkpoint.strategy_observation_first_at,
+                "strategy_observation_last_at": checkpoint.strategy_observation_last_at,
+                "last_cursor_advanced_at": checkpoint.last_cursor_advanced_at,
+                "runtime_status": checkpoint.runtime_status,
+                "updated_at": checkpoint.updated_at,
+            }
+            if saved is None:
+                session.add(ShadowInputCheckpointRow(run_id=checkpoint.run_id, **values))
+            else:
+                for name, value in values.items():
+                    setattr(saved, name, value)
+            session.commit()
+
+    def list_experimental_event_ids_between(
+        self,
+        *,
+        venue: str,
+        instrument: str,
+        event_type: str,
+        after_available_at: datetime,
+        after_event_id: str,
+        through_available_at: datetime,
+        through_event_id: str,
+    ) -> tuple[str, ...]:
+        after = or_(
+            ExperimentalMarketEventRow.available_at > after_available_at,
+            and_(
+                ExperimentalMarketEventRow.available_at == after_available_at,
+                ExperimentalMarketEventRow.event_id > after_event_id,
+            ),
+        )
+        through = or_(
+            ExperimentalMarketEventRow.available_at < through_available_at,
+            and_(
+                ExperimentalMarketEventRow.available_at == through_available_at,
+                ExperimentalMarketEventRow.event_id <= through_event_id,
+            ),
+        )
+        statement = (
+            select(ExperimentalMarketEventRow.event_id)
+            .where(
+                ExperimentalMarketEventRow.venue == venue,
+                ExperimentalMarketEventRow.canonical_instrument_id == instrument,
+                ExperimentalMarketEventRow.event_type == event_type,
+                after,
+                through,
+            )
+            .order_by(
+                ExperimentalMarketEventRow.available_at,
+                ExperimentalMarketEventRow.event_id,
+            )
+        )
+        with Session(self.engine) as session:
+            return tuple(session.scalars(statement).all())
 
     def save_raw_payload(
         self,

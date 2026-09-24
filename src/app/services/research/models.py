@@ -156,6 +156,65 @@ class RawMarketEvent:
 
 
 @dataclass(frozen=True)
+class ExperimentalEventCursor:
+    run_id: str
+    venue: str
+    instrument: str
+    event_stream: str
+    last_available_at: datetime | None
+    last_event_id: str | None
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if not all((self.run_id, self.venue, self.instrument, self.event_stream)):
+            raise ValueError("experimental event cursor identity is required")
+        object.__setattr__(self, "updated_at", utc(self.updated_at, "updated_at"))
+        if self.last_available_at is not None:
+            object.__setattr__(
+                self,
+                "last_available_at",
+                utc(self.last_available_at, "last_available_at"),
+            )
+        if (self.last_available_at is None) != (self.last_event_id is None):
+            raise ValueError("cursor ordering fields must be both present or both absent")
+
+
+@dataclass(frozen=True)
+class ShadowInputCheckpoint:
+    run_id: str
+    state_json: str
+    events_fetched_total: int
+    events_processed_total: int
+    events_failed_total: int
+    batch_count: int
+    last_batch_size: int
+    scan_duration_ms: Decimal
+    processing_duration_ms: Decimal
+    latest_db_event_available_at: datetime | None
+    shadow_input_lag_seconds: Decimal | None
+    shadow_input_backlog_estimate: int
+    strategy_observation_first_at: datetime | None
+    strategy_observation_last_at: datetime | None
+    last_cursor_advanced_at: datetime | None
+    runtime_status: str
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            raise ValueError("shadow input checkpoint run identity is required")
+        for name in (
+            "latest_db_event_available_at",
+            "strategy_observation_first_at",
+            "strategy_observation_last_at",
+            "last_cursor_advanced_at",
+            "updated_at",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, utc(value, name))
+
+
+@dataclass(frozen=True)
 class QuarantinedMarketEvent:
     event: RawMarketEvent
     reason: str

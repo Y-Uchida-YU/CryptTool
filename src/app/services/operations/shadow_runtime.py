@@ -4,21 +4,65 @@ import hashlib
 import json
 import math
 import zlib
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from time import perf_counter
 from typing import Protocol
 
 from app.domain.strategies.funding_carry import FundingCarryRejectCode
 from app.services.operations.models import LiveSignalInput
-from app.services.research.models import RawMarketEvent
+from app.services.research.models import (
+    ExperimentalEventCursor,
+    RawMarketEvent,
+    ShadowInputCheckpoint,
+)
 
 SHADOW_INPUT_REFRESH_INTERVAL_SECONDS = 10
 
 
 class ExperimentalEventRepository(Protocol):
-    def list_experimental_events(self) -> tuple[RawMarketEvent, ...]: ...
+    def list_experimental_events_after(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+        limit: int,
+    ) -> tuple[RawMarketEvent, ...]: ...
+
+    def experimental_event_backlog(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        *,
+        venues: tuple[str, ...],
+        instrument: str,
+        event_types: tuple[str, ...],
+    ) -> tuple[int, datetime | None]: ...
+
+    def shadow_input_checkpoint(
+        self, run_id: str
+    ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]: ...
+
+    def commit_shadow_input_checkpoint(
+        self,
+        cursors: tuple[ExperimentalEventCursor, ...],
+        checkpoint: ShadowInputCheckpoint,
+    ) -> None: ...
+
+    def list_experimental_event_ids_between(
+        self,
+        *,
+        venue: str,
+        instrument: str,
+        event_type: str,
+        after_available_at: datetime,
+        after_event_id: str,
+        through_available_at: datetime,
+        through_event_id: str,
+    ) -> tuple[str, ...]: ...
 
 
 class BookStateStatus(StrEnum):
@@ -104,6 +148,7 @@ class _BookState:
     bids: dict[Decimal, Decimal]
     asks: dict[Decimal, Decimal]
     source_snapshot_event_id: str
+    source_snapshot_available_at: datetime
     applied_delta_event_ids: list[str]
     last_sequence: int | None
     exchange_timestamp: datetime
@@ -178,6 +223,104 @@ class CanonicalOrderBookStateBuilder:
         self.metrics = OrderBookStateMetrics()
         self.last_invalid_reason: dict[tuple[str, str], FundingCarryRejectCode] = {}
 
+    def export_state(self) -> dict[str, object]:
+        """Return the durable replay boundary for memory-only book state."""
+        return {
+            "states": [
+                {
+                    **{
+                        key: value
+                        for key, value in asdict(state).items()
+                        if key not in {"bids", "asks", "status", "applied_delta_event_ids"}
+                    },
+                    "bids": list(state.bids.items()),
+                    "asks": list(state.asks.items()),
+                    "status": state.status.value,
+                }
+                for _, state in sorted(self._states.items())
+            ],
+            "metrics": asdict(self.metrics),
+            "last_invalid_reason": [
+                {"venue": venue, "instrument": instrument, "reason": reason.value}
+                for (venue, instrument), reason in sorted(self.last_invalid_reason.items())
+            ],
+        }
+
+    def restore_state(self, value: dict[str, object]) -> None:
+        """Restore a snapshot-backed book before consuming post-cursor deltas."""
+        self._states.clear()
+        states = value.get("states", [])
+        if isinstance(states, list):
+            for item in states:
+                if not isinstance(item, dict):
+                    continue
+                state = _BookState(
+                    venue=str(item["venue"]),
+                    instrument=str(item["instrument"]),
+                    channel=str(item["channel"]),
+                    connection_epoch=int(item["connection_epoch"]),
+                    bids={Decimal(str(price)): Decimal(str(size)) for price, size in item["bids"]},
+                    asks={Decimal(str(price)): Decimal(str(size)) for price, size in item["asks"]},
+                    source_snapshot_event_id=str(item["source_snapshot_event_id"]),
+                    source_snapshot_available_at=datetime.fromisoformat(
+                        str(item["source_snapshot_available_at"])
+                    ),
+                    applied_delta_event_ids=[],
+                    last_sequence=(
+                        int(item["last_sequence"])
+                        if item.get("last_sequence") is not None
+                        else None
+                    ),
+                    exchange_timestamp=datetime.fromisoformat(str(item["exchange_timestamp"])),
+                    received_at=datetime.fromisoformat(str(item["received_at"])),
+                    available_at=datetime.fromisoformat(str(item["available_at"])),
+                    normalizer_version=str(item["normalizer_version"]),
+                    status=BookStateStatus(str(item["status"])),
+                )
+                self._states[(state.venue, state.instrument, state.channel)] = state
+        metrics = value.get("metrics", {})
+        if isinstance(metrics, dict):
+            self.metrics = OrderBookStateMetrics(
+                **{
+                    name: int(metrics.get(name, 0))
+                    for name in OrderBookStateMetrics.__annotations__
+                }
+            )
+        self.last_invalid_reason.clear()
+        reasons = value.get("last_invalid_reason", [])
+        if isinstance(reasons, list):
+            for item in reasons:
+                if isinstance(item, dict):
+                    self.last_invalid_reason[(str(item["venue"]), str(item["instrument"]))] = (
+                        FundingCarryRejectCode(str(item["reason"]))
+                    )
+
+    def recovery_boundaries(
+        self,
+    ) -> tuple[tuple[str, str, str, datetime, str], ...]:
+        return tuple(
+            (
+                state.venue,
+                state.instrument,
+                state.channel,
+                state.source_snapshot_available_at,
+                state.source_snapshot_event_id,
+            )
+            for _, state in sorted(self._states.items())
+        )
+
+    def restore_applied_delta_event_ids(
+        self,
+        *,
+        venue: str,
+        instrument: str,
+        channel: str,
+        event_ids: tuple[str, ...],
+    ) -> None:
+        state = self._states.get((venue, instrument, channel))
+        if state is not None:
+            state.applied_delta_event_ids = list(event_ids)
+
     def apply(self, event: RawMarketEvent, *, now: datetime) -> CanonicalOrderBookSnapshot | None:
         if event.venue not in {"hyperliquid", "bitget"} or event.canonical_instrument_id != "BTC":
             return None
@@ -239,6 +382,7 @@ class CanonicalOrderBookStateBuilder:
                     bids=bids,
                     asks=asks,
                     source_snapshot_event_id=event.event_id,
+                    source_snapshot_available_at=event.available_at,
                     applied_delta_event_ids=[],
                     last_sequence=event.sequence,
                     exchange_timestamp=event.exchange_timestamp or event.available_at,
@@ -456,6 +600,10 @@ class FundingCarryShadowInputSource:
         self,
         repository: ExperimentalEventRepository,
         *,
+        run_id: str = "shadow-input-test",
+        batch_size: int = 1000,
+        maximum_shadow_input_stall_seconds: int | None = None,
+        initial_available_at: datetime | None = None,
         maximum_age_seconds: int = 30,
         maximum_future_seconds: int = 1,
         collector_poll_interval_seconds: float = 30,
@@ -466,6 +614,15 @@ class FundingCarryShadowInputSource:
         maximum_venue_timestamp_skew_seconds: int | None = None,
     ) -> None:
         self.repository = repository
+        self.run_id = run_id
+        self.batch_size = batch_size
+        if batch_size <= 0:
+            raise ValueError("shadow input batch size must be positive")
+        self.maximum_shadow_input_stall_seconds = (
+            maximum_shadow_input_stall_seconds
+            if maximum_shadow_input_stall_seconds is not None
+            else math.ceil(2 * (collector_poll_interval_seconds + input_refresh_interval_seconds))
+        )
         self.maximum_orderbook_age = timedelta(seconds=maximum_age_seconds)
         self.maximum_future = timedelta(seconds=maximum_future_seconds)
         derived_funding_age = math.ceil(
@@ -492,7 +649,6 @@ class FundingCarryShadowInputSource:
             maximum_age_seconds=maximum_age_seconds,
             maximum_future_seconds=maximum_future_seconds,
         )
-        self._processed_book_events: set[str] = set()
         self._latest_funding: dict[str, LiveSignalInput] = {}
         self._latest_books: dict[str, LiveSignalInput] = {}
         self._last_pair_identity: str | None = None
@@ -500,52 +656,122 @@ class FundingCarryShadowInputSource:
         self.last_seen: dict[tuple[str, str], datetime] = {}
         self.last_valid: dict[tuple[str, str], datetime] = {}
         self._funding_invalid_reason: dict[str, FundingCarryRejectCode] = {}
+        self._events_fetched_total = 0
+        self._events_processed_total = 0
+        self._events_failed_total = 0
+        self._batch_count = 0
+        self._last_batch_size = 0
+        self._scan_duration_ms = Decimal("0")
+        self._processing_duration_ms = Decimal("0")
+        self._latest_db_event_available_at: datetime | None = None
+        self._lag_seconds: Decimal | None = None
+        self._backlog_estimate = 0
+        self._strategy_observation_first_at: datetime | None = None
+        self._strategy_observation_last_at: datetime | None = None
+        self._last_cursor_advanced_at: datetime | None = None
+        self.runtime_status = "healthy"
+        self._processed_by_stream: dict[tuple[str, str], int] = {}
+        saved_cursors, checkpoint = repository.shadow_input_checkpoint(run_id)
+        cursor_map = {(item.venue, item.event_stream): item for item in saved_cursors}
+        initialized_at = datetime.now(UTC)
+        self._started_at = initialized_at
+        self._cursors = tuple(
+            cursor_map.get((venue, stream))
+            or ExperimentalEventCursor(
+                run_id=run_id,
+                venue=venue,
+                instrument="BTC",
+                event_stream=stream,
+                last_available_at=initial_available_at,
+                last_event_id="" if initial_available_at is not None else None,
+                updated_at=initialized_at,
+            )
+            for venue in ("hyperliquid", "bitget")
+            for stream in ("funding_current", "orderbook_snapshot")
+        )
+        if checkpoint is not None:
+            self._restore_checkpoint(checkpoint)
+            self._restore_delta_identities()
+        elif self._last_cursor_advanced_at is None:
+            self._last_cursor_advanced_at = initialized_at
 
     def read(self, *, now: datetime) -> ShadowInputBatch:
-        events = tuple(
-            event
-            for event in self.repository.list_experimental_events()
-            if event.venue in {"hyperliquid", "bitget"}
-            and event.canonical_instrument_id == "BTC"
-            and event.event_type in {"funding_current", "orderbook_snapshot", "orderbook_delta"}
+        before = self._state_json()
+        cursors_before = self._cursors
+        scan_started = perf_counter()
+        events = self.repository.list_experimental_events_after(
+            self._cursors,
+            venues=("hyperliquid", "bitget"),
+            instrument="BTC",
+            event_types=("funding_current", "orderbook_snapshot", "orderbook_delta"),
+            limit=self.batch_size,
         )
-        self.source_event_count = len(events)
-        for event in sorted(events, key=lambda item: (item.available_at, item.event_id)):
-            capability = (
-                "funding_current" if event.event_type == "funding_current" else "orderbook_snapshot"
+        self._scan_duration_ms = Decimal(str((perf_counter() - scan_started) * 1000))
+        self._events_fetched_total += len(events)
+        self._last_batch_size = len(events)
+        self._batch_count += 1
+        processing_started = perf_counter()
+        try:
+            for event in events:
+                self._process_event(event, now=now)
+            self._processing_duration_ms = Decimal(
+                str((perf_counter() - processing_started) * 1000)
             )
-            self.last_seen[(event.venue, capability)] = event.available_at
-            if event.event_type == "funding_current":
-                parsed = self._funding(event, now=now)
-                if parsed is not None and (
-                    event.venue not in self._latest_funding
-                    or parsed.available_at >= self._latest_funding[event.venue].available_at
-                ):
-                    self._latest_funding[event.venue] = parsed
-                    self.last_valid[(event.venue, capability)] = event.available_at
-                elif parsed is None:
-                    self._latest_funding.pop(event.venue, None)
-                continue
-            if event.event_id in self._processed_book_events:
-                continue
-            self._processed_book_events.add(event.event_id)
-            snapshot = self.book_builder.apply(event, now=now)
-            if snapshot is not None:
-                parsed_book = self._book(snapshot, now=now)
-                self._latest_books[event.venue] = parsed_book
-                self.last_valid[(event.venue, capability)] = event.available_at
-            elif event.venue == "hyperliquid" or self.book_builder.last_invalid_reason.get(
-                (event.venue, "BTC")
-            ) in {
-                FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_NOT_INITIALIZED,
-                FundingCarryRejectCode.BITGET_ORDERBOOK_SEQUENCE_GAP,
-                FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_INVALID,
-                FundingCarryRejectCode.STALE_DATA,
-                FundingCarryRejectCode.FUTURE_TIMESTAMP,
-                FundingCarryRejectCode.CROSSED_ORDERBOOK,
-            }:
-                self._latest_books.pop(event.venue, None)
+            self._events_processed_total += len(events)
+            self.source_event_count = self._events_processed_total
+            if events:
+                self._advance_cursors(events, now=now)
+                self._last_cursor_advanced_at = now
+            result = self._evaluate(now=now)
+            if result.matched:
+                self._strategy_observation_first_at = self._strategy_observation_first_at or now
+                self._strategy_observation_last_at = now
+            self._refresh_lag(now=now)
+            self.repository.commit_shadow_input_checkpoint(self._cursors, self._checkpoint(now=now))
+            return result
+        except Exception:
+            self._events_failed_total += len(events)
+            self._cursors = cursors_before
+            self._restore_state_json(before)
+            self._refresh_lag(now=now)
+            self.repository.commit_shadow_input_checkpoint(self._cursors, self._checkpoint(now=now))
+            raise
 
+    def _process_event(self, event: RawMarketEvent, *, now: datetime) -> None:
+        capability = (
+            "funding_current" if event.event_type == "funding_current" else "orderbook_snapshot"
+        )
+        key = (event.venue, capability)
+        self._processed_by_stream[key] = self._processed_by_stream.get(key, 0) + 1
+        self.last_seen[key] = event.available_at
+        if event.event_type == "funding_current":
+            parsed = self._funding(event, now=now)
+            if parsed is not None and (
+                event.venue not in self._latest_funding
+                or parsed.available_at >= self._latest_funding[event.venue].available_at
+            ):
+                self._latest_funding[event.venue] = parsed
+                self.last_valid[key] = event.available_at
+            elif parsed is None:
+                self._latest_funding.pop(event.venue, None)
+            return
+        snapshot = self.book_builder.apply(event, now=now)
+        if snapshot is not None:
+            self._latest_books[event.venue] = self._book(snapshot, now=now)
+            self.last_valid[key] = event.available_at
+        elif event.venue == "hyperliquid" or self.book_builder.last_invalid_reason.get(
+            (event.venue, "BTC")
+        ) in {
+            FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_NOT_INITIALIZED,
+            FundingCarryRejectCode.BITGET_ORDERBOOK_SEQUENCE_GAP,
+            FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_INVALID,
+            FundingCarryRejectCode.STALE_DATA,
+            FundingCarryRejectCode.FUTURE_TIMESTAMP,
+            FundingCarryRejectCode.CROSSED_ORDERBOOK,
+        }:
+            self._latest_books.pop(event.venue, None)
+
+    def _evaluate(self, *, now: datetime) -> ShadowInputBatch:
         missing = self._missing()
         if missing is not None:
             return ShadowInputBatch(self._available_events(), False, None, False, missing)
@@ -598,6 +824,301 @@ class FundingCarryShadowInputSource:
             duplicate,
             timing=timing,
         )
+
+    @staticmethod
+    def _stream(event_type: str) -> str:
+        return "funding_current" if event_type == "funding_current" else "orderbook_snapshot"
+
+    def _advance_cursors(self, events: tuple[RawMarketEvent, ...], *, now: datetime) -> None:
+        latest: dict[tuple[str, str], RawMarketEvent] = {}
+        for event in events:
+            key = (event.venue, self._stream(event.event_type))
+            previous = latest.get(key)
+            if previous is None or (event.available_at, event.event_id) > (
+                previous.available_at,
+                previous.event_id,
+            ):
+                latest[key] = event
+        self._cursors = tuple(
+            replace(
+                cursor,
+                last_available_at=latest[(cursor.venue, cursor.event_stream)].available_at,
+                last_event_id=latest[(cursor.venue, cursor.event_stream)].event_id,
+                updated_at=now,
+            )
+            if (cursor.venue, cursor.event_stream) in latest
+            else cursor
+            for cursor in self._cursors
+        )
+
+    def _refresh_lag(self, *, now: datetime) -> None:
+        backlog, latest = self.repository.experimental_event_backlog(
+            self._cursors,
+            venues=("hyperliquid", "bitget"),
+            instrument="BTC",
+            event_types=("funding_current", "orderbook_snapshot", "orderbook_delta"),
+        )
+        self._backlog_estimate = backlog
+        self._latest_db_event_available_at = latest
+        cursor_times = [
+            item.last_available_at for item in self._cursors if item.last_available_at is not None
+        ]
+        newest_cursor = max(cursor_times) if cursor_times else None
+        self._lag_seconds = (
+            Decimal(str(max(0.0, (latest - newest_cursor).total_seconds())))
+            if latest is not None and newest_cursor is not None
+            else None
+        )
+        stalled_for = max(
+            (max(0.0, (now - cursor.updated_at).total_seconds()) for cursor in self._cursors),
+            default=0,
+        )
+        self.runtime_status = (
+            "degraded"
+            if backlog > 0 and stalled_for > self.maximum_shadow_input_stall_seconds
+            else "healthy"
+        )
+
+    @staticmethod
+    def _input_payload(item: LiveSignalInput) -> dict[str, object]:
+        payload = asdict(item)
+        if item.event_type == "canonical_orderbook_snapshot":
+            payload["applied_source_event_ids"] = ()
+        return payload
+
+    @staticmethod
+    def _restore_input(value: dict[str, object]) -> LiveSignalInput:
+        date_fields = {
+            "available_at",
+            "next_funding_at",
+            "source_timestamp",
+            "received_at",
+            "exchange_timestamp",
+        }
+        decimal_fields = {
+            "bid",
+            "ask",
+            "bid_size",
+            "ask_size",
+            "funding_rate",
+            "freshness_age_seconds",
+        }
+        restored = dict(value)
+        for name in date_fields:
+            if restored.get(name) is not None:
+                restored[name] = datetime.fromisoformat(str(restored[name]))
+        for name in decimal_fields:
+            if restored.get(name) is not None:
+                restored[name] = Decimal(str(restored[name]))
+        for name in ("bids", "asks"):
+            levels = restored.get(name, [])
+            if not isinstance(levels, list):
+                levels = []
+            restored[name] = tuple(
+                (Decimal(str(price)), Decimal(str(quantity))) for price, quantity in levels
+            )
+        applied_ids = restored.get("applied_source_event_ids", [])
+        if not isinstance(applied_ids, list):
+            applied_ids = []
+        restored["applied_source_event_ids"] = tuple(str(item) for item in applied_ids)
+        return LiveSignalInput(**restored)  # type: ignore[arg-type]
+
+    def _state_json(self) -> str:
+        payload = {
+            "latest_funding": {
+                venue: self._input_payload(item) for venue, item in self._latest_funding.items()
+            },
+            "latest_books": {
+                venue: self._input_payload(item) for venue, item in self._latest_books.items()
+            },
+            "last_pair_identity": self._last_pair_identity,
+            "last_seen": [
+                [venue, capability, timestamp]
+                for (venue, capability), timestamp in sorted(self.last_seen.items())
+            ],
+            "last_valid": [
+                [venue, capability, timestamp]
+                for (venue, capability), timestamp in sorted(self.last_valid.items())
+            ],
+            "funding_invalid_reason": {
+                venue: reason.value for venue, reason in self._funding_invalid_reason.items()
+            },
+            "processed_by_stream": [
+                [venue, capability, count]
+                for (venue, capability), count in sorted(self._processed_by_stream.items())
+            ],
+            "book_builder": self.book_builder.export_state(),
+        }
+        return json.dumps(payload, default=str, sort_keys=True, separators=(",", ":"))
+
+    def _restore_state_json(self, value: str) -> None:
+        payload = json.loads(value) if value else {}
+        self._latest_funding = {
+            venue: self._restore_input(item)
+            for venue, item in payload.get("latest_funding", {}).items()
+        }
+        self._latest_books = {
+            venue: self._restore_input(item)
+            for venue, item in payload.get("latest_books", {}).items()
+        }
+        self._last_pair_identity = payload.get("last_pair_identity")
+        self.last_seen = {
+            (str(venue), str(capability)): datetime.fromisoformat(str(timestamp))
+            for venue, capability, timestamp in payload.get("last_seen", [])
+        }
+        self.last_valid = {
+            (str(venue), str(capability)): datetime.fromisoformat(str(timestamp))
+            for venue, capability, timestamp in payload.get("last_valid", [])
+        }
+        self._funding_invalid_reason = {
+            venue: FundingCarryRejectCode(reason)
+            for venue, reason in payload.get("funding_invalid_reason", {}).items()
+        }
+        self._processed_by_stream = {
+            (str(venue), str(capability)): int(count)
+            for venue, capability, count in payload.get("processed_by_stream", [])
+        }
+        builder = payload.get("book_builder", {})
+        if isinstance(builder, dict):
+            self.book_builder.restore_state(builder)
+
+    def _restore_checkpoint(self, checkpoint: ShadowInputCheckpoint) -> None:
+        self._restore_state_json(checkpoint.state_json)
+        self._events_fetched_total = checkpoint.events_fetched_total
+        self._events_processed_total = checkpoint.events_processed_total
+        self._events_failed_total = checkpoint.events_failed_total
+        self._batch_count = checkpoint.batch_count
+        self._last_batch_size = checkpoint.last_batch_size
+        self._scan_duration_ms = checkpoint.scan_duration_ms
+        self._processing_duration_ms = checkpoint.processing_duration_ms
+        self._latest_db_event_available_at = checkpoint.latest_db_event_available_at
+        self._lag_seconds = checkpoint.shadow_input_lag_seconds
+        self._backlog_estimate = checkpoint.shadow_input_backlog_estimate
+        self._strategy_observation_first_at = checkpoint.strategy_observation_first_at
+        self._strategy_observation_last_at = checkpoint.strategy_observation_last_at
+        self._last_cursor_advanced_at = checkpoint.last_cursor_advanced_at
+        self.runtime_status = checkpoint.runtime_status
+        self.source_event_count = self._events_processed_total
+
+    def _restore_delta_identities(self) -> None:
+        cursor_map = {(item.venue, item.event_stream): item for item in self._cursors}
+        for (
+            venue,
+            instrument,
+            channel,
+            snapshot_at,
+            snapshot_id,
+        ) in self.book_builder.recovery_boundaries():
+            cursor = cursor_map.get((venue, "orderbook_snapshot"))
+            if (
+                venue != "bitget"
+                or cursor is None
+                or cursor.last_available_at is None
+                or cursor.last_event_id is None
+            ):
+                continue
+            identities = self.repository.list_experimental_event_ids_between(
+                venue=venue,
+                instrument=instrument,
+                event_type="orderbook_delta",
+                after_available_at=snapshot_at,
+                after_event_id=snapshot_id,
+                through_available_at=cursor.last_available_at,
+                through_event_id=cursor.last_event_id,
+            )
+            self.book_builder.restore_applied_delta_event_ids(
+                venue=venue,
+                instrument=instrument,
+                channel=channel,
+                event_ids=identities,
+            )
+            book = self._latest_books.get(venue)
+            if book is not None:
+                self._latest_books[venue] = replace(
+                    book,
+                    applied_source_event_ids=identities,
+                )
+
+    def _checkpoint(self, *, now: datetime) -> ShadowInputCheckpoint:
+        return ShadowInputCheckpoint(
+            run_id=self.run_id,
+            state_json=self._state_json(),
+            events_fetched_total=self._events_fetched_total,
+            events_processed_total=self._events_processed_total,
+            events_failed_total=self._events_failed_total,
+            batch_count=self._batch_count,
+            last_batch_size=self._last_batch_size,
+            scan_duration_ms=self._scan_duration_ms,
+            processing_duration_ms=self._processing_duration_ms,
+            latest_db_event_available_at=self._latest_db_event_available_at,
+            shadow_input_lag_seconds=self._lag_seconds,
+            shadow_input_backlog_estimate=self._backlog_estimate,
+            strategy_observation_first_at=self._strategy_observation_first_at,
+            strategy_observation_last_at=self._strategy_observation_last_at,
+            last_cursor_advanced_at=self._last_cursor_advanced_at,
+            runtime_status=self.runtime_status,
+            updated_at=now,
+        )
+
+    def runtime_metrics(self, *, now: datetime | None = None) -> dict[str, object]:
+        evaluated_at = now or datetime.now(UTC)
+        coverage = Decimal("0")
+        if self._strategy_observation_first_at and self._strategy_observation_last_at:
+            coverage = Decimal(
+                str(
+                    max(
+                        0.0,
+                        (
+                            self._strategy_observation_last_at - self._strategy_observation_first_at
+                        ).total_seconds(),
+                    )
+                )
+            )
+        run_age = max(
+            0.0,
+            (evaluated_at - self._started_at).total_seconds(),
+        )
+        return {
+            "shadow_input_events_fetched_total": self._events_fetched_total,
+            "shadow_input_events_processed_total": self._events_processed_total,
+            "shadow_input_events_failed_total": self._events_failed_total,
+            "shadow_input_batch_count": self._batch_count,
+            "shadow_input_batch_size": self._last_batch_size,
+            "shadow_input_configured_batch_size": self.batch_size,
+            "shadow_input_scan_duration_ms": self._scan_duration_ms,
+            "shadow_input_processing_duration_ms": self._processing_duration_ms,
+            "shadow_input_cursor_available_at": max(
+                (item.last_available_at for item in self._cursors if item.last_available_at),
+                default=None,
+            ),
+            "latest_db_event_available_at": self._latest_db_event_available_at,
+            "shadow_input_lag_seconds": self._lag_seconds,
+            "shadow_input_backlog_estimate": self._backlog_estimate,
+            "collector_uptime_seconds": Decimal(str(run_age)),
+            "strategy_observation_first_at": self._strategy_observation_first_at,
+            "strategy_observation_last_at": self._strategy_observation_last_at,
+            "strategy_observation_coverage_seconds": coverage,
+            "strategy_observation_coverage_ratio": (
+                coverage / Decimal(str(run_age)) if run_age > 0 else Decimal("0")
+            ),
+            "maximum_shadow_input_stall_seconds": self.maximum_shadow_input_stall_seconds,
+            "shadow_runtime_status": self.runtime_status,
+            "processed_by_venue_capability": [
+                {"venue": venue, "capability": capability, "count": count}
+                for (venue, capability), count in sorted(self._processed_by_stream.items())
+            ],
+            "cursor_positions": [
+                {
+                    "venue": cursor.venue,
+                    "instrument": cursor.instrument,
+                    "event_stream": cursor.event_stream,
+                    "last_available_at": cursor.last_available_at,
+                    "last_event_id": cursor.last_event_id,
+                    "updated_at": cursor.updated_at,
+                }
+                for cursor in self._cursors
+            ],
+        }
 
     def _funding(self, event: RawMarketEvent, *, now: datetime) -> LiveSignalInput | None:
         timestamp = event.exchange_timestamp or event.available_at
