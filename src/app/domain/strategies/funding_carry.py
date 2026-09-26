@@ -10,8 +10,9 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 
 from app.domain.strategies.capabilities import (
-    FUNDING_CARRY_REQUIRED_INSTRUMENTS,
+    FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT,
     FUNDING_CARRY_REQUIRED_VENUES,
+    FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS,
     FUNDING_CARRY_STRATEGY_ID,
 )
 
@@ -105,7 +106,7 @@ class CanonicalFunding:
 
 @dataclass(frozen=True)
 class FundingCarryShadowConfig:
-    instrument: str = "BTC"
+    instrument: str = FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT
     venues: tuple[str, str] = ("hyperliquid", "bitget")
     shadow_notional: Decimal = Decimal("10")
     minimum_net_edge: Decimal = Decimal("0")
@@ -631,7 +632,7 @@ class FundingCarryShadowEvaluator:
         orderbooks: tuple[OrderBookObservation, ...],
         now: datetime,
     ) -> None:
-        if self.config.instrument not in FUNDING_CARRY_REQUIRED_INSTRUMENTS:
+        if self.config.instrument not in FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS:
             raise ValueError(FundingCarryRejectCode.INSTRUMENT_MISMATCH)
         if tuple(self.config.venues) != FUNDING_CARRY_REQUIRED_VENUES:
             raise ValueError(FundingCarryRejectCode.VENUE_MISMATCH)

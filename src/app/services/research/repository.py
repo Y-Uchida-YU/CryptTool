@@ -119,7 +119,7 @@ class ResearchRepository(Protocol):
     ) -> tuple[int, datetime | None]: ...
 
     def shadow_input_checkpoint(
-        self, run_id: str
+        self, run_id: str, *, instrument: str = "BTC"
     ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]: ...
 
     def commit_shadow_input_checkpoint(
@@ -251,7 +251,7 @@ class InMemoryResearchRepository:
         self.snapshot_manifests: dict[str, DataSnapshotManifest] = {}
         self.experimental_events: dict[str, tuple[RawMarketEvent, str]] = {}
         self.shadow_cursors: dict[tuple[str, str, str, str], ExperimentalEventCursor] = {}
-        self.shadow_checkpoints: dict[str, ShadowInputCheckpoint] = {}
+        self.shadow_checkpoints: dict[tuple[str, str], ShadowInputCheckpoint] = {}
         self.raw_payloads: dict[str, tuple[str, str, str, str, datetime]] = {}
         self.checkpoints: dict[tuple[str, str, str], CollectionCheckpoint] = {}
         self.rules: dict[str, InstrumentRuleSnapshot] = {}
@@ -348,15 +348,19 @@ class InMemoryResearchRepository:
         return len(events), latest
 
     def shadow_input_checkpoint(
-        self, run_id: str
+        self, run_id: str, *, instrument: str = "BTC"
     ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]:
         cursors = tuple(
             sorted(
-                (item for key, item in self.shadow_cursors.items() if key[0] == run_id),
+                (
+                    item
+                    for key, item in self.shadow_cursors.items()
+                    if key[0] == run_id and item.instrument == instrument
+                ),
                 key=lambda item: (item.venue, item.event_stream),
             )
         )
-        return cursors, self.shadow_checkpoints.get(run_id)
+        return cursors, self.shadow_checkpoints.get((run_id, instrument))
 
     def commit_shadow_input_checkpoint(
         self,
@@ -367,7 +371,7 @@ class InMemoryResearchRepository:
             self.shadow_cursors[(item.run_id, item.venue, item.instrument, item.event_stream)] = (
                 item
             )
-        self.shadow_checkpoints[checkpoint.run_id] = checkpoint
+        self.shadow_checkpoints[(checkpoint.run_id, checkpoint.instrument)] = checkpoint
 
     def list_experimental_event_ids_between(
         self,
@@ -712,7 +716,10 @@ class PostgreSQLResearchRepository:
                 ("funding_current", ("funding_current",)),
                 ("orderbook_snapshot", ("orderbook_snapshot", "orderbook_delta")),
             )
+            if set(stream_event_types).intersection(event_types)
         )
+        if not stream_queries:
+            return ()
         per_stream_limit = max(1, math.ceil(limit / len(stream_queries)))
         collected: list[RawMarketEvent] = []
         with Session(self.engine) as session:
@@ -757,17 +764,17 @@ class PostgreSQLResearchRepository:
     ) -> tuple[int, datetime | None]:
         predicates = _cursor_predicates(cursors, venues=venues)
         with Session(self.engine) as session:
-            backlog_lower_bound = sum(
+            backlog_event_count = sum(
                 session.scalar(
-                    select(ExperimentalMarketEventRow.event_id)
+                    select(func.count())
+                    .select_from(ExperimentalMarketEventRow)
                     .where(
                         ExperimentalMarketEventRow.canonical_instrument_id == instrument,
                         ExperimentalMarketEventRow.event_type.in_(event_types),
                         predicate,
                     )
-                    .limit(1)
                 )
-                is not None
+                or 0
                 for predicate in predicates
             )
             latest_by_venue = tuple(
@@ -784,18 +791,21 @@ class PostgreSQLResearchRepository:
                 for venue in venues
             )
         latest = max((item for item in latest_by_venue if item is not None), default=None)
-        return backlog_lower_bound, self._aware(latest) if latest is not None else None
+        return backlog_event_count, self._aware(latest) if latest is not None else None
 
     def shadow_input_checkpoint(
-        self, run_id: str
+        self, run_id: str, *, instrument: str = "BTC"
     ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]:
         with Session(self.engine) as session:
             cursor_rows = session.scalars(
                 select(ShadowInputCursorRow)
-                .where(ShadowInputCursorRow.run_id == run_id)
+                .where(
+                    ShadowInputCursorRow.run_id == run_id,
+                    ShadowInputCursorRow.instrument == instrument,
+                )
                 .order_by(ShadowInputCursorRow.venue, ShadowInputCursorRow.event_stream)
             ).all()
-            row = session.get(ShadowInputCheckpointRow, run_id)
+            row = session.get(ShadowInputCheckpointRow, (run_id, instrument))
             cursors = tuple(
                 ExperimentalEventCursor(
                     run_id=item.run_id,
@@ -814,6 +824,7 @@ class PostgreSQLResearchRepository:
                 return cursors, None
             return cursors, ShadowInputCheckpoint(
                 run_id=row.run_id,
+                instrument=row.instrument,
                 state_json=row.state_json,
                 events_fetched_total=row.events_fetched_total,
                 events_processed_total=row.events_processed_total,
@@ -882,7 +893,9 @@ class PostgreSQLResearchRepository:
                     row.last_available_at = cursor.last_available_at
                     row.last_event_id = cursor.last_event_id
                     row.updated_at = cursor.updated_at
-            saved = session.get(ShadowInputCheckpointRow, checkpoint.run_id)
+            saved = session.get(
+                ShadowInputCheckpointRow, (checkpoint.run_id, checkpoint.instrument)
+            )
             values = {
                 "state_json": checkpoint.state_json,
                 "events_fetched_total": checkpoint.events_fetched_total,
@@ -902,7 +915,11 @@ class PostgreSQLResearchRepository:
                 "updated_at": checkpoint.updated_at,
             }
             if saved is None:
-                session.add(ShadowInputCheckpointRow(run_id=checkpoint.run_id, **values))
+                session.add(
+                    ShadowInputCheckpointRow(
+                        run_id=checkpoint.run_id, instrument=checkpoint.instrument, **values
+                    )
+                )
             else:
                 for name, value in values.items():
                     setattr(saved, name, value)

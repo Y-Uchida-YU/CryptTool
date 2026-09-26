@@ -198,6 +198,7 @@ class ShadowInputCheckpoint:
     last_cursor_advanced_at: datetime | None
     runtime_status: str
     updated_at: datetime
+    instrument: str = "BTC"  # R9 checkpoints predate instrument-scoped state.
 
     def __post_init__(self) -> None:
         if not self.run_id:
