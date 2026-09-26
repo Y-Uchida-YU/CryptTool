@@ -184,6 +184,7 @@ class ShadowInputCursorRow(Base):
 class ShadowInputCheckpointRow(Base):
     __tablename__ = "shadow_input_checkpoints"
     run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    instrument: Mapped[str] = mapped_column(String(100), primary_key=True, default="BTC")
     state_json: Mapped[str] = mapped_column(Text)
     events_fetched_total: Mapped[int] = mapped_column(BigInteger, default=0)
     events_processed_total: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -557,6 +558,7 @@ class FundingCarryShadowMetricsRow(Base):
     run_id: Mapped[str] = mapped_column(
         String(160), ForeignKey("operational_runs.run_id"), primary_key=True
     )
+    instrument: Mapped[str] = mapped_column(String(100), primary_key=True, default="")
     candidate_generation_attempt_count: Mapped[int] = mapped_column(BigInteger, default=0)
     candidate_inserted_count: Mapped[int] = mapped_column(BigInteger, default=0)
     candidate_rejected_count: Mapped[int] = mapped_column(BigInteger, default=0)

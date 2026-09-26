@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -14,7 +16,10 @@ from sqlalchemy.engine import Engine, make_url
 
 from app.config.settings import Settings
 from app.services.operations.repository import OperationalRepository
-from app.services.operations.shadow_runtime import FundingCarryShadowInputSource
+from app.services.operations.shadow_runtime import (
+    FundingCarryShadowInstrumentRuntime,
+    FundingCarryShadowRuntime,
+)
 
 
 class ArtifactFinalizationError(RuntimeError):
@@ -37,6 +42,8 @@ class ShadowRunArtifactWriter:
         "safety-counters.json",
         "summary.json",
         "git-head.txt",
+        "funding-edge-timeseries.csv",
+        "economics-timeseries.csv",
     )
     SUCCESS_FILES = (
         *REQUIRED_FILES,
@@ -54,7 +61,7 @@ class ShadowRunArtifactWriter:
         settings: Settings,
         engine: Engine,
         repository: OperationalRepository,
-        input_source: FundingCarryShadowInputSource,
+        input_source: FundingCarryShadowInstrumentRuntime | FundingCarryShadowRuntime,
     ) -> None:
         raw_state = os.environ.get("CRYPTTOOL_STATE_DIR")
         if not raw_state:
@@ -81,7 +88,8 @@ class ShadowRunArtifactWriter:
                 (
                     "source_table: experimental_market_events",
                     "strategy: funding_carry",
-                    "instrument: BTC",
+                    "instruments:",
+                    *(f"  - {instrument}" for instrument in input_source.instrument_sources),
                     "venues:",
                     "  - hyperliquid",
                     "  - bitget",
@@ -124,6 +132,7 @@ class ShadowRunArtifactWriter:
             for name, payload in payloads.items():
                 self._active_artifact_name = name
                 self._write_json(name, payload)
+            self._write_timeseries(payloads["candidate-export.json"])
             self._active_artifact_name = None
             self._validate_payload_artifacts()
             if not manifest["provenance_consistent"]:
@@ -167,7 +176,17 @@ class ShadowRunArtifactWriter:
             name: current_counts[name] - self._baseline_counts[name] for name in current_counts
         }
         candidate_export = [asdict(candidate) for candidate in candidates]
-        orderbook_metrics = asdict(self.input_source.book_builder.metrics)
+        sources = self.input_source.instrument_sources
+        first_source = next(iter(sources.values()))
+        book_split = {
+            instrument: {"instrument": instrument, **asdict(source.book_builder.metrics)}
+            for instrument, source in sources.items()
+        }
+        orderbook_metrics = {
+            name: sum(getattr(source.book_builder.metrics, name) for source in sources.values())
+            for name in asdict(first_source.book_builder.metrics)
+        }
+        orderbook_metrics["by_instrument"] = book_split
         timing_observations = [
             {
                 key: value
@@ -175,6 +194,7 @@ class ShadowRunArtifactWriter:
                 if key
                 in {
                     "candidate_id",
+                    "instrument",
                     "hyperliquid_funding_age_seconds",
                     "bitget_funding_age_seconds",
                     "funding_observation_skew_seconds",
@@ -192,15 +212,23 @@ class ShadowRunArtifactWriter:
             "matched_source_pair_count": metrics.matched_source_pair_count,
             "source_pair_duplicate_count": metrics.source_pair_duplicate_count,
             "source_event_count": self.input_source.source_event_count,
-            "last_seen_inputs": self._input_timestamp_records(self.input_source.last_seen),
-            "last_valid_inputs": self._input_timestamp_records(self.input_source.last_valid),
+            "last_seen_inputs": [
+                {"instrument": instrument, **row}
+                for instrument, source in sources.items()
+                for row in self._input_timestamp_records(source.last_seen)
+            ],
+            "last_valid_inputs": [
+                {"instrument": instrument, **row}
+                for instrument, source in sources.items()
+                for row in self._input_timestamp_records(source.last_valid)
+            ],
             "timing_policy": {
-                "funding_max_age_seconds": self.input_source.funding_max_age_seconds,
+                "funding_max_age_seconds": first_source.funding_max_age_seconds,
                 "funding_max_observation_skew_seconds": (
-                    self.input_source.funding_max_observation_skew_seconds
+                    first_source.funding_max_observation_skew_seconds
                 ),
                 "maximum_orderbook_venue_skew_seconds": (
-                    self.input_source.maximum_orderbook_venue_skew_seconds
+                    first_source.maximum_orderbook_venue_skew_seconds
                 ),
                 "legacy_mixed_timestamp_skew": False,
             },
@@ -213,7 +241,7 @@ class ShadowRunArtifactWriter:
         disposition_rejected_count = sum(
             item.disposition.value == "rejected" for item in candidates
         )
-        dedup_metrics = {
+        dedup_metrics: dict[str, Any] = {
             "candidate_evaluation_attempt_count": metrics.candidate_generation_attempt_count,
             "candidate_record_inserted_count": metrics.candidate_inserted_count,
             "candidate_disposition_candidate_count": disposition_candidate_count,
@@ -222,6 +250,28 @@ class ShadowRunArtifactWriter:
             "matched_source_pair_count": metrics.matched_source_pair_count,
             "source_pair_duplicate_count": metrics.source_pair_duplicate_count,
         }
+        instrument_metrics = {}
+        for instrument, source in sources.items():
+            scoped = self.repository.shadow_metrics(self.run_id, instrument=instrument)
+            records = tuple(item for item in candidates if item.instrument == instrument)
+            instrument_metrics[instrument] = {
+                "instrument": instrument,
+                "candidate_evaluation_attempt_count": scoped.candidate_generation_attempt_count,
+                "candidate_record_inserted_count": scoped.candidate_inserted_count,
+                "candidate_disposition_candidate_count": sum(
+                    item.disposition.value == "candidate" for item in records
+                ),
+                "candidate_disposition_rejected_count": sum(
+                    item.disposition.value == "rejected" for item in records
+                ),
+                "economics_calculated_count": sum(item.economics_calculated for item in records),
+                "candidate_duplicate_suppressed_count": scoped.candidate_duplicate_suppressed_count,
+                "matched_source_pair_count": scoped.matched_source_pair_count,
+                "source_pair_duplicate_count": scoped.source_pair_duplicate_count,
+                "shadow_input": source.runtime_metrics(now=completed_at),
+            }
+        pairing_metrics["by_instrument"] = instrument_metrics
+        dedup_metrics["by_instrument"] = instrument_metrics
         safety = {
             "snapshot_count": counts["data_snapshots"],
             "research_run_count": counts["research_runs"],
@@ -291,6 +341,59 @@ class ShadowRunArtifactWriter:
             "summary.json": summary,
         }
         return payloads, manifest
+
+    def _write_timeseries(self, records: list[dict[str, Any]]) -> None:
+        """Diagnostic export only; it cannot feed eligibility or execution."""
+        identity = ["created_at", "candidate_id", "instrument", "long_venue", "short_venue"]
+        funding = [
+            "raw_funding_rates",
+            "canonical_funding_rates",
+            "funding_intervals",
+            "funding_rates_per_hour",
+            "gross_funding_edge_per_hour",
+            "gross_funding_cashflow_per_hour",
+        ]
+        economics = [
+            "disposition",
+            "rejection_reason",
+            "long_entry_vwap",
+            "short_entry_vwap",
+            "long_available_quantity",
+            "short_available_quantity",
+            "entry_fee_total",
+            "estimated_exit_fee",
+            "entry_slippage_total",
+            "estimated_exit_slippage",
+            "entry_basis_cost",
+            "round_trip_cost",
+            "expected_funding_income",
+            "expected_net_income",
+            "expected_net_edge",
+            "break_even_holding_hours",
+            "evaluation_horizon_seconds",
+            "economics_notional",
+            "economics_currency",
+        ]
+        for name, fields in (
+            ("funding-edge-timeseries.csv", identity + funding),
+            ("economics-timeseries.csv", identity + funding + economics),
+        ):
+            self._active_artifact_name = name
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            for record in records:
+                if not record["economics_calculated"]:
+                    continue
+                writer.writerow(
+                    {
+                        field: json.dumps(record[field], default=str)
+                        if isinstance(record.get(field), (tuple, list, dict))
+                        else record.get(field)
+                        for field in fields
+                    }
+                )
+            self._write_text(name, output.getvalue())
 
     @staticmethod
     def _input_timestamp_records(

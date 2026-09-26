@@ -193,7 +193,12 @@ class SyntheticTailRepository(InMemoryResearchRepository):
         instrument: str,
         event_types: tuple[str, ...],
     ) -> tuple[int, datetime | None]:
-        del venues, instrument, event_types
+        if (
+            "hyperliquid" not in venues
+            or "funding_current" not in event_types
+            or instrument != "BTC"
+        ):
+            return 0, None
         cursor = next(
             (
                 item

@@ -16,9 +16,9 @@ from app.adapters.notifications.base import NotificationAdapter, NullNotificatio
 from app.config.settings import ContinuousPaperSettings, Settings
 from app.domain.market_data.models import Side
 from app.domain.strategies.capabilities import (
-    FUNDING_CARRY_REQUIRED_INSTRUMENTS,
     FUNDING_CARRY_REQUIRED_VENUES,
     FUNDING_CARRY_STRATEGY_ID,
+    validate_shadow_instruments,
 )
 from app.domain.strategies.funding_carry import (
     FundingCarryShadowCandidate,
@@ -58,6 +58,7 @@ from app.services.operations.repository import OperationalRepository
 from app.services.operations.shadow_runtime import (
     SHADOW_INPUT_REFRESH_INTERVAL_SECONDS,
     ShadowInputBatch,
+    ShadowInstrumentBatches,
 )
 
 
@@ -147,7 +148,9 @@ class ContinuousResearchPaperService:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         snapshot_action: Callable[[datetime], str | ScheduledSnapshotOutcome] | None = None,
         research_action: Callable[[str], Sequence[ScheduledResearchOutcome]] | None = None,
-        market_event_action: Callable[[], Sequence[LiveSignalInput] | ShadowInputBatch]
+        market_event_action: Callable[
+            [], Sequence[LiveSignalInput] | ShadowInputBatch | ShadowInstrumentBatches
+        ]
         | None = None,
         collector_health_action: Callable[[], CollectorHealthSummary] | None = None,
     ) -> None:
@@ -188,37 +191,38 @@ class ContinuousResearchPaperService:
             reasons=("health summary not yet evaluated",),
         )
         self._latest_events: dict[tuple[str, str, str], LiveSignalInput] = {}
-        self._shadow_input_batch: ShadowInputBatch | None = None
+        self._shadow_input_batches: dict[str, ShadowInputBatch] = {}
         self._portfolio_states: dict[str, PortfolioState] = {}
-        self._funding_carry_shadow = FundingCarryShadowEvaluator(
-            FundingCarryShadowConfig(
-                instrument=FUNDING_CARRY_REQUIRED_INSTRUMENTS[0],
-                venues=FUNDING_CARRY_REQUIRED_VENUES,
-                shadow_notional=self.operation_settings.shadow_notional,
-                minimum_net_edge=self.operation_settings.minimum_shadow_net_edge,
-                maximum_age_seconds=self.operation_settings.source_event_max_age_seconds,
-                funding_max_age_seconds=(
-                    self.operation_settings.funding_max_age_seconds
-                    if self.operation_settings.funding_max_age_seconds is not None
-                    else math.ceil(self.settings.research_collection.poll_interval_seconds)
-                    + SHADOW_INPUT_REFRESH_INTERVAL_SECONDS
-                ),
-                funding_max_observation_skew_seconds=(
-                    self.operation_settings.funding_max_observation_skew_seconds
-                    if self.operation_settings.funding_max_observation_skew_seconds is not None
-                    else math.ceil(self.settings.research_collection.poll_interval_seconds)
-                ),
-                maximum_orderbook_venue_skew_seconds=(
-                    self.operation_settings.maximum_orderbook_venue_skew_seconds
-                ),
-                maximum_venue_timestamp_skew_seconds=(
-                    self.operation_settings.maximum_venue_timestamp_skew_seconds
-                ),
-                venue_taker_fee_rates=tuple(
-                    sorted(self.operation_settings.shadow_venue_taker_fee_rates.items())
-                ),
-            )
+        shadow_config = FundingCarryShadowConfig(
+            venues=FUNDING_CARRY_REQUIRED_VENUES,
+            shadow_notional=self.operation_settings.shadow_notional,
+            minimum_net_edge=self.operation_settings.minimum_shadow_net_edge,
+            maximum_age_seconds=self.operation_settings.source_event_max_age_seconds,
+            funding_max_age_seconds=(
+                self.operation_settings.funding_max_age_seconds
+                if self.operation_settings.funding_max_age_seconds is not None
+                else math.ceil(self.settings.research_collection.poll_interval_seconds)
+                + SHADOW_INPUT_REFRESH_INTERVAL_SECONDS
+            ),
+            funding_max_observation_skew_seconds=(
+                self.operation_settings.funding_max_observation_skew_seconds
+                if self.operation_settings.funding_max_observation_skew_seconds is not None
+                else math.ceil(self.settings.research_collection.poll_interval_seconds)
+            ),
+            maximum_orderbook_venue_skew_seconds=(
+                self.operation_settings.maximum_orderbook_venue_skew_seconds
+            ),
+            maximum_venue_timestamp_skew_seconds=(
+                self.operation_settings.maximum_venue_timestamp_skew_seconds
+            ),
+            venue_taker_fee_rates=tuple(
+                sorted(self.operation_settings.shadow_venue_taker_fee_rates.items())
+            ),
         )
+        self._shadow_evaluators = {
+            instrument: FundingCarryShadowEvaluator(replace(shadow_config, instrument=instrument))
+            for instrument in self.operation_settings.instruments
+        }
         self._validate_startup()
         self._restore_or_initialize()
         self.workers: tuple[Worker, ...]
@@ -271,8 +275,7 @@ class ContinuousResearchPaperService:
                 raise ValueError("shadow mode requires observation_only")
             if self.operation_settings.strategies != (FUNDING_CARRY_STRATEGY_ID,):
                 raise ValueError("shadow mode only starts funding_carry")
-            if self.operation_settings.instruments != FUNDING_CARRY_REQUIRED_INSTRUMENTS:
-                raise ValueError("shadow mode only starts BTC")
+            validate_shadow_instruments(self.operation_settings.instruments)
             if self.operation_settings.venues != FUNDING_CARRY_REQUIRED_VENUES:
                 raise ValueError("shadow mode requires hyperliquid and bitget")
             if self.settings.live.adapter_name != "disabled":
@@ -478,9 +481,15 @@ class ContinuousResearchPaperService:
         *,
         events: Sequence[LiveSignalInput],
         batch: ShadowInputBatch | None = None,
+        instrument: str | None = None,
         decision_time: datetime | None = None,
     ) -> FundingCarryShadowCandidate:
         decision_time = decision_time or self.now()
+        instrument = (
+            instrument
+            or (batch.instrument if batch else None)
+            or (events[0].instrument if events else self.operation_settings.instruments[0])
+        )
         funding = tuple(
             FundingObservation(
                 event_id=event.event_id,
@@ -532,7 +541,7 @@ class ContinuousResearchPaperService:
             if event.event_type.startswith("orderbook")
             or event.event_type == "canonical_orderbook_snapshot"
         )
-        candidate = self._funding_carry_shadow.evaluate(
+        candidate = self._shadow_evaluators[instrument].evaluate(
             run_id=self.run_id,
             funding=funding,
             orderbooks=orderbooks,
@@ -1410,9 +1419,14 @@ class ContinuousResearchPaperService:
             return
         if self.market_event_action is not None:
             result = await asyncio.to_thread(self.market_event_action)
-            if isinstance(result, ShadowInputBatch):
-                self._shadow_input_batch = result
-                events: Sequence[LiveSignalInput] = result.events
+            if isinstance(result, ShadowInstrumentBatches):
+                self._shadow_input_batches = {batch.instrument: batch for batch in result.batches}
+                events: Sequence[LiveSignalInput] = tuple(
+                    event for batch in result.batches for event in batch.events
+                )
+            elif isinstance(result, ShadowInputBatch):
+                self._shadow_input_batches = {result.instrument: result}
+                events = result.events
             else:
                 events = result
             for event in events:
@@ -1533,11 +1547,11 @@ class ContinuousResearchPaperService:
                 self.operation_settings.mode == "shadow"
                 and FUNDING_CARRY_STRATEGY_ID in self.operation_settings.strategies
             ):
-                batch = self._shadow_input_batch
+                batch = self._shadow_input_batches.get(instrument)
                 if batch is None:
                     continue
                 self.generate_funding_carry_shadow_candidate(
-                    events=batch.events, batch=batch, decision_time=now
+                    events=batch.events, batch=batch, instrument=instrument, decision_time=now
                 )
                 continue
             books = tuple(

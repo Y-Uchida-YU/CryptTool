@@ -9,8 +9,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from time import perf_counter
-from typing import Protocol
+from typing import Any, Protocol
 
+from app.domain.strategies.capabilities import (
+    FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT,
+    FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS,
+    validate_shadow_instruments,
+)
 from app.domain.strategies.funding_carry import FundingCarryRejectCode
 from app.services.operations.models import LiveSignalInput
 from app.services.research.models import (
@@ -20,6 +25,87 @@ from app.services.research.models import (
 )
 
 SHADOW_INPUT_REFRESH_INTERVAL_SECONDS = 10
+
+
+class FundingCarryShadowRuntime:
+    """Bounded, independently committed instrument state machines.
+
+    Every instrument receives one batch per refresh, regardless of another's
+    backlog or processing failure. Each batch reserves capacity for all streams.
+    """
+
+    def __init__(
+        self,
+        repository: ExperimentalEventRepository,
+        *,
+        instruments: tuple[str, ...],
+        **options: Any,
+    ) -> None:
+        validate_shadow_instruments(instruments)
+        self.instrument_sources = {
+            instrument: FundingCarryShadowInstrumentRuntime(
+                repository, instrument=instrument, fair_consumption=True, **options
+            )
+            for instrument in instruments
+        }
+        self.last_errors: dict[str, str] = {}
+
+    def read(self, *, now: datetime) -> ShadowInstrumentBatches:
+        batches: list[ShadowInputBatch] = []
+        for instrument, source in self.instrument_sources.items():
+            try:
+                batches.append(source.read(now=now))
+                self.last_errors.pop(instrument, None)
+            except Exception as exc:
+                # Do not emit a stale batch, and do not roll back another instrument.
+                source.runtime_status = "degraded"
+                self.last_errors[instrument] = f"{type(exc).__name__}: {exc}"
+        return ShadowInstrumentBatches(tuple(batches))
+
+    @property
+    def runtime_status(self) -> str:
+        return (
+            "degraded"
+            if any(
+                source.runtime_status == "degraded" for source in self.instrument_sources.values()
+            )
+            else "healthy"
+        )
+
+    @property
+    def source_event_count(self) -> int:
+        return sum(source.source_event_count for source in self.instrument_sources.values())
+
+    def runtime_metrics(self, *, now: datetime | None = None) -> dict[str, object]:
+        split = {
+            instrument: source.runtime_metrics(now=now)
+            for instrument, source in self.instrument_sources.items()
+        }
+        result: dict[str, object] = {
+            "by_instrument": split,
+            "shadow_runtime_status": self.runtime_status,
+            "instrument_errors": dict(self.last_errors),
+            "shadow_input_backlog_estimate_semantics": "legacy_pending_stream_count",
+            "strategy_observation_coverage_ratio": min(
+                Decimal(str(m["strategy_observation_coverage_ratio"])) for m in split.values()
+            ),
+            "aggregate_coverage_semantics": "minimum_instrument_coverage",
+        }
+        for name in (
+            "shadow_input_events_fetched_total",
+            "shadow_input_events_processed_total",
+            "shadow_input_events_failed_total",
+            "shadow_input_batch_count",
+            "shadow_input_batch_size",
+            "shadow_input_backlog_estimate",
+            "shadow_input_backlog_stream_count",
+            "shadow_input_backlog_event_count",
+        ):
+            result[name] = sum(int(str(m[name])) for m in split.values())
+        for name in ("shadow_input_lag_seconds",):
+            values = [Decimal(str(m[name])) for m in split.values() if m[name] is not None]
+            result[name] = max(values, default=None)
+        return result
 
 
 class ExperimentalEventRepository(Protocol):
@@ -43,7 +129,7 @@ class ExperimentalEventRepository(Protocol):
     ) -> tuple[int, datetime | None]: ...
 
     def shadow_input_checkpoint(
-        self, run_id: str
+        self, run_id: str, *, instrument: str = FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT
     ) -> tuple[tuple[ExperimentalEventCursor, ...], ShadowInputCheckpoint | None]: ...
 
     def commit_shadow_input_checkpoint(
@@ -125,6 +211,12 @@ class ShadowInputBatch:
     timing: ShadowTimingMetrics | None = None
     # Legacy only. It must never mix funding and order-book timestamp domains.
     venue_timestamp_skew_seconds: Decimal | None = None
+    instrument: str = FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT
+
+
+@dataclass(frozen=True)
+class ShadowInstrumentBatches:
+    batches: tuple[ShadowInputBatch, ...]
 
 
 @dataclass
@@ -322,7 +414,10 @@ class CanonicalOrderBookStateBuilder:
             state.applied_delta_event_ids = list(event_ids)
 
     def apply(self, event: RawMarketEvent, *, now: datetime) -> CanonicalOrderBookSnapshot | None:
-        if event.venue not in {"hyperliquid", "bitget"} or event.canonical_instrument_id != "BTC":
+        if (
+            event.venue not in {"hyperliquid", "bitget"}
+            or event.canonical_instrument_id not in FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS
+        ):
             return None
         if event.event_type not in {"orderbook_snapshot", "orderbook_delta"}:
             return None
@@ -334,7 +429,9 @@ class CanonicalOrderBookStateBuilder:
                 return self._standalone_snapshot(event, now=now)
             except ValueError as exc:
                 self.metrics.invalid_count += 1
-                self.last_invalid_reason[(event.venue, "BTC")] = self._validation_reason(exc)
+                self.last_invalid_reason[(event.venue, event.canonical_instrument_id)] = (
+                    self._validation_reason(exc)
+                )
                 return None
         return self._apply_bitget(event, now=now)
 
@@ -396,13 +493,15 @@ class CanonicalOrderBookStateBuilder:
                 return snapshot
             except ValueError as exc:
                 self.metrics.invalid_count += 1
-                self.last_invalid_reason[("bitget", "BTC")] = self._validation_reason(exc)
+                self.last_invalid_reason[("bitget", event.canonical_instrument_id)] = (
+                    self._validation_reason(exc)
+                )
                 if current is not None:
                     current.status = BookStateStatus.INVALID
                 return None
         self.metrics.delta_count += 1
         if current is None:
-            self.last_invalid_reason[("bitget", "BTC")] = (
+            self.last_invalid_reason[("bitget", event.canonical_instrument_id)] = (
                 FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_NOT_INITIALIZED
             )
             return None
@@ -418,7 +517,7 @@ class CanonicalOrderBookStateBuilder:
             current.status = BookStateStatus.INVALID
             self.metrics.sequence_gap_count += 1
             self.metrics.invalid_count += 1
-            self.last_invalid_reason[("bitget", "BTC")] = (
+            self.last_invalid_reason[("bitget", event.canonical_instrument_id)] = (
                 FundingCarryRejectCode.BITGET_ORDERBOOK_SEQUENCE_GAP
             )
             return None
@@ -435,7 +534,7 @@ class CanonicalOrderBookStateBuilder:
                 current.status = BookStateStatus.INVALID
                 self.metrics.sequence_gap_count += 1
                 self.metrics.invalid_count += 1
-                self.last_invalid_reason[("bitget", "BTC")] = (
+                self.last_invalid_reason[("bitget", event.canonical_instrument_id)] = (
                     FundingCarryRejectCode.BITGET_ORDERBOOK_SEQUENCE_GAP
                 )
                 return None
@@ -453,7 +552,9 @@ class CanonicalOrderBookStateBuilder:
         except ValueError as exc:
             current.status = BookStateStatus.INVALID
             self.metrics.invalid_count += 1
-            self.last_invalid_reason[("bitget", "BTC")] = self._validation_reason(exc)
+            self.last_invalid_reason[("bitget", event.canonical_instrument_id)] = (
+                self._validation_reason(exc)
+            )
             return None
 
     @staticmethod
@@ -591,7 +692,7 @@ class CanonicalOrderBookStateBuilder:
         return FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_INVALID
 
 
-class FundingCarryShadowInputSource:
+class FundingCarryShadowInstrumentRuntime:
     SOURCE_TABLE = "experimental_market_events"
     FUNDING_TIMESTAMP_SEMANTIC = "funding_observation"
     ORDERBOOK_TIMESTAMP_SEMANTIC = "orderbook_market_event"
@@ -601,6 +702,8 @@ class FundingCarryShadowInputSource:
         repository: ExperimentalEventRepository,
         *,
         run_id: str = "shadow-input-test",
+        instrument: str = FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT,
+        fair_consumption: bool = False,
         batch_size: int = 1000,
         maximum_shadow_input_stall_seconds: int | None = None,
         initial_available_at: datetime | None = None,
@@ -615,8 +718,11 @@ class FundingCarryShadowInputSource:
     ) -> None:
         self.repository = repository
         self.run_id = run_id
+        validate_shadow_instruments((instrument,))
+        self.instrument = instrument
+        self.fair_consumption = fair_consumption
         self.batch_size = batch_size
-        if batch_size <= 0:
+        if batch_size <= 0 or (fair_consumption and batch_size < 4):
             raise ValueError("shadow input batch size must be positive")
         self.maximum_shadow_input_stall_seconds = (
             maximum_shadow_input_stall_seconds
@@ -666,21 +772,25 @@ class FundingCarryShadowInputSource:
         self._latest_db_event_available_at: datetime | None = None
         self._lag_seconds: Decimal | None = None
         self._backlog_estimate = 0
+        self._backlog_event_count = 0
+        self._stream_metrics: list[dict[str, object]] = []
         self._strategy_observation_first_at: datetime | None = None
         self._strategy_observation_last_at: datetime | None = None
         self._last_cursor_advanced_at: datetime | None = None
         self.runtime_status = "healthy"
         self._processed_by_stream: dict[tuple[str, str], int] = {}
-        saved_cursors, checkpoint = repository.shadow_input_checkpoint(run_id)
+        saved_cursors, checkpoint = repository.shadow_input_checkpoint(
+            run_id, instrument=instrument
+        )
         cursor_map = {(item.venue, item.event_stream): item for item in saved_cursors}
         initialized_at = datetime.now(UTC)
-        self._started_at = initialized_at
+        self._started_at = initial_available_at or initialized_at
         self._cursors = tuple(
             cursor_map.get((venue, stream))
             or ExperimentalEventCursor(
                 run_id=run_id,
                 venue=venue,
-                instrument="BTC",
+                instrument=self.instrument,
                 event_stream=stream,
                 last_available_at=initial_available_at,
                 last_event_id="" if initial_available_at is not None else None,
@@ -698,14 +808,14 @@ class FundingCarryShadowInputSource:
     def read(self, *, now: datetime) -> ShadowInputBatch:
         before = self._state_json()
         cursors_before = self._cursors
-        scan_started = perf_counter()
-        events = self.repository.list_experimental_events_after(
-            self._cursors,
-            venues=("hyperliquid", "bitget"),
-            instrument="BTC",
-            event_types=("funding_current", "orderbook_snapshot", "orderbook_delta"),
-            limit=self.batch_size,
+        processed_before = self._events_processed_total
+        coverage_before = (
+            self._strategy_observation_first_at,
+            self._strategy_observation_last_at,
+            self._last_cursor_advanced_at,
         )
+        scan_started = perf_counter()
+        events = self._fetch_events()
         self._scan_duration_ms = Decimal(str((perf_counter() - scan_started) * 1000))
         self._events_fetched_total += len(events)
         self._last_batch_size = len(events)
@@ -722,7 +832,7 @@ class FundingCarryShadowInputSource:
             if events:
                 self._advance_cursors(events, now=now)
                 self._last_cursor_advanced_at = now
-            result = self._evaluate(now=now)
+            result = replace(self._evaluate(now=now), instrument=self.instrument)
             if result.matched:
                 self._strategy_observation_first_at = self._strategy_observation_first_at or now
                 self._strategy_observation_last_at = now
@@ -733,11 +843,22 @@ class FundingCarryShadowInputSource:
             self._events_failed_total += len(events)
             self._cursors = cursors_before
             self._restore_state_json(before)
+            self._restore_delta_identities()
+            self._events_processed_total = processed_before
+            self.source_event_count = processed_before
+            (
+                self._strategy_observation_first_at,
+                self._strategy_observation_last_at,
+                self._last_cursor_advanced_at,
+            ) = coverage_before
             self._refresh_lag(now=now)
+            self.runtime_status = "degraded"
             self.repository.commit_shadow_input_checkpoint(self._cursors, self._checkpoint(now=now))
             raise
 
     def _process_event(self, event: RawMarketEvent, *, now: datetime) -> None:
+        if event.canonical_instrument_id != self.instrument:
+            raise ValueError("cross-instrument shadow input rejected")
         capability = (
             "funding_current" if event.event_type == "funding_current" else "orderbook_snapshot"
         )
@@ -760,7 +881,7 @@ class FundingCarryShadowInputSource:
             self._latest_books[event.venue] = self._book(snapshot, now=now)
             self.last_valid[key] = event.available_at
         elif event.venue == "hyperliquid" or self.book_builder.last_invalid_reason.get(
-            (event.venue, "BTC")
+            (event.venue, self.instrument)
         ) in {
             FundingCarryRejectCode.BITGET_ORDERBOOK_STATE_NOT_INITIALIZED,
             FundingCarryRejectCode.BITGET_ORDERBOOK_SEQUENCE_GAP,
@@ -813,7 +934,9 @@ class FundingCarryShadowInputSource:
                 timing=timing,
             )
         pair_identity = hashlib.sha256(
-            json.dumps(self._source_event_ids(paired), separators=(",", ":")).encode()
+            json.dumps(
+                (self.instrument, self._source_event_ids(paired)), separators=(",", ":")
+            ).encode()
         ).hexdigest()
         duplicate = pair_identity == self._last_pair_identity
         self._last_pair_identity = pair_identity
@@ -852,32 +975,86 @@ class FundingCarryShadowInputSource:
         )
 
     def _refresh_lag(self, *, now: datetime) -> None:
-        backlog, latest = self.repository.experimental_event_backlog(
-            self._cursors,
-            venues=("hyperliquid", "bitget"),
-            instrument="BTC",
-            event_types=("funding_current", "orderbook_snapshot", "orderbook_delta"),
+        self._stream_metrics = []
+        lags: list[Decimal] = []
+        latest_times: list[datetime] = []
+        for cursor in self._cursors:
+            backlog, latest = self.repository.experimental_event_backlog(
+                (cursor,),
+                venues=(cursor.venue,),
+                instrument=self.instrument,
+                event_types=self._stream_event_types(cursor.event_stream),
+            )
+            lag = (
+                Decimal(str(max(0.0, (latest - cursor.last_available_at).total_seconds())))
+                if latest is not None and cursor.last_available_at is not None
+                else None
+            )
+            stalled = (
+                backlog > 0
+                and (now - cursor.updated_at).total_seconds()
+                > self.maximum_shadow_input_stall_seconds
+            )
+            if lag is not None:
+                lags.append(lag)
+            if latest is not None:
+                latest_times.append(latest)
+            self._stream_metrics.append(
+                {
+                    "instrument": self.instrument,
+                    "venue": cursor.venue,
+                    "event_stream": cursor.event_stream,
+                    "backlog_event_count": backlog,
+                    "lag_seconds": lag,
+                    "latest_db_event_available_at": latest,
+                    "runtime_status": "degraded" if stalled else "healthy",
+                }
+            )
+        self._backlog_event_count = sum(
+            int(str(m["backlog_event_count"])) for m in self._stream_metrics
         )
-        self._backlog_estimate = backlog
-        self._latest_db_event_available_at = latest
-        cursor_times = [
-            item.last_available_at for item in self._cursors if item.last_available_at is not None
-        ]
-        newest_cursor = max(cursor_times) if cursor_times else None
-        self._lag_seconds = (
-            Decimal(str(max(0.0, (latest - newest_cursor).total_seconds())))
-            if latest is not None and newest_cursor is not None
-            else None
+        self._backlog_estimate = sum(
+            int(str(m["backlog_event_count"])) > 0 for m in self._stream_metrics
         )
-        stalled_for = max(
-            (max(0.0, (now - cursor.updated_at).total_seconds()) for cursor in self._cursors),
-            default=0,
-        )
+        self._latest_db_event_available_at = max(latest_times, default=None)
+        self._lag_seconds = max(lags, default=None)
         self.runtime_status = (
             "degraded"
-            if backlog > 0 and stalled_for > self.maximum_shadow_input_stall_seconds
+            if any(m["runtime_status"] == "degraded" for m in self._stream_metrics)
             else "healthy"
         )
+
+    @staticmethod
+    def _stream_event_types(stream: str) -> tuple[str, ...]:
+        return (
+            ("funding_current",)
+            if stream == "funding_current"
+            else ("orderbook_snapshot", "orderbook_delta")
+        )
+
+    def _fetch_events(self) -> tuple[RawMarketEvent, ...]:
+        if not self.fair_consumption:
+            return self.repository.list_experimental_events_after(
+                self._cursors,
+                venues=("hyperliquid", "bitget"),
+                instrument=self.instrument,
+                event_types=("funding_current", "orderbook_snapshot", "orderbook_delta"),
+                limit=self.batch_size,
+            )
+        # A reserved quota for every stream; a busy book cannot consume a funding slot.
+        quota = self.batch_size // len(self._cursors)
+        events = tuple(
+            event
+            for cursor in self._cursors
+            for event in self.repository.list_experimental_events_after(
+                (cursor,),
+                venues=(cursor.venue,),
+                instrument=self.instrument,
+                event_types=self._stream_event_types(cursor.event_stream),
+                limit=quota,
+            )
+        )
+        return tuple(sorted(events, key=lambda event: (event.available_at, event.event_id)))
 
     @staticmethod
     def _input_payload(item: LiveSignalInput) -> dict[str, object]:
@@ -925,6 +1102,8 @@ class FundingCarryShadowInputSource:
 
     def _state_json(self) -> str:
         payload = {
+            "started_at": self._started_at,
+            "stream_metrics": self._stream_metrics,
             "latest_funding": {
                 venue: self._input_payload(item) for venue, item in self._latest_funding.items()
             },
@@ -953,6 +1132,12 @@ class FundingCarryShadowInputSource:
 
     def _restore_state_json(self, value: str) -> None:
         payload = json.loads(value) if value else {}
+        if payload.get("started_at"):
+            self._started_at = datetime.fromisoformat(payload["started_at"])
+        self._stream_metrics = payload.get("stream_metrics", [])
+        self._backlog_event_count = sum(
+            int(str(m["backlog_event_count"])) for m in self._stream_metrics
+        )
         self._latest_funding = {
             venue: self._restore_input(item)
             for venue, item in payload.get("latest_funding", {}).items()
@@ -1042,6 +1227,7 @@ class FundingCarryShadowInputSource:
     def _checkpoint(self, *, now: datetime) -> ShadowInputCheckpoint:
         return ShadowInputCheckpoint(
             run_id=self.run_id,
+            instrument=self.instrument,
             state_json=self._state_json(),
             events_fetched_total=self._events_fetched_total,
             events_processed_total=self._events_processed_total,
@@ -1079,6 +1265,7 @@ class FundingCarryShadowInputSource:
             (evaluated_at - self._started_at).total_seconds(),
         )
         return {
+            "instrument": self.instrument,
             "shadow_input_events_fetched_total": self._events_fetched_total,
             "shadow_input_events_processed_total": self._events_processed_total,
             "shadow_input_events_failed_total": self._events_failed_total,
@@ -1094,6 +1281,10 @@ class FundingCarryShadowInputSource:
             "latest_db_event_available_at": self._latest_db_event_available_at,
             "shadow_input_lag_seconds": self._lag_seconds,
             "shadow_input_backlog_estimate": self._backlog_estimate,
+            "shadow_input_backlog_estimate_semantics": "legacy_pending_stream_count",
+            "shadow_input_backlog_stream_count": self._backlog_estimate,
+            "shadow_input_backlog_event_count": self._backlog_event_count,
+            "streams": self._stream_metrics,
             "collector_uptime_seconds": Decimal(str(run_age)),
             "strategy_observation_first_at": self._strategy_observation_first_at,
             "strategy_observation_last_at": self._strategy_observation_last_at,
@@ -1104,7 +1295,12 @@ class FundingCarryShadowInputSource:
             "maximum_shadow_input_stall_seconds": self.maximum_shadow_input_stall_seconds,
             "shadow_runtime_status": self.runtime_status,
             "processed_by_venue_capability": [
-                {"venue": venue, "capability": capability, "count": count}
+                {
+                    "instrument": self.instrument,
+                    "venue": venue,
+                    "capability": capability,
+                    "count": count,
+                }
                 for (venue, capability), count in sorted(self._processed_by_stream.items())
             ],
             "cursor_positions": [
@@ -1119,6 +1315,10 @@ class FundingCarryShadowInputSource:
                 for cursor in self._cursors
             ],
         }
+
+    @property
+    def instrument_sources(self) -> dict[str, FundingCarryShadowInstrumentRuntime]:
+        return {self.instrument: self}
 
     def _funding(self, event: RawMarketEvent, *, now: datetime) -> LiveSignalInput | None:
         timestamp = event.exchange_timestamp or event.available_at
@@ -1238,9 +1438,9 @@ class FundingCarryShadowInputSource:
             if capability == "funding_current":
                 reason = self._funding_invalid_reason.get(venue, reason)
             if venue == "bitget" and capability == "orderbook_snapshot":
-                reason = self.book_builder.last_invalid_reason.get((venue, "BTC"), reason)
+                reason = self.book_builder.last_invalid_reason.get((venue, self.instrument), reason)
             if venue == "hyperliquid" and capability == "orderbook_snapshot":
-                reason = self.book_builder.last_invalid_reason.get((venue, "BTC"), reason)
+                reason = self.book_builder.last_invalid_reason.get((venue, self.instrument), reason)
             if reason is FundingCarryRejectCode.STALE_DATA and capability == "orderbook_snapshot":
                 reason = (
                     FundingCarryRejectCode.HYPERLIQUID_ORDERBOOK_STALE
@@ -1413,3 +1613,7 @@ class FundingCarryShadowInputSource:
                 FundingCarryRejectCode.ORDERBOOK_VENUES_UNSYNCHRONIZED,
             )
         return None
+
+
+# Backward-compatible single-instrument API. The CLI uses the multi-instrument owner.
+FundingCarryShadowInputSource = FundingCarryShadowInstrumentRuntime

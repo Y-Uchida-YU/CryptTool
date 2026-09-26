@@ -39,6 +39,19 @@ FUNDING_CARRY_NON_BLOCKING_CAPABILITIES = (
 )
 FUNDING_CARRY_REQUIRED_VENUES = ("hyperliquid", "bitget")
 FUNDING_CARRY_REQUIRED_INSTRUMENTS = ("BTC",)
+# Observation allowlist, not a requirement that both instruments be available.
+FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS = ("BTC", "SOL")
+FUNDING_CARRY_DEFAULT_SHADOW_INSTRUMENT = FUNDING_CARRY_REQUIRED_INSTRUMENTS[0]
+
+
+def validate_shadow_instruments(instruments: tuple[str, ...]) -> None:
+    if (
+        not instruments
+        or len(set(instruments)) != len(instruments)
+        or not set(instruments) <= set(FUNDING_CARRY_SHADOW_ALLOWED_INSTRUMENTS)
+    ):
+        raise ValueError("shadow instruments must be a non-empty unique subset of BTC/SOL")
+
 
 FUNDING_CARRY_REQUIREMENT = StrategyDataRequirement(
     strategy_id=FUNDING_CARRY_STRATEGY_ID,

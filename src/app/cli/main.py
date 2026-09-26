@@ -49,6 +49,7 @@ from app.config.settings import Settings
 from app.domain.execution.models import InstrumentRules, MarketSnapshot, OrderType, TimeInForce
 from app.domain.features.engine import FeatureEngine
 from app.domain.market_data.models import OHLCV, Side
+from app.domain.strategies.capabilities import validate_shadow_instruments
 from app.domain.venues.trusted_capabilities import TrustedCapabilityRegistry
 from app.infrastructure.database.session import build_engine
 from app.services.backtest.engine import BacktestEngine
@@ -72,7 +73,10 @@ from app.services.operations.service import (
     ScheduledSnapshotOutcome,
 )
 from app.services.operations.shadow_artifacts import ShadowRunArtifactWriter
-from app.services.operations.shadow_runtime import FundingCarryShadowInputSource, ShadowInputBatch
+from app.services.operations.shadow_runtime import (
+    FundingCarryShadowRuntime,
+    ShadowInstrumentBatches,
+)
 from app.services.paper_trading.broker import PaperBroker
 from app.services.paper_trading.models import PaperOrderRequest, PaperQuote
 from app.services.regime_engine.ensemble import EnsembleRegimeEngine
@@ -2883,8 +2887,13 @@ def start_paper_operation(
         if settings.continuous_paper.mode == "shadow":
             if set(collection.venues) != {"hyperliquid", "bitget"}:
                 raise typer.BadParameter("shadow collection requires only hyperliquid and bitget")
-            if collection.instruments != ("BTC",):
-                raise typer.BadParameter("shadow collection requires only BTC")
+            try:
+                validate_shadow_instruments(collection.instruments)
+                validate_shadow_instruments(settings.continuous_paper.instruments)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            if set(collection.instruments) != set(settings.continuous_paper.instruments):
+                raise typer.BadParameter("shadow collector and evaluator instruments must match")
             if set(collection.event_types) != {
                 "funding_current",
                 "orderbook_snapshot",
@@ -2947,8 +2956,9 @@ def start_paper_operation(
             raise
         research_repository = PostgreSQLResearchRepository(engine)
         shadow_input_source = (
-            FundingCarryShadowInputSource(
+            FundingCarryShadowRuntime(
                 research_repository,
+                instruments=collection.instruments,
                 run_id=resolved_run_id,
                 batch_size=settings.continuous_paper.shadow_event_batch_size,
                 maximum_shadow_input_stall_seconds=(
@@ -3076,7 +3086,7 @@ def start_paper_operation(
                 )
             return tuple(outcomes)
 
-        def live_market_events() -> tuple[LiveSignalInput, ...] | ShadowInputBatch:
+        def live_market_events() -> tuple[LiveSignalInput, ...] | ShadowInstrumentBatches:
             if shadow_input_source is not None:
                 return shadow_input_source.read(now=datetime.now(UTC))
             cutoff_at = datetime.now(UTC)
